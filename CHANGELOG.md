@@ -26,6 +26,7 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 
 ### Added
 
+- TypeScript route endpoint helpers: `types:export` now emits a headless `FoundryEndpoint` base runtime plus per-route helper files with path/method constants, request/response aliases, typed `validateForm()`/`submitForm()`, busy/error state, and validation metadata from `#[derive(Validate)]`. Generated DTO files now include a Foundry do-not-edit header, and validated DTO fields include validation-rule comments. Routes can opt out with `without_client_export()` or `client_export(false)`.
 - Datatable relation filters: model datatables can opt in to typed relation-backed filters with `Datatable::relation_filters()`, `DatatableRelationFilter`, and `DatatableRelationColumn`.
 - Datatable relation filter coverage for belongs-to, has-many, many-to-many, legacy hyphen aliases, and `LikeAny` search across declared relation columns.
 - Consumer-facing datatable request examples for direct filters, relation filters, legacy query params, and multi-column relation search.

@@ -176,7 +176,7 @@ export const PermissionGroups = {
 The exporter fails fast if one enum mixes dotted and non-dotted keys, or if two
 module names normalize to the same camelCase TypeScript property.
 
-### Route Manifest
+### Route Manifest and Endpoint Helpers
 
 `types:export` also boots the registered HTTP route modules and writes a
 generated `RouteManifest.ts`. Named routes from `scope()`, `route_named()`, and
@@ -197,8 +197,8 @@ adminRouteUrl(RouteIds.admin.users.show, { id: userId });
 ```
 
 The generated manifest includes route id, path, method, path params, guard,
-permissions, summary, request schema name, and response schema names when Foundry
-can infer them from the registered route. Route id groups are camelCased for
+permissions, summary, request schema name, response schema names, and whether a
+route endpoint helper was generated. Route id groups are camelCased for
 TypeScript property access, so `admin.audit_logs.index` becomes
 `RouteIds.admin.auditLogs.index`.
 
@@ -206,8 +206,91 @@ Route params support Axum `{id}` / `{*path}` patterns and legacy `:id` patterns.
 The helper URL-encodes substituted params and throws a clear runtime error if a
 required param is missing.
 
-This is route URL and metadata generation only. Request body trust still belongs
-to Foundry validation extractors such as `JsonValidated<T>` and `Validated<T>`.
+When a named route has request/response docs, Foundry also writes a route helper
+under `routes/`. The helper is optional and headless: it does not depend on
+React, Vue, or a specific HTTP library. Any Axios-compatible client with
+`request(config)` works.
+
+```rust
+#[derive(Debug, Deserialize, ts_rs::TS, foundry::ApiSchema, foundry::Validate)]
+pub struct LoginRequest {
+    #[validate(required, email)]
+    pub email: String,
+
+    #[validate(required, min(8))]
+    pub password: String,
+}
+
+#[derive(Debug, Serialize, ts_rs::TS, foundry::ApiSchema)]
+pub struct LoginResponse {
+    pub token: String,
+}
+
+routes.post("/login", "user.portal.login", login, |route| {
+    route
+        .request::<LoginRequest>()
+        .response::<LoginResponse>(200);
+});
+```
+
+Generated TypeScript:
+
+```typescript
+import { UserPortalLogin } from "@shared/types/generated";
+
+const loginForm = UserPortalLogin(axios, {
+  email: "",
+  password: "",
+});
+
+loginForm.validateForm();
+
+const response = await loginForm.submitForm();
+response.token;
+loginForm.busy;
+loginForm.errors.email;
+```
+
+The route file exports the path, method, request alias, response alias, params
+type, validation metadata, endpoint class, and factory function. For complex
+screens, import only the DTOs or constants you need:
+
+```typescript
+import type {
+  UserPortalLoginRequest,
+  UserPortalLoginResponse,
+} from "@shared/types/generated";
+```
+
+Request DTO files are also marked as generated and include validation remarks
+above fields when the Rust DTO derives `Validate`:
+
+```typescript
+// Auto-generated from Foundry types. Do not edit.
+export type LoginRequest = {
+  // Validation: required, email
+  email: string,
+  // Validation: required, min(8)
+  password: string,
+};
+```
+
+Basic `#[validate(...)]` rules are embedded into the generated validation schema
+and run in `validateForm()`. Server-backed rules such as `unique`, `exists`, and
+custom `rule("...")` are kept as server-only metadata; the backend remains the
+final source of validation truth through `JsonValidated<T>` and `Validated<T>`.
+
+Disable the route helper when a route should only export manifest metadata and
+DTOs:
+
+```rust
+routes.post("/webhook", "billing.webhook", webhook, |route| {
+    route.without_client_export();
+});
+
+// Equivalent builder style:
+HttpRouteOptions::new().client_export(false)
+```
 
 ### `foundry::TS` (escape hatch)
 
@@ -282,6 +365,10 @@ Datatable exports now keep JSON-facing numeric fields as `number` and include th
 ```
 frontend/shared/types/generated/
 ├── index.ts                    ← barrel (auto-generated)
+├── FoundryEndpoint.ts          ← headless endpoint base runtime
+├── RouteManifest.ts            ← route URL helpers and metadata
+├── routes/
+│   └── UserPortalLogin.ts      ← route helper class + route DTO aliases
 ├── CreateOrderRequest.ts       ← from project
 ├── OrderStatus.ts              ← from project
 ├── CountryStatus.ts            ← from framework
@@ -309,6 +396,9 @@ export type { RefreshTokenRequest } from "./RefreshTokenRequest";
 export type { TokenPair } from "./TokenPair";
 export type { TokenResponse } from "./TokenResponse";
 export type { WsTokenResponse } from "./WsTokenResponse";
+export { RouteManifest, RouteIds, createRouteUrlBuilder, routeUrl, type RouteName, type RouteParams, type RouteParamValue, type RouteUrlOptions } from "./RouteManifest";
+export { FoundryEndpoint, FoundryValidationClientError, type FoundryHttpClient, type FoundryValidationSchema, type FoundryValidationRule } from "./FoundryEndpoint";
+export * from "./routes/UserPortalLogin";
 ```
 
 ---

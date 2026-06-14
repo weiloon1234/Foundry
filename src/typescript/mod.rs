@@ -29,6 +29,9 @@ use crate::support::CommandId;
 
 const TYPES_EXPORT_COMMAND: CommandId = CommandId::new("types:export");
 const TYPES_EXPORT_MANIFEST: &str = ".foundry-types-manifest.json";
+const TYPE_FILE_HEADER: &str = "// Auto-generated from Foundry types. Do not edit.";
+const ENDPOINT_RUNTIME_FILE: &str = "FoundryEndpoint.ts";
+const ROUTE_HELPER_DIR: &str = "routes";
 
 /// A registered TypeScript type exporter.
 pub struct TsType {
@@ -46,6 +49,63 @@ pub struct TsAppEnum {
 }
 
 inventory::collect!(TsAppEnum);
+
+/// A registered validation schema for TypeScript route helpers.
+pub struct TsValidation {
+    pub name: &'static str,
+    pub schema_fn: fn() -> TsValidationSchema,
+}
+
+inventory::collect!(TsValidation);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TsValidationSchema {
+    pub fields: Vec<TsValidationField>,
+    pub messages: Vec<TsValidationMessage>,
+    pub attributes: Vec<TsValidationAttribute>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TsValidationField {
+    pub name: String,
+    pub rules: Vec<TsValidationRule>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TsValidationRule {
+    pub code: String,
+    pub params: BTreeMap<String, String>,
+    pub values: Vec<String>,
+    pub message: Option<String>,
+    pub server_only: bool,
+    pub rules: Vec<TsValidationRule>,
+}
+
+impl TsValidationRule {
+    pub fn new(code: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            params: BTreeMap::new(),
+            values: Vec::new(),
+            message: None,
+            server_only: false,
+            rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TsValidationMessage {
+    pub field: String,
+    pub rule: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TsValidationAttribute {
+    pub field: String,
+    pub name: String,
+}
 
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).expect("string literal serialization should not fail")
@@ -486,12 +546,13 @@ fn render_route_manifest(routes: &[RouteManifestEntry]) -> Result<String> {
                 .collect::<Vec<_>>();
 
             format!(
-                "  {}: {{ id: {}, path: {}, method: {}, params: {}, guard: {}, permissions: {}, summary: {}, request: {}, responses: [{}] }}",
+                "  {}: {{ id: {}, path: {}, method: {}, params: {}, clientExport: {}, guard: {}, permissions: {}, summary: {}, request: {}, responses: [{}] }}",
                 json_string(route.id.as_str()),
                 json_string(route.id.as_str()),
                 json_string(&route.path),
                 option_string_literal(route.method.as_deref()),
                 params,
+                if route.client_export { "true" } else { "false" },
                 option_string_literal(route.guard.as_ref().map(|guard| guard.as_str())),
                 permissions,
                 option_string_literal(route.summary.as_deref()),
@@ -622,6 +683,1096 @@ fn render_route_manifest(routes: &[RouteManifestEntry]) -> Result<String> {
     ))
 }
 
+#[derive(Debug)]
+struct PlannedRouteHelper<'a> {
+    route: &'a RouteManifestEntry,
+    name: String,
+    file: String,
+}
+
+fn to_pascal_case_identifier_with_context(value: &str, context: &str) -> Result<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch);
+        } else if ch.is_ascii() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        } else {
+            return Err(Error::message(format!(
+                "{context} only supports ASCII identifiers; `{value}` contains unsupported character `{ch}`"
+            )));
+        }
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    if words.is_empty() {
+        return Err(Error::message(format!(
+            "{context} requires a non-empty identifier"
+        )));
+    }
+
+    let mut identifier = String::new();
+    for word in words {
+        let lower = word.to_ascii_lowercase();
+        let mut chars = lower.chars();
+        if let Some(first) = chars.next() {
+            identifier.push(first.to_ascii_uppercase());
+            identifier.push_str(chars.as_str());
+        }
+    }
+
+    if !is_ts_identifier(&identifier) {
+        return Err(Error::message(format!(
+            "{context} normalized `{value}` to invalid TypeScript identifier `{identifier}`"
+        )));
+    }
+
+    Ok(identifier)
+}
+
+fn planned_route_helpers(routes: &[RouteManifestEntry]) -> Result<Vec<PlannedRouteHelper<'_>>> {
+    let mut helpers = Vec::new();
+    let mut names = BTreeMap::<String, &str>::new();
+    let mut files = BTreeMap::<String, &str>::new();
+
+    for route in routes.iter().filter(|route| route.client_export) {
+        let name = to_pascal_case_identifier_with_context(
+            route.id.as_str(),
+            "route endpoint TypeScript export",
+        )?;
+        if let Some(existing) = names.insert(name.clone(), route.id.as_str()) {
+            return Err(Error::message(format!(
+                "route endpoint TypeScript export has route ids `{existing}` and `{}` that both normalize to `{name}`",
+                route.id.as_str()
+            )));
+        }
+
+        let file = format!("{ROUTE_HELPER_DIR}/{name}.ts");
+        if let Some(existing) = files.insert(file.clone(), route.id.as_str()) {
+            return Err(Error::message(format!(
+                "route endpoint TypeScript export has route ids `{existing}` and `{}` that both write `{file}`",
+                route.id.as_str()
+            )));
+        }
+
+        helpers.push(PlannedRouteHelper { route, name, file });
+    }
+
+    Ok(helpers)
+}
+
+fn render_endpoint_runtime() -> String {
+    r#"// Auto-generated Foundry endpoint runtime. Do not edit.
+
+import { routeUrl, type RouteName, type RouteParamValue, type RouteUrlOptions } from "./RouteManifest";
+
+export type FoundryHttpMethod = "get" | "post" | "put" | "patch" | "delete" | "head" | "options";
+export type FoundryHttpHeaders = Record<string, string>;
+
+export type FoundryHttpRequestConfig = {
+  url?: string;
+  method?: FoundryHttpMethod | string;
+  data?: unknown;
+  params?: Record<string, unknown>;
+  headers?: FoundryHttpHeaders;
+  [key: string]: unknown;
+};
+
+export type FoundryHttpResponse<T> = {
+  data: T;
+  status?: number;
+  headers?: unknown;
+};
+
+export type FoundryHttpClient = {
+  request<T = unknown>(config: FoundryHttpRequestConfig): Promise<FoundryHttpResponse<T>>;
+};
+
+export type FoundryFieldErrors<TRequest> = Partial<Record<Extract<keyof TRequest, string> | string, string[]>>;
+
+export type FoundryValidationRule = {
+  readonly code: string;
+  readonly params?: Readonly<Record<string, string>>;
+  readonly values?: readonly string[];
+  readonly message?: string;
+  readonly serverOnly?: boolean;
+  readonly rules?: readonly FoundryValidationRule[];
+};
+
+export type FoundryValidationField<Field extends string = string> = {
+  readonly name: Field;
+  readonly rules: readonly FoundryValidationRule[];
+};
+
+export type FoundryValidationMessage<Field extends string = string> = {
+  readonly field: Field;
+  readonly rule: string;
+  readonly message: string;
+};
+
+export type FoundryValidationAttribute<Field extends string = string> = {
+  readonly field: Field;
+  readonly name: string;
+};
+
+export type FoundryValidationSchema<TRequest> = {
+  readonly fields: readonly FoundryValidationField<Extract<keyof TRequest, string>>[];
+  readonly messages?: readonly FoundryValidationMessage<Extract<keyof TRequest, string>>[];
+  readonly attributes?: readonly FoundryValidationAttribute<Extract<keyof TRequest, string>>[];
+};
+
+export type FoundrySubmitOptions<TParams extends Record<string, RouteParamValue>> = {
+  params?: TParams;
+  url?: string;
+  method?: FoundryHttpMethod;
+  route?: RouteUrlOptions;
+  headers?: FoundryHttpHeaders;
+  formData?: boolean;
+  validate?: boolean;
+  request?: Omit<FoundryHttpRequestConfig, "url" | "method" | "data">;
+};
+
+export class FoundryValidationClientError<TRequest> extends Error {
+  readonly errors: FoundryFieldErrors<TRequest>;
+
+  constructor(errors: FoundryFieldErrors<TRequest>) {
+    super("Client validation failed");
+    this.name = "FoundryValidationClientError";
+    this.errors = errors;
+  }
+}
+
+type Subscriber = () => void;
+
+function routeUrlUntyped(name: RouteName, params: Record<string, RouteParamValue>, options: RouteUrlOptions): string {
+  return (routeUrl as (name: RouteName, params?: Record<string, RouteParamValue>, options?: RouteUrlOptions) => string)(
+    name,
+    params,
+    options,
+  );
+}
+
+function isEmptyValue(value: unknown): boolean {
+  if (value === null || value === undefined) {
+    return true;
+  }
+  if (typeof value === "string") {
+    return value.trim().length === 0;
+  }
+  if (Array.isArray(value)) {
+    return value.length === 0;
+  }
+  return false;
+}
+
+function stringValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return String(value);
+}
+
+function finiteNumber(value: unknown): number | null {
+  const parsed = Number(stringValue(value).trim());
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function valueLength(value: unknown): number {
+  if (Array.isArray(value)) {
+    return value.length;
+  }
+  return Array.from(stringValue(value)).length;
+}
+
+function hasFileLike(value: unknown): boolean {
+  const fileCtor = typeof File === "undefined" ? undefined : File;
+  const blobCtor = typeof Blob === "undefined" ? undefined : Blob;
+
+  if (fileCtor && value instanceof fileCtor) {
+    return true;
+  }
+  if (blobCtor && value instanceof blobCtor) {
+    return true;
+  }
+  if (Array.isArray(value)) {
+    return value.some(hasFileLike);
+  }
+  if (value && typeof value === "object" && !(value instanceof Date)) {
+    return Object.values(value as Record<string, unknown>).some(hasFileLike);
+  }
+  return false;
+}
+
+function appendFormValue(form: FormData, key: string, value: unknown): void {
+  if (value === null || value === undefined) {
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      appendFormValue(form, key, item);
+    }
+    return;
+  }
+  const fileCtor = typeof File === "undefined" ? undefined : File;
+  const blobCtor = typeof Blob === "undefined" ? undefined : Blob;
+  if ((fileCtor && value instanceof fileCtor) || (blobCtor && value instanceof blobCtor)) {
+    form.append(key, value);
+    return;
+  }
+  if (value instanceof Date) {
+    form.append(key, value.toISOString());
+    return;
+  }
+  if (typeof value === "object") {
+    form.append(key, JSON.stringify(value));
+    return;
+  }
+  form.append(key, String(value));
+}
+
+function fallbackMessage(field: string, code: string, params: Readonly<Record<string, string>>): string {
+  const value = (name: string) => params[name] ?? "";
+  switch (code) {
+    case "required": return `The ${field} field is required.`;
+    case "email": return `The ${field} must be a valid email address.`;
+    case "min": return `The ${field} must be at least ${value("min")} characters.`;
+    case "max": return `The ${field} must not exceed ${value("max")} characters.`;
+    case "numeric": return `The ${field} must be a number.`;
+    case "integer": return `The ${field} must be an integer.`;
+    case "alpha": return `The ${field} must contain only letters.`;
+    case "alpha_numeric": return `The ${field} must contain only letters and numbers.`;
+    case "digits": return `The ${field} must contain only digits.`;
+    case "url": return `The ${field} must be a valid URL.`;
+    case "uuid": return `The ${field} must be a valid UUID.`;
+    case "regex": return `The ${field} has an invalid format.`;
+    case "json": return `The ${field} must be valid JSON.`;
+    case "ip": return `The ${field} must be a valid IP address.`;
+    case "ipv4": return `The ${field} must be a valid IPv4 address.`;
+    case "ipv6": return `The ${field} must be a valid IPv6 address.`;
+    case "date": return `The ${field} must be a valid date.`;
+    case "time": return `The ${field} must be a valid time.`;
+    case "datetime": return `The ${field} must be a valid datetime.`;
+    case "local_datetime": return `The ${field} must be a valid local datetime.`;
+    case "in_list": return `The selected ${field} is invalid.`;
+    case "not_in": return `The ${field} has an invalid value.`;
+    case "starts_with": return `The ${field} must start with ${value("value")}.`;
+    case "ends_with": return `The ${field} must end with ${value("value")}.`;
+    case "confirmed": return `The ${field} confirmation does not match.`;
+    case "same": return `The ${field} must match ${value("other")}.`;
+    case "different": return `The ${field} must be different from ${value("other")}.`;
+    case "before": return `The ${field} must be a date before ${value("other")}.`;
+    case "before_or_equal": return `The ${field} must be a date before or equal to ${value("other")}.`;
+    case "after": return `The ${field} must be a date after ${value("other")}.`;
+    case "after_or_equal": return `The ${field} must be a date after or equal to ${value("other")}.`;
+    case "min_numeric": return `The ${field} must be at least ${value("min")}.`;
+    case "max_numeric": return `The ${field} must not exceed ${value("max")}.`;
+    case "between": return `The ${field} must be between ${value("min")} and ${value("max")}.`;
+    case "app_enum": return `The selected ${field} is invalid.`;
+    default: return `The ${field} is invalid.`;
+  }
+}
+
+function parseComparable(value: unknown): number | null {
+  const parsed = Date.parse(stringValue(value));
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function isValidByRule(rule: FoundryValidationRule, value: unknown, data: Record<string, unknown>): boolean {
+  const params = rule.params ?? {};
+  const text = stringValue(value);
+
+  switch (rule.code) {
+    case "required": return !isEmptyValue(value);
+    case "email": return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text);
+    case "min": return valueLength(value) >= Number(params.min ?? 0);
+    case "max": return valueLength(value) <= Number(params.max ?? 0);
+    case "numeric": return finiteNumber(value) !== null;
+    case "integer": return /^-?\d+$/.test(text.trim());
+    case "alpha": return /^[\p{L}]+$/u.test(text);
+    case "alpha_numeric": return /^[\p{L}\p{N}]+$/u.test(text);
+    case "digits": return /^\d+$/.test(text);
+    case "url":
+      try {
+        new URL(text);
+        return text.length > 0;
+      } catch {
+        return false;
+      }
+    case "uuid": return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text);
+    case "regex":
+      try {
+        return new RegExp(params.pattern ?? "").test(text);
+      } catch {
+        return true;
+      }
+    case "json":
+      try {
+        JSON.parse(text);
+        return true;
+      } catch {
+        return false;
+      }
+    case "timezone":
+      if (text === "UTC" || /^[+-](?:[01]\d|2[0-3]):?[0-5]\d$/.test(text)) {
+        return true;
+      }
+      try {
+        new Intl.DateTimeFormat("en-US", { timeZone: text });
+        return true;
+      } catch {
+        return false;
+      }
+    case "ip": return /^(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f:]+)$/i.test(text);
+    case "ipv4": return /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/.test(text);
+    case "ipv6": return /^[0-9a-f:]+$/i.test(text) && text.includes(":");
+    case "date": return /^\d{4}-\d{2}-\d{2}$/.test(text) && !Number.isNaN(Date.parse(`${text}T00:00:00Z`));
+    case "time": return /^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?$/.test(text);
+    case "datetime": return !Number.isNaN(Date.parse(text));
+    case "local_datetime": return /^\d{4}-\d{2}-\d{2}[T ][0-2]\d:[0-5]\d/.test(text) && !/[zZ]|[+-]\d{2}:?\d{2}$/.test(text);
+    case "in_list": return (rule.values ?? []).includes(text);
+    case "not_in": return !(rule.values ?? []).includes(text);
+    case "starts_with": return text.startsWith(params.value ?? "");
+    case "ends_with": return text.endsWith(params.value ?? "");
+    case "confirmed":
+    case "same": return text === stringValue(data[params.other ?? ""]);
+    case "different": return text !== stringValue(data[params.other ?? ""]);
+    case "before":
+    case "before_or_equal":
+    case "after":
+    case "after_or_equal": {
+      const left = parseComparable(value);
+      const right = parseComparable(data[params.other ?? ""]);
+      if (left === null || right === null) {
+        return false;
+      }
+      if (rule.code === "before") return left < right;
+      if (rule.code === "before_or_equal") return left <= right;
+      if (rule.code === "after") return left > right;
+      return left >= right;
+    }
+    case "min_numeric": {
+      const parsed = finiteNumber(value);
+      return parsed !== null && parsed >= Number(params.min ?? 0);
+    }
+    case "max_numeric": {
+      const parsed = finiteNumber(value);
+      return parsed !== null && parsed <= Number(params.max ?? 0);
+    }
+    case "between": {
+      const parsed = finiteNumber(value);
+      return parsed !== null && parsed >= Number(params.min ?? 0) && parsed <= Number(params.max ?? 0);
+    }
+    case "app_enum": return (rule.values ?? []).includes(text);
+    default: return true;
+  }
+}
+
+export abstract class FoundryEndpoint<
+  TRequest extends Record<string, unknown>,
+  TResponse,
+  TParams extends Record<string, RouteParamValue> = Record<never, never>,
+> {
+  abstract readonly routeName: RouteName;
+  abstract readonly path: string;
+  abstract readonly method: FoundryHttpMethod | null;
+  abstract readonly validation: FoundryValidationSchema<TRequest>;
+
+  data: TRequest;
+  busy = false;
+  errors: FoundryFieldErrors<TRequest> = {};
+  response: TResponse | null = null;
+  status: number | null = null;
+  serverError: unknown = null;
+
+  private subscribers = new Set<Subscriber>();
+
+  constructor(protected readonly client: FoundryHttpClient, data: TRequest) {
+    this.data = data;
+  }
+
+  subscribe(subscriber: Subscriber): () => void {
+    this.subscribers.add(subscriber);
+    return () => this.subscribers.delete(subscriber);
+  }
+
+  protected notify(): void {
+    for (const subscriber of this.subscribers) {
+      subscriber();
+    }
+  }
+
+  setData(data: TRequest): this {
+    this.data = data;
+    this.notify();
+    return this;
+  }
+
+  patchData(data: Partial<TRequest>): this {
+    this.data = { ...this.data, ...data };
+    this.notify();
+    return this;
+  }
+
+  resetErrors(): this {
+    this.errors = {};
+    this.serverError = null;
+    this.notify();
+    return this;
+  }
+
+  validateForm(data: TRequest = this.data): boolean {
+    const errors: FoundryFieldErrors<TRequest> = {};
+    const record = data as Record<string, unknown>;
+    for (const field of this.validation.fields) {
+      this.validateField(field.name, record[field.name], field.rules, record, errors);
+    }
+    this.errors = errors;
+    this.notify();
+    return Object.keys(errors).length === 0;
+  }
+
+  toFormData(data: TRequest = this.data): FormData {
+    const form = new FormData();
+    for (const [key, value] of Object.entries(data)) {
+      appendFormValue(form, key, value);
+    }
+    return form;
+  }
+
+  async submitForm(options: FoundrySubmitOptions<TParams> = {}): Promise<TResponse> {
+    if ((options.validate ?? true) && !this.validateForm()) {
+      throw new FoundryValidationClientError(this.errors);
+    }
+
+    this.busy = true;
+    this.serverError = null;
+    this.notify();
+
+    try {
+      const url = options.url ?? routeUrlUntyped(this.routeName, options.params ?? {}, options.route ?? {});
+      const useFormData = options.formData ?? hasFileLike(this.data);
+      const data = useFormData ? this.toFormData() : this.data;
+      const response = await this.client.request<TResponse>({
+        ...(options.request ?? {}),
+        method: options.method ?? this.method ?? "get",
+        url,
+        data,
+        headers: { ...(options.request?.headers as FoundryHttpHeaders | undefined), ...(options.headers ?? {}) },
+      });
+      this.response = response.data;
+      this.status = response.status ?? null;
+      this.errors = {};
+      return response.data;
+    } catch (error) {
+      this.serverError = error;
+      this.applyServerErrors(error);
+      throw error;
+    } finally {
+      this.busy = false;
+      this.notify();
+    }
+  }
+
+  private validateField(
+    field: string,
+    value: unknown,
+    rules: readonly FoundryValidationRule[],
+    data: Record<string, unknown>,
+    errors: FoundryFieldErrors<TRequest>,
+  ): void {
+    if (rules.some((rule) => rule.code === "nullable") && isEmptyValue(value)) {
+      return;
+    }
+
+    const bail = rules.some((rule) => rule.code === "bail");
+    for (const rule of rules) {
+      if (rule.code === "nullable" || rule.code === "bail" || rule.serverOnly) {
+        continue;
+      }
+
+      if (rule.code === "each") {
+        if (Array.isArray(value)) {
+          value.forEach((item, index) => {
+            this.validateField(`${field}[${index}]`, item, rule.rules ?? [], data, errors);
+          });
+        }
+        continue;
+      }
+
+      if (!isValidByRule(rule, value, data)) {
+        this.addValidationError(errors, field, rule);
+        if (bail) {
+          break;
+        }
+      }
+    }
+  }
+
+  private addValidationError(
+    errors: FoundryFieldErrors<TRequest>,
+    field: string,
+    rule: FoundryValidationRule,
+  ): void {
+    const params = rule.params ?? {};
+    const display = this.validation.attributes?.find((entry) => entry.field === field)?.name ?? field;
+    const custom = this.validation.messages?.find((entry) => entry.field === field && entry.rule === rule.code)?.message;
+    const message = rule.message ?? custom ?? fallbackMessage(display, rule.code, params);
+    errors[field] = [...(errors[field] ?? []), message];
+  }
+
+  private applyServerErrors(error: unknown): void {
+    const responseData = (error as { response?: { data?: unknown } }).response?.data;
+    const serverErrors = (responseData as { errors?: unknown }).errors;
+    if (!Array.isArray(serverErrors)) {
+      return;
+    }
+
+    const errors: FoundryFieldErrors<TRequest> = {};
+    for (const entry of serverErrors) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      const field = String((entry as { field?: unknown }).field ?? "");
+      const message = String((entry as { message?: unknown }).message ?? "Invalid value.");
+      if (!field) {
+        continue;
+      }
+      errors[field] = [...(errors[field] ?? []), message];
+    }
+    this.errors = errors;
+  }
+}
+"#
+    .to_string()
+}
+
+fn render_validation_rule(rule: &TsValidationRule) -> String {
+    let mut parts = vec![format!("code: {}", json_string(&rule.code))];
+
+    if !rule.params.is_empty() {
+        let params = rule
+            .params
+            .iter()
+            .map(|(key, value)| format!("{}: {}", json_string(key), json_string(value)))
+            .collect::<Vec<_>>();
+        parts.push(format!("params: {{ {} }}", params.join(", ")));
+    }
+
+    if !rule.values.is_empty() {
+        parts.push(format!(
+            "values: [{}]",
+            rule.values
+                .iter()
+                .map(|value| json_string(value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    if let Some(message) = &rule.message {
+        parts.push(format!("message: {}", json_string(message)));
+    }
+
+    if rule.server_only {
+        parts.push("serverOnly: true".to_string());
+    }
+
+    if !rule.rules.is_empty() {
+        parts.push(format!(
+            "rules: [{}]",
+            rule.rules
+                .iter()
+                .map(render_validation_rule)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    format!("{{ {} }}", parts.join(", "))
+}
+
+fn render_validation_rule_remark(rule: &TsValidationRule) -> String {
+    let mut rendered = match rule.code.as_str() {
+        "each" => {
+            let nested = rule
+                .rules
+                .iter()
+                .map(render_validation_rule_remark)
+                .collect::<Vec<_>>();
+            format!("each({})", nested.join(", "))
+        }
+        "min" => format!(
+            "min({})",
+            rule.params.get("min").map(String::as_str).unwrap_or("")
+        ),
+        "max" => format!(
+            "max({})",
+            rule.params.get("max").map(String::as_str).unwrap_or("")
+        ),
+        "min_numeric" => format!(
+            "min_numeric({})",
+            rule.params.get("min").map(String::as_str).unwrap_or("")
+        ),
+        "max_numeric" => format!(
+            "max_numeric({})",
+            rule.params.get("max").map(String::as_str).unwrap_or("")
+        ),
+        "between" => format!(
+            "between({}, {})",
+            rule.params.get("min").map(String::as_str).unwrap_or(""),
+            rule.params.get("max").map(String::as_str).unwrap_or("")
+        ),
+        "confirmed" | "same" | "different" | "before" | "before_or_equal" | "after"
+        | "after_or_equal" => format!(
+            "{}({})",
+            rule.code,
+            rule.params.get("other").map(String::as_str).unwrap_or("")
+        ),
+        "regex" => format!(
+            "regex({})",
+            rule.params.get("pattern").map(String::as_str).unwrap_or("")
+        ),
+        "starts_with" | "ends_with" => format!(
+            "{}({})",
+            rule.code,
+            rule.params.get("value").map(String::as_str).unwrap_or("")
+        ),
+        "unique" | "exists" => format!(
+            "{}({}.{})",
+            rule.code,
+            rule.params.get("table").map(String::as_str).unwrap_or(""),
+            rule.params.get("column").map(String::as_str).unwrap_or("")
+        ),
+        "rule" => format!(
+            "rule({})",
+            rule.params.get("rule").map(String::as_str).unwrap_or("")
+        ),
+        "max_file_size" => format!(
+            "max_file_size({}KB)",
+            rule.params.get("max").map(String::as_str).unwrap_or("")
+        ),
+        "max_dimensions" | "min_dimensions" => format!(
+            "{}({}x{})",
+            rule.code,
+            rule.params.get("width").map(String::as_str).unwrap_or(""),
+            rule.params.get("height").map(String::as_str).unwrap_or("")
+        ),
+        "allowed_mimes" | "allowed_extensions" | "in_list" | "not_in" | "app_enum" => {
+            if rule.values.is_empty() {
+                rule.code.clone()
+            } else {
+                format!("{}({})", rule.code, rule.values.join(", "))
+            }
+        }
+        _ => rule.code.clone(),
+    };
+
+    if rule.server_only {
+        rendered.push_str(" [server]");
+    }
+
+    rendered
+}
+
+fn render_validation_rules_remark(rules: &[TsValidationRule]) -> Option<String> {
+    if rules.is_empty() {
+        return None;
+    }
+
+    let rendered = rules
+        .iter()
+        .map(render_validation_rule_remark)
+        .collect::<Vec<_>>();
+    Some(format!("Validation: {}", rendered.join(", ")))
+}
+
+fn line_declares_ts_property(line: &str, field: &str) -> bool {
+    let trimmed = line.trim_start();
+    let plain = format!("{field}:");
+    let plain_optional = format!("{field}?:");
+    let quoted = format!("{}:", json_string(field));
+    let quoted_optional = format!("{}?:", json_string(field));
+
+    trimmed.starts_with(&plain)
+        || trimmed.starts_with(&plain_optional)
+        || trimmed.starts_with(&quoted)
+        || trimmed.starts_with(&quoted_optional)
+}
+
+fn split_top_level_ts_fields(input: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut start = 0usize;
+    let mut angle_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut string_quote = None::<char>;
+    let mut escaped = false;
+
+    for (index, ch) in input.char_indices() {
+        if let Some(quote) = string_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                string_quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' | '`' => string_quote = Some(ch),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            ',' if angle_depth == 0
+                && brace_depth == 0
+                && bracket_depth == 0
+                && paren_depth == 0 =>
+            {
+                let field = input[start..index].trim();
+                if !field.is_empty() {
+                    fields.push(field.to_string());
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    let field = input[start..].trim();
+    if !field.is_empty() {
+        fields.push(field.to_string());
+    }
+
+    fields
+}
+
+fn validation_remark_for_property<'a>(
+    property: &str,
+    remarks: &'a [(&String, String)],
+) -> Option<&'a str> {
+    remarks.iter().find_map(|(field, remark)| {
+        if line_declares_ts_property(property, field) {
+            Some(remark.as_str())
+        } else {
+            None
+        }
+    })
+}
+
+fn expand_single_line_type_literal(line: &str, remarks: &[(&String, String)]) -> Option<String> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("export type ") || !trimmed.ends_with("};") {
+        return None;
+    }
+
+    let open_index = trimmed.find('{')?;
+    let close_index = trimmed.rfind("};")?;
+    if close_index <= open_index {
+        return None;
+    }
+
+    let fields = split_top_level_ts_fields(&trimmed[open_index + 1..close_index]);
+    if fields.is_empty()
+        || !fields
+            .iter()
+            .any(|field| validation_remark_for_property(field, remarks).is_some())
+    {
+        return None;
+    }
+
+    let indent_len = line.len().saturating_sub(trimmed.len());
+    let indent = &line[..indent_len];
+    let prefix = trimmed[..open_index].trim_end();
+    let mut output = format!("{indent}{prefix} {{\n");
+
+    for field in fields {
+        if let Some(remark) = validation_remark_for_property(&field, remarks) {
+            output.push_str(indent);
+            output.push_str("  // ");
+            output.push_str(remark);
+            output.push('\n');
+        }
+        output.push_str(indent);
+        output.push_str("  ");
+        output.push_str(&field);
+        if !field.ends_with(',') {
+            output.push(',');
+        }
+        output.push('\n');
+    }
+
+    output.push_str(indent);
+    output.push_str("};");
+    Some(output)
+}
+
+fn add_validation_comments(content: &str, schema: &TsValidationSchema) -> String {
+    let remarks = schema
+        .fields
+        .iter()
+        .filter_map(|field| {
+            render_validation_rules_remark(&field.rules).map(|remark| (&field.name, remark))
+        })
+        .collect::<Vec<_>>();
+
+    if remarks.is_empty() {
+        return content.to_string();
+    }
+
+    let mut output = String::new();
+    for line in content.lines() {
+        if let Some(expanded) = expand_single_line_type_literal(line, &remarks) {
+            output.push_str(&expanded);
+            output.push('\n');
+            continue;
+        }
+
+        for (field, remark) in &remarks {
+            if line_declares_ts_property(line, field) {
+                let indent_len = line.len().saturating_sub(line.trim_start().len());
+                let indent = &line[..indent_len];
+                output.push_str(indent);
+                output.push_str("// ");
+                output.push_str(remark);
+                output.push('\n');
+                break;
+            }
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+
+    if !content.ends_with('\n') {
+        output.pop();
+    }
+
+    output
+}
+
+fn postprocess_ts_type_file(path: &Path, validation: Option<&TsValidationSchema>) -> Result<()> {
+    let mut content = std::fs::read_to_string(path).map_err(Error::other)?;
+
+    if !content.starts_with(TYPE_FILE_HEADER) {
+        content = format!("{TYPE_FILE_HEADER}\n{content}");
+    }
+
+    if let Some(validation) = validation {
+        content = add_validation_comments(&content, validation);
+    }
+
+    write_generated_file(path, content)
+}
+
+fn render_validation_schema(schema: Option<&TsValidationSchema>, request_type: &str) -> String {
+    let schema = schema.cloned().unwrap_or_default();
+    let fields = schema
+        .fields
+        .iter()
+        .map(|field| {
+            let rules = field
+                .rules
+                .iter()
+                .map(render_validation_rule)
+                .collect::<Vec<_>>();
+            format!(
+                "    {{ name: {}, rules: [{}] }}",
+                json_string(&field.name),
+                rules.join(", ")
+            )
+        })
+        .collect::<Vec<_>>();
+    let messages = schema
+        .messages
+        .iter()
+        .map(|message| {
+            format!(
+                "    {{ field: {}, rule: {}, message: {} }}",
+                json_string(&message.field),
+                json_string(&message.rule),
+                json_string(&message.message)
+            )
+        })
+        .collect::<Vec<_>>();
+    let attributes = schema
+        .attributes
+        .iter()
+        .map(|attribute| {
+            format!(
+                "    {{ field: {}, name: {} }}",
+                json_string(&attribute.field),
+                json_string(&attribute.name)
+            )
+        })
+        .collect::<Vec<_>>();
+
+    format!(
+        "{{\n  fields: [\n{}\n  ],\n  messages: [\n{}\n  ],\n  attributes: [\n{}\n  ],\n}} as const satisfies FoundryValidationSchema<{request_type}>",
+        fields.join(",\n"),
+        messages.join(",\n"),
+        attributes.join(",\n"),
+    )
+}
+
+fn validation_schemas() -> BTreeMap<&'static str, TsValidationSchema> {
+    let mut schemas = BTreeMap::new();
+    for validation in inventory::iter::<TsValidation> {
+        schemas.insert(validation.name, (validation.schema_fn)());
+    }
+    schemas
+}
+
+fn route_type_name(helper_name: &str, suffix: &str) -> String {
+    format!("{helper_name}{suffix}")
+}
+
+fn schema_type_reference(
+    schema: Option<&str>,
+    exported_types: &BTreeMap<String, String>,
+    imports: &mut BTreeSet<String>,
+    fallback: &str,
+) -> String {
+    let Some(schema) = schema else {
+        return fallback.to_string();
+    };
+
+    if exported_types.contains_key(schema) {
+        imports.insert(schema.to_string());
+        schema.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn route_response_type(
+    route: &RouteManifestEntry,
+    exported_types: &BTreeMap<String, String>,
+    imports: &mut BTreeSet<String>,
+) -> String {
+    let mut responses = route
+        .responses
+        .iter()
+        .filter(|response| (200..300).contains(&response.status))
+        .map(|response| {
+            schema_type_reference(Some(response.schema), exported_types, imports, "unknown")
+        })
+        .collect::<Vec<_>>();
+    responses.sort();
+    responses.dedup();
+
+    match responses.as_slice() {
+        [] => "unknown".to_string(),
+        [one] => one.clone(),
+        many => many.join(" | "),
+    }
+}
+
+fn render_route_params_type(route: &RouteManifestEntry) -> String {
+    if route.params.is_empty() {
+        return "Record<never, never>".to_string();
+    }
+
+    let fields = route
+        .params
+        .iter()
+        .map(|param| format!("{}: RouteParamValue", json_string(param)))
+        .collect::<Vec<_>>();
+    format!("{{ {} }}", fields.join("; "))
+}
+
+fn route_helper_module_specifier(file: &str) -> Result<String> {
+    let module = file.strip_suffix(".ts").ok_or_else(|| {
+        Error::message(format!(
+            "TypeScript route helper import path `{file}` must end with .ts"
+        ))
+    })?;
+    Ok(format!("../{module}"))
+}
+
+fn render_route_helper(
+    helper: &PlannedRouteHelper<'_>,
+    exported_types: &BTreeMap<String, String>,
+    validations: &BTreeMap<&'static str, TsValidationSchema>,
+) -> Result<String> {
+    let route = helper.route;
+    let name = &helper.name;
+    let endpoint_name = route_type_name(name, "Endpoint");
+    let request_alias = route_type_name(name, "Request");
+    let response_alias = route_type_name(name, "Response");
+    let params_alias = route_type_name(name, "Params");
+    let path_const = route_type_name(name, "Path");
+    let method_const = route_type_name(name, "Method");
+    let validation_const = route_type_name(name, "Validation");
+
+    let mut imports = BTreeSet::new();
+    let request_type = schema_type_reference(
+        route.request,
+        exported_types,
+        &mut imports,
+        "Record<string, never>",
+    );
+    let response_type = route_response_type(route, exported_types, &mut imports);
+    let params_type = render_route_params_type(route);
+
+    let import_lines = imports
+        .iter()
+        .filter_map(|import| {
+            exported_types.get(import).map(|file| {
+                route_helper_module_specifier(file).map(|module| {
+                    format!("import type {{ {import} }} from {};", json_string(&module))
+                })
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let validation = render_validation_schema(
+        route.request.and_then(|request| validations.get(request)),
+        &request_alias,
+    );
+    let method = option_string_literal(route.method.as_deref());
+
+    Ok(format!(
+        "// Auto-generated from Foundry route `{}`. Do not edit.\n\n\
+         import {{ FoundryEndpoint, type FoundryHttpClient, type FoundryHttpMethod, type FoundryValidationSchema }} from \"../FoundryEndpoint\";\n\
+         import type {{ RouteName, RouteParamValue }} from \"../RouteManifest\";\n\
+         {}\n\
+         export const {path_const} = {} as const;\n\
+         export const {method_const} = {} as FoundryHttpMethod | null;\n\
+         export type {request_alias} = {request_type};\n\
+         export type {response_alias} = {response_type};\n\
+         export type {params_alias} = {params_type};\n\n\
+         export const {validation_const} = {validation};\n\n\
+         export class {endpoint_name} extends FoundryEndpoint<{request_alias} & Record<string, unknown>, {response_alias}, {params_alias}> {{\n\
+           readonly routeName = {} as RouteName;\n\
+           readonly path = {path_const};\n\
+           readonly method = {method_const};\n\
+           readonly validation = {validation_const};\n\
+         }}\n\n\
+         export function {name}(client: FoundryHttpClient, data: {request_alias}): {endpoint_name} {{\n\
+           return new {endpoint_name}(client, data as {request_alias} & Record<string, unknown>);\n\
+         }}\n",
+        route.id.as_str(),
+        import_lines.join("\n"),
+        json_string(&route.path),
+        method,
+        json_string(route.id.as_str()),
+    ))
+}
+
 /// Export all registered TypeScript types to a directory.
 pub fn export_all(dir: &Path) -> Result<()> {
     export_all_with_routes(dir, &[])
@@ -634,7 +1785,9 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
     let ts_types: Vec<&TsType> = inventory::iter::<TsType>.into_iter().collect();
     let app_enums: Vec<&TsAppEnum> = inventory::iter::<TsAppEnum>.into_iter().collect();
     let ts_type_files = planned_ts_type_files(&ts_types)?;
-    let output_files = planned_output_files(&ts_type_files, &app_enums);
+    let route_helpers = planned_route_helpers(routes)?;
+    let output_files = planned_output_files(&ts_type_files, &app_enums, &route_helpers);
+    let validations = validation_schemas();
     clean_manifest_files(dir, &output_files)?;
 
     let mut type_exports = BTreeMap::new();
@@ -645,6 +1798,7 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
             .get(ts_type.name)
             .expect("planned TypeScript file should exist")
             .clone();
+        postprocess_ts_type_file(&dir.join(&file), validations.get(ts_type.name))?;
         type_exports.insert(ts_type.name, file);
     }
 
@@ -662,6 +1816,14 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
         enum_names.insert(app_enum.name);
     }
 
+    let mut exported_types = BTreeMap::new();
+    for (name, file) in &type_exports {
+        exported_types.insert((*name).to_string(), file.clone());
+    }
+    for name in &enum_names {
+        exported_types.insert((*name).to_string(), format!("{name}.ts"));
+    }
+
     let mut names: Vec<&str> = type_exports
         .keys()
         .copied()
@@ -674,6 +1836,17 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
         &dir.join("RouteManifest.ts"),
         render_route_manifest(routes)?,
     )?;
+    write_generated_file(&dir.join(ENDPOINT_RUNTIME_FILE), render_endpoint_runtime())?;
+
+    if !route_helpers.is_empty() {
+        std::fs::create_dir_all(dir.join(ROUTE_HELPER_DIR)).map_err(Error::other)?;
+    }
+    for helper in &route_helpers {
+        write_generated_file(
+            &dir.join(&helper.file),
+            render_route_helper(helper, &exported_types, &validations)?,
+        )?;
+    }
 
     let mut barrel = String::from("// Auto-generated barrel. Do not edit.\n");
     for name in &names {
@@ -697,6 +1870,13 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
     barrel.push_str(
         "export { RouteManifest, RouteIds, createRouteUrlBuilder, routeUrl, type RouteName, type RouteParams, type RouteParamValue, type RouteUrlOptions } from \"./RouteManifest\";\n",
     );
+    barrel.push_str(
+        "export { FoundryEndpoint, FoundryValidationClientError, type FoundryFieldErrors, type FoundryHttpClient, type FoundryHttpHeaders, type FoundryHttpMethod, type FoundryHttpRequestConfig, type FoundryHttpResponse, type FoundrySubmitOptions, type FoundryValidationAttribute, type FoundryValidationField, type FoundryValidationMessage, type FoundryValidationRule, type FoundryValidationSchema } from \"./FoundryEndpoint\";\n",
+    );
+    for helper in &route_helpers {
+        let module = ts_module_specifier(&helper.file)?;
+        barrel.push_str(&format!("export * from \"{module}\";\n"));
+    }
     write_generated_file(&dir.join("index.ts"), barrel)?;
     write_export_manifest(dir, &output_files)?;
 
@@ -724,6 +1904,7 @@ fn planned_ts_type_files(ts_types: &[&TsType]) -> Result<BTreeMap<&'static str, 
 fn planned_output_files(
     ts_type_files: &BTreeMap<&'static str, String>,
     app_enums: &[&TsAppEnum],
+    route_helpers: &[PlannedRouteHelper<'_>],
 ) -> BTreeSet<String> {
     let mut files = BTreeSet::new();
     for file in ts_type_files.values() {
@@ -733,6 +1914,10 @@ fn planned_output_files(
         files.insert(format!("{}.ts", app_enum.name));
     }
     files.insert("RouteManifest.ts".to_string());
+    files.insert(ENDPOINT_RUNTIME_FILE.to_string());
+    for helper in route_helpers {
+        files.insert(helper.file.clone());
+    }
     files.insert("index.ts".to_string());
     files
 }
@@ -841,6 +2026,7 @@ mod tests {
     use super::render_app_enum;
     use super::render_route_manifest;
     use super::TYPES_EXPORT_MANIFEST;
+    use super::TYPE_FILE_HEADER;
 
     #[derive(Clone, Debug, PartialEq, Eq, crate::AppEnum)]
     enum MinimalExportStatus {
@@ -879,6 +2065,23 @@ mod tests {
         value: String,
     }
 
+    #[allow(dead_code)]
+    #[derive(Clone, Debug, serde::Serialize, ts_rs::TS, crate::ApiSchema, crate::Validate)]
+    struct MinimalLoginRequest {
+        #[validate(required, email)]
+        email: String,
+        #[validate(required, min(8), confirmed("password_confirmation"))]
+        password: String,
+        #[validate(required)]
+        password_confirmation: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Clone, Debug, serde::Serialize, ts_rs::TS, crate::ApiSchema)]
+    struct MinimalLoginResponse {
+        token: String,
+    }
+
     fn string_meta(values: &[&str]) -> EnumMeta {
         EnumMeta {
             id: "permission".to_string(),
@@ -901,6 +2104,7 @@ mod tests {
             path: path.to_string(),
             method: Some("get".to_string()),
             params: params.iter().map(|param| (*param).to_string()).collect(),
+            client_export: true,
             guard: Some(GuardId::new("admin")),
             permissions: vec![PermissionId::new("users.read")],
             summary: Some("Show user".to_string()),
@@ -908,6 +2112,24 @@ mod tests {
             responses: vec![RouteManifestResponse {
                 status: 200,
                 schema: "ShowUserResponse",
+            }],
+        }
+    }
+
+    fn login_route_manifest_entry(client_export: bool) -> RouteManifestEntry {
+        RouteManifestEntry {
+            id: RouteId::new("user.portal.login"),
+            path: "/api/v1/user-portal/login".to_string(),
+            method: Some("post".to_string()),
+            params: Vec::new(),
+            client_export,
+            guard: None,
+            permissions: Vec::new(),
+            summary: Some("Login".to_string()),
+            request: Some("MinimalLoginRequest"),
+            responses: vec![RouteManifestResponse {
+                status: 200,
+                schema: "MinimalLoginResponse",
             }],
         }
     }
@@ -929,7 +2151,10 @@ mod tests {
             "TokenResponse.ts",
             "WsTokenResponse.ts",
             "RouteManifest.ts",
+            "FoundryEndpoint.ts",
             "MinimalExportAppEnumDto.ts",
+            "MinimalLoginRequest.ts",
+            "MinimalLoginResponse.ts",
         ] {
             assert!(
                 dir.path().join(file).exists(),
@@ -997,6 +2222,10 @@ mod tests {
         );
 
         let datatable_request = fs::read_to_string(dir.path().join("DatatableRequest.ts")).unwrap();
+        assert!(
+            datatable_request.starts_with(TYPE_FILE_HEADER),
+            "expected DTO files to include Foundry generated-file header:\n{datatable_request}"
+        );
         assert!(
             datatable_request.contains("page: number"),
             "expected DatatableRequest.ts page field to use number:\n{datatable_request}"
@@ -1162,6 +2391,12 @@ mod tests {
             ),
             "expected index.ts to re-export route manifest helpers:\n{index}"
         );
+        assert!(
+            index.contains(
+                "export { FoundryEndpoint, FoundryValidationClientError, type FoundryFieldErrors, type FoundryHttpClient"
+            ),
+            "expected index.ts to re-export endpoint runtime:\n{index}"
+        );
 
         let route_manifest = fs::read_to_string(dir.path().join("RouteManifest.ts")).unwrap();
         assert!(
@@ -1211,6 +2446,7 @@ mod tests {
         .unwrap();
         assert!(manifest.iter().any(|file| file == "index.ts"));
         assert!(manifest.iter().any(|file| file == "RouteManifest.ts"));
+        assert!(manifest.iter().any(|file| file == "FoundryEndpoint.ts"));
     }
 
     #[cfg(unix)]
@@ -1262,6 +2498,10 @@ mod tests {
             "expected route params:\n{route_manifest}"
         );
         assert!(
+            route_manifest.contains("clientExport: true"),
+            "expected client export metadata:\n{route_manifest}"
+        );
+        assert!(
             route_manifest.contains("guard: \"admin\""),
             "expected guard metadata:\n{route_manifest}"
         );
@@ -1282,6 +2522,128 @@ mod tests {
         assert!(
             index.contains("from \"./RouteManifest\";"),
             "expected route manifest barrel export:\n{index}"
+        );
+        assert!(
+            index.contains("export * from \"./routes/AdminUsersShow\";"),
+            "expected route endpoint helper barrel export:\n{index}"
+        );
+    }
+
+    #[test]
+    fn exports_route_endpoint_helper_with_validation_metadata() {
+        let dir = tempdir().unwrap();
+        export_all_with_routes(dir.path(), &[login_route_manifest_entry(true)]).unwrap();
+
+        let runtime = fs::read_to_string(dir.path().join("FoundryEndpoint.ts")).unwrap();
+        assert!(
+            runtime.contains("abstract class FoundryEndpoint"),
+            "expected endpoint runtime class:\n{runtime}"
+        );
+        assert!(
+            runtime.contains("async submitForm"),
+            "expected endpoint runtime submit helper:\n{runtime}"
+        );
+        assert!(
+            runtime.contains("validateForm"),
+            "expected endpoint runtime validation helper:\n{runtime}"
+        );
+
+        let helper = fs::read_to_string(dir.path().join("routes/UserPortalLogin.ts")).unwrap();
+        let request = fs::read_to_string(dir.path().join("MinimalLoginRequest.ts")).unwrap();
+        assert!(
+            request.starts_with(TYPE_FILE_HEADER),
+            "expected request DTO to include generated-file header:\n{request}"
+        );
+        assert!(
+            request.contains("// Validation: required, email\n"),
+            "expected email validation remark in request DTO:\n{request}"
+        );
+        assert!(
+            request.contains("// Validation: required, min(8), confirmed(password_confirmation)\n"),
+            "expected password validation remark in request DTO:\n{request}"
+        );
+        assert!(
+            helper.contains("import type { MinimalLoginRequest } from \"../MinimalLoginRequest\";"),
+            "expected request type import:\n{helper}"
+        );
+        assert!(
+            helper
+                .contains("import type { MinimalLoginResponse } from \"../MinimalLoginResponse\";"),
+            "expected response type import:\n{helper}"
+        );
+        assert!(
+            helper.contains("export type UserPortalLoginRequest = MinimalLoginRequest;"),
+            "expected route request alias:\n{helper}"
+        );
+        assert!(
+            helper.contains("export type UserPortalLoginResponse = MinimalLoginResponse;"),
+            "expected route response alias:\n{helper}"
+        );
+        assert!(
+            helper.contains("export class UserPortalLoginEndpoint extends FoundryEndpoint"),
+            "expected endpoint class:\n{helper}"
+        );
+        assert!(
+            helper.contains(
+                "export function UserPortalLogin(client: FoundryHttpClient, data: UserPortalLoginRequest): UserPortalLoginEndpoint"
+            ),
+            "expected factory function:\n{helper}"
+        );
+        assert!(
+            helper.contains(
+                "{ name: \"email\", rules: [{ code: \"required\" }, { code: \"email\" }] }"
+            ),
+            "expected email validation rules:\n{helper}"
+        );
+        assert!(
+            helper.contains("{ code: \"min\", params: { \"min\": \"8\" } }"),
+            "expected min validation metadata:\n{helper}"
+        );
+        assert!(
+            helper.contains(
+                "{ code: \"confirmed\", params: { \"other\": \"password_confirmation\" } }"
+            ),
+            "expected cross-field validation metadata:\n{helper}"
+        );
+
+        let index = fs::read_to_string(dir.path().join("index.ts")).unwrap();
+        assert!(
+            index.contains("export * from \"./routes/UserPortalLogin\";"),
+            "expected route helper barrel export:\n{index}"
+        );
+
+        let manifest: Vec<String> = serde_json::from_str(
+            &fs::read_to_string(dir.path().join(TYPES_EXPORT_MANIFEST)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            manifest
+                .iter()
+                .any(|file| file == "routes/UserPortalLogin.ts"),
+            "expected generated manifest to track route helper files: {manifest:?}"
+        );
+    }
+
+    #[test]
+    fn route_endpoint_helper_export_can_be_disabled_per_route() {
+        let dir = tempdir().unwrap();
+        export_all_with_routes(dir.path(), &[login_route_manifest_entry(false)]).unwrap();
+
+        assert!(
+            !dir.path().join("routes/UserPortalLogin.ts").exists(),
+            "did not expect opt-out route helper to be written"
+        );
+
+        let route_manifest = fs::read_to_string(dir.path().join("RouteManifest.ts")).unwrap();
+        assert!(
+            route_manifest.contains("clientExport: false"),
+            "expected route manifest to preserve opt-out metadata:\n{route_manifest}"
+        );
+
+        let index = fs::read_to_string(dir.path().join("index.ts")).unwrap();
+        assert!(
+            !index.contains("routes/UserPortalLogin"),
+            "did not expect opt-out route helper in barrel:\n{index}"
         );
     }
 

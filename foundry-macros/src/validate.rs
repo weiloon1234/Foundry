@@ -413,6 +413,8 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let attributes_body = generate_attributes_body(&args.attributes);
 
     let from_multipart_impl = generate_from_multipart_impl(&ident, &all_fields)?;
+    let ts_validation_registration =
+        generate_ts_validation_registration(&ident, &field_validations, &args)?;
 
     Ok(quote! {
         #[::foundry::__reexports::async_trait]
@@ -432,7 +434,379 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         }
 
         #from_multipart_impl
+        #ts_validation_registration
     })
+}
+
+fn generate_ts_validation_registration(
+    ident: &Ident,
+    field_validations: &[FieldValidation],
+    args: &ValidateArgs,
+) -> syn::Result<TokenStream> {
+    let name = ident.to_string();
+    let fields = field_validations
+        .iter()
+        .map(|field| {
+            let field_name = &field.field_name;
+            let rules = generate_ts_validation_rules(&field.rules)?;
+            Ok(quote! {
+                ::foundry::typescript::TsValidationField {
+                    name: #field_name.to_string(),
+                    rules: vec![#(#rules),*],
+                }
+            })
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
+
+    let messages = args.messages.iter().map(|(field, rule, message)| {
+        quote! {
+            ::foundry::typescript::TsValidationMessage {
+                field: #field.to_string(),
+                rule: #rule.to_string(),
+                message: #message.to_string(),
+            }
+        }
+    });
+    let attributes = args.attributes.iter().map(|(field, name)| {
+        quote! {
+            ::foundry::typescript::TsValidationAttribute {
+                field: #field.to_string(),
+                name: #name.to_string(),
+            }
+        }
+    });
+
+    Ok(quote! {
+        ::foundry::inventory::submit! {
+            ::foundry::typescript::TsValidation {
+                name: #name,
+                schema_fn: || ::foundry::typescript::TsValidationSchema {
+                    fields: vec![#(#fields),*],
+                    messages: vec![#(#messages),*],
+                    attributes: vec![#(#attributes),*],
+                },
+            }
+        }
+    })
+}
+
+fn generate_ts_validation_rules(rules: &[RuleSpec]) -> syn::Result<Vec<TokenStream>> {
+    rules
+        .iter()
+        .map(generate_ts_validation_rule)
+        .collect::<syn::Result<Vec<_>>>()
+}
+
+fn generate_ts_validation_rule(rule: &RuleSpec) -> syn::Result<TokenStream> {
+    match rule {
+        RuleSpec::Simple { name, message } => Ok(generate_ts_rule(
+            name,
+            Vec::new(),
+            quote!(Vec::new()),
+            message,
+            false,
+            Vec::new(),
+        )),
+        RuleSpec::Parametric {
+            name,
+            args,
+            message,
+        } => generate_ts_parametric_rule(name, args, message),
+        RuleSpec::Each { rules } => {
+            let nested = generate_ts_validation_rules(rules)?;
+            Ok(generate_ts_rule(
+                "each",
+                Vec::new(),
+                quote!(Vec::new()),
+                &None,
+                false,
+                nested,
+            ))
+        }
+        RuleSpec::AppEnum { type_path } => {
+            let values = quote! {{
+                let __meta = <#type_path as ::foundry::FoundryAppEnum>::meta();
+                __meta
+                    .options
+                    .iter()
+                    .map(|__option| match &__option.value {
+                        ::foundry::EnumKey::String(__value) => __value.clone(),
+                        ::foundry::EnumKey::Int(__value) => __value.to_string(),
+                    })
+                    .collect::<Vec<String>>()
+            }};
+            Ok(generate_ts_rule(
+                "app_enum",
+                Vec::new(),
+                values,
+                &None,
+                false,
+                Vec::new(),
+            ))
+        }
+        RuleSpec::Image => Ok(generate_ts_rule(
+            "image",
+            Vec::new(),
+            quote!(Vec::new()),
+            &None,
+            true,
+            Vec::new(),
+        )),
+        RuleSpec::MaxFileSize(kb_expr) => Ok(generate_ts_rule(
+            "max_file_size",
+            vec![("max", quote!((#kb_expr) as u64))],
+            quote!(Vec::new()),
+            &None,
+            true,
+            Vec::new(),
+        )),
+        RuleSpec::MaxDimensions(w_expr, h_expr) => Ok(generate_ts_rule(
+            "max_dimensions",
+            vec![
+                ("width", quote!((#w_expr) as u32)),
+                ("height", quote!((#h_expr) as u32)),
+            ],
+            quote!(Vec::new()),
+            &None,
+            true,
+            Vec::new(),
+        )),
+        RuleSpec::MinDimensions(w_expr, h_expr) => Ok(generate_ts_rule(
+            "min_dimensions",
+            vec![
+                ("width", quote!((#w_expr) as u32)),
+                ("height", quote!((#h_expr) as u32)),
+            ],
+            quote!(Vec::new()),
+            &None,
+            true,
+            Vec::new(),
+        )),
+        RuleSpec::AllowedMimes(exprs) => Ok(generate_ts_rule(
+            "allowed_mimes",
+            Vec::new(),
+            quote!(vec![#(#exprs.to_string()),*]),
+            &None,
+            true,
+            Vec::new(),
+        )),
+        RuleSpec::AllowedExtensions(exprs) => Ok(generate_ts_rule(
+            "allowed_extensions",
+            Vec::new(),
+            quote!(vec![#(#exprs.to_string()),*]),
+            &None,
+            true,
+            Vec::new(),
+        )),
+    }
+}
+
+fn generate_ts_parametric_rule(
+    name: &str,
+    args: &[syn::Expr],
+    message: &Option<String>,
+) -> syn::Result<TokenStream> {
+    if CROSS_FIELD_RULES.contains(&name) {
+        if args.len() != 1 {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "`{}` requires exactly 1 argument (the other field name)",
+                    name
+                ),
+            ));
+        }
+        let other = extract_string_literal(&args[0], name)?;
+        return Ok(generate_ts_rule(
+            name,
+            vec![("other", quote!(#other))],
+            quote!(Vec::new()),
+            message,
+            false,
+            Vec::new(),
+        ));
+    }
+
+    if TWO_STRING_PARAM_RULES.contains(&name) {
+        if args.len() != 2 {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("`{}` requires exactly 2 arguments (table, column)", name),
+            ));
+        }
+        let arg0 = &args[0];
+        let arg1 = &args[1];
+        return Ok(generate_ts_rule(
+            name,
+            vec![("table", quote!(#arg0)), ("column", quote!(#arg1))],
+            quote!(Vec::new()),
+            message,
+            true,
+            Vec::new(),
+        ));
+    }
+
+    if STRING_PARAM_RULES.contains(&name) {
+        if args.len() != 1 {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("`{}` requires exactly 1 argument", name),
+            ));
+        }
+        let key = if name == "regex" { "pattern" } else { "value" };
+        let arg0 = &args[0];
+        return Ok(generate_ts_rule(
+            name,
+            vec![(key, quote!(#arg0))],
+            quote!(Vec::new()),
+            message,
+            false,
+            Vec::new(),
+        ));
+    }
+
+    if name == "min" || name == "max" {
+        if args.len() != 1 {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("`{}` requires exactly 1 argument", name),
+            ));
+        }
+        let key = name;
+        let arg0 = &args[0];
+        return Ok(generate_ts_rule(
+            name,
+            vec![(key, quote!((#arg0) as usize))],
+            quote!(Vec::new()),
+            message,
+            false,
+            Vec::new(),
+        ));
+    }
+
+    if FLOAT_PARAM_RULES.contains(&name) {
+        if args.len() != 1 {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("`{}` requires exactly 1 argument", name),
+            ));
+        }
+        let key = if name == "min_numeric" { "min" } else { "max" };
+        let arg0 = &args[0];
+        return Ok(generate_ts_rule(
+            name,
+            vec![(key, quote!((#arg0) as f64))],
+            quote!(Vec::new()),
+            message,
+            false,
+            Vec::new(),
+        ));
+    }
+
+    if name == "between" {
+        if args.len() != 2 {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`between` requires exactly 2 arguments (min, max)",
+            ));
+        }
+        let min = &args[0];
+        let max = &args[1];
+        return Ok(generate_ts_rule(
+            name,
+            vec![
+                ("min", quote!((#min) as f64)),
+                ("max", quote!((#max) as f64)),
+            ],
+            quote!(Vec::new()),
+            message,
+            false,
+            Vec::new(),
+        ));
+    }
+
+    if name == "in_list" || name == "not_in" {
+        if args.is_empty() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("`{}` requires at least 1 argument", name),
+            ));
+        }
+        return Ok(generate_ts_rule(
+            name,
+            Vec::new(),
+            quote!(vec![#(#args.to_string()),*]),
+            message,
+            false,
+            Vec::new(),
+        ));
+    }
+
+    if name == "rule" {
+        if args.len() != 1 {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`rule` requires exactly 1 argument (the rule name string)",
+            ));
+        }
+        let rule_name = extract_string_literal(&args[0], "rule")?;
+        return Ok(generate_ts_rule(
+            "rule",
+            vec![("rule", quote!(#rule_name))],
+            quote!(Vec::new()),
+            message,
+            true,
+            Vec::new(),
+        ));
+    }
+
+    if args.is_empty() {
+        return Ok(generate_ts_rule(
+            name,
+            Vec::new(),
+            quote!(Vec::new()),
+            message,
+            false,
+            Vec::new(),
+        ));
+    }
+
+    Err(syn::Error::new(
+        proc_macro2::Span::call_site(),
+        format!("unknown parametric validation rule `{}`", name),
+    ))
+}
+
+fn generate_ts_rule(
+    code: &str,
+    params: Vec<(&str, TokenStream)>,
+    values: TokenStream,
+    message: &Option<String>,
+    server_only: bool,
+    nested_rules: Vec<TokenStream>,
+) -> TokenStream {
+    let params = params.iter().map(|(name, value)| {
+        quote! {
+            __params.insert(#name.to_string(), (#value).to_string());
+        }
+    });
+    let message = match message {
+        Some(message) => quote!(Some(#message.to_string())),
+        None => quote!(None),
+    };
+
+    quote! {{
+        let mut __params = ::std::collections::BTreeMap::new();
+        #(#params)*
+        ::foundry::typescript::TsValidationRule {
+            code: #code.to_string(),
+            params: __params,
+            values: #values,
+            message: #message,
+            server_only: #server_only,
+            rules: vec![#(#nested_rules),*],
+        }
+    }}
 }
 
 fn is_file_rule(rule: &RuleSpec) -> bool {

@@ -83,6 +83,7 @@ pub struct RouteManifestEntry {
     pub path: String,
     pub method: Option<String>,
     pub params: Vec<String>,
+    pub client_export: bool,
     pub guard: Option<GuardId>,
     pub permissions: Vec<PermissionId>,
     pub summary: Option<String>,
@@ -128,7 +129,7 @@ impl HttpAuthorizeContext {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct HttpRouteOptions {
     pub access: AccessScope,
     middlewares: Vec<MiddlewareConfig>,
@@ -136,8 +137,25 @@ pub struct HttpRouteOptions {
     pub(crate) authorize: Option<HttpAuthorizeCallback>,
     pub(crate) post_auth_rate_limit: Option<middleware::RateLimit>,
     pub(crate) allow_mfa_pending_token: bool,
+    pub(crate) client_export: bool,
     audit_area: AuditAreaSetting,
     pub(crate) doc: Option<crate::openapi::RouteDoc>,
+}
+
+impl Default for HttpRouteOptions {
+    fn default() -> Self {
+        Self {
+            access: AccessScope::default(),
+            middlewares: Vec::new(),
+            middleware_group_name: None,
+            authorize: None,
+            post_auth_rate_limit: None,
+            allow_mfa_pending_token: false,
+            client_export: true,
+            audit_area: AuditAreaSetting::default(),
+            doc: None,
+        }
+    }
 }
 
 impl HttpRouteOptions {
@@ -195,6 +213,22 @@ impl HttpRouteOptions {
 
     pub fn allow_mfa_pending_token(mut self) -> Self {
         self.allow_mfa_pending_token = true;
+        self
+    }
+
+    /// Enable or disable generation of the TypeScript endpoint helper for this route.
+    ///
+    /// DTOs and route manifest metadata remain available when this is disabled.
+    pub fn client_export(mut self, enabled: bool) -> Self {
+        self.client_export = enabled;
+        self
+    }
+
+    /// Disable generation of the TypeScript endpoint helper for this route.
+    ///
+    /// This is equivalent to `client_export(false)`.
+    pub fn without_client_export(mut self) -> Self {
+        self.client_export = false;
         self
     }
 
@@ -317,6 +351,7 @@ impl HttpRouteOptions {
         if defaults.allow_mfa_pending_token {
             self.allow_mfa_pending_token = true;
         }
+        self.client_export = self.client_export && defaults.client_export;
         self.audit_area = merge_audit_area_setting(&self.audit_area, &defaults.audit_area);
 
         self.doc = match (self.doc.take(), defaults.doc.as_ref()) {
@@ -764,6 +799,22 @@ impl HttpRouteBuilder {
 
     pub fn middleware_group(&mut self, name: impl Into<String>) -> &mut Self {
         self.options.middleware_group_name = Some(name.into());
+        self
+    }
+
+    /// Enable or disable generation of the TypeScript endpoint helper for this route.
+    ///
+    /// DTOs and route manifest metadata remain available when this is disabled.
+    pub fn client_export(&mut self, enabled: bool) -> &mut Self {
+        self.options.client_export = enabled;
+        self
+    }
+
+    /// Disable generation of the TypeScript endpoint helper for this route.
+    ///
+    /// This is equivalent to `client_export(false)`.
+    pub fn without_client_export(&mut self) -> &mut Self {
+        self.options.client_export = false;
         self
     }
 
@@ -1425,6 +1476,7 @@ impl HttpRegistrar {
                 path: route.path.clone(),
                 method,
                 params: route_path_params(&route.path),
+                client_export: route.options.client_export,
                 guard: route.options.guard_id().cloned(),
                 permissions: route.options.permissions_set().into_iter().collect(),
                 summary: doc.and_then(|doc| doc.summary.clone()),
@@ -2098,6 +2150,7 @@ mod tests {
         assert_eq!(index.path, "/api/v1/admin/users");
         assert_eq!(index.method.as_deref(), Some("get"));
         assert!(index.params.is_empty());
+        assert!(index.client_export);
         assert_eq!(index.guard, Some(GuardId::new("admin")));
         assert_eq!(index.permissions, vec![PermissionId::new("users.read")]);
         assert_eq!(index.summary.as_deref(), Some("List admin users"));
@@ -2112,6 +2165,29 @@ mod tests {
         assert_eq!(show.responses.len(), 1);
         assert_eq!(show.responses[0].status, 200);
         assert_eq!(show.responses[0].schema, "String");
+    }
+
+    #[test]
+    fn collect_route_manifest_includes_client_export_opt_out() {
+        let mut registrar = HttpRegistrar::new();
+        registrar.route_named_with_options(
+            RouteId::new("login"),
+            "/login",
+            post(ok),
+            HttpRouteOptions::new()
+                .request::<String>()
+                .response::<String>(200)
+                .without_client_export(),
+        );
+
+        let manifest = registrar.collect_route_manifest().unwrap();
+        let login = manifest
+            .iter()
+            .find(|route| route.id == RouteId::new("login"))
+            .expect("login route manifest entry");
+
+        assert!(!login.client_export);
+        assert_eq!(login.request, Some("String"));
     }
 
     #[test]
