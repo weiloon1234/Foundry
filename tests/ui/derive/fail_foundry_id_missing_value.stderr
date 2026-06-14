@@ -1,0 +1,5 @@
+error: missing #[foundry(value = "...")] variant attribute; add rename_all = "snake_case" to the enum to derive values automatically
+ --> tests/ui/derive/fail_foundry_id_missing_value.rs:6:5
+  |
+6 |     Api,
+  |     ^^^

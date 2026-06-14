@@ -1,0 +1,24 @@
+{"timestamp":"2026-06-10T09:05:35.368262+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:05:35.369066+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:05:35.369311+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:05:35.369622+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:05:35.371150+00:00","level":"INFO","message":"Scheduler leadership acquired","state":"acquired","owner":"scheduler-653e28bea5b1a-1","target":"foundry.scheduler"}
+{"timestamp":"2026-06-10T09:05:35.371714+00:00","level":"INFO","message":"Schedule executed","schedule":"heartbeat","kind":"cron","target":"foundry.scheduler"}
+{"timestamp":"2026-06-10T09:08:03.197318+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:08:03.197595+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:08:03.197772+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:08:03.197933+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:08:03.198243+00:00","level":"INFO","message":"Scheduler leadership acquired","state":"acquired","owner":"scheduler-653e294ba0850-1","target":"foundry.scheduler"}
+{"timestamp":"2026-06-10T09:08:03.198360+00:00","level":"INFO","message":"Schedule executed","schedule":"heartbeat","kind":"cron","target":"foundry.scheduler"}
+{"timestamp":"2026-06-10T09:39:40.554831+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:39:40.555562+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:39:40.555773+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:39:40.555993+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:39:40.556949+00:00","level":"INFO","message":"Scheduler leadership acquired","state":"acquired","owner":"scheduler-653e305d16bc8-1","target":"foundry.scheduler"}
+{"timestamp":"2026-06-10T09:39:40.557397+00:00","level":"INFO","message":"Schedule executed","schedule":"heartbeat","kind":"cron","target":"foundry.scheduler"}
+{"timestamp":"2026-06-10T09:41:27.261514+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:41:27.261791+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:41:27.261997+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:41:27.262187+00:00","level":"INFO","message":"foundry: i18n resource path not found, skipping: locales","target":"foundry::i18n"}
+{"timestamp":"2026-06-10T09:41:27.262495+00:00","level":"INFO","message":"Scheduler leadership acquired","state":"acquired","owner":"scheduler-653e30c2da04f-1","target":"foundry.scheduler"}
+{"timestamp":"2026-06-10T09:41:27.262603+00:00","level":"INFO","message":"Schedule executed","schedule":"heartbeat","kind":"cron","target":"foundry.scheduler"}

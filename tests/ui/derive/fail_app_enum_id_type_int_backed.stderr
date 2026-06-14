@@ -1,0 +1,5 @@
+error: id_type is only supported for string-backed AppEnum enums
+ --> tests/ui/derive/fail_app_enum_id_type_int_backed.rs:3:6
+  |
+3 | enum Status {
+  |      ^^^^^^

@@ -1,0 +1,3 @@
+mod app_service_provider;
+
+pub use app_service_provider::{shared_log, AppServiceProvider};

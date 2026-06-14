@@ -1,0 +1,5 @@
+error: Foundry owns TypeScript export output through `types:export`; remove `export` and run the Foundry exporter instead
+ --> tests/ui/derive/fail_ts_export_attr.rs:4:6
+  |
+4 | #[ts(export)]
+  |      ^^^^^^

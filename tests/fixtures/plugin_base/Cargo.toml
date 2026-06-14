@@ -1,0 +1,11 @@
+[package]
+name = "foundry_fixture_plugin_base"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+foundry = { path = "../../../" }
+semver = "1"
+toml = "0.9"

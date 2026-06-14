@@ -1,0 +1,5 @@
+error: unsupported foundry attribute for FoundryId derive; expected id = ... or rename_all = "snake_case"
+ --> tests/ui/derive/fail_foundry_id_unsupported_attr.rs:4:34
+  |
+4 | #[foundry(id = foundry::GuardId, prefix = "admin")]
+  |                                  ^^^^^^

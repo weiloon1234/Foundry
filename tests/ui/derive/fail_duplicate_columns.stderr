@@ -1,0 +1,5 @@
+error: duplicate column name `email`
+  --> tests/ui/derive/fail_duplicate_columns.rs:11:5
+   |
+11 |     email: String,
+   |     ^^^^^

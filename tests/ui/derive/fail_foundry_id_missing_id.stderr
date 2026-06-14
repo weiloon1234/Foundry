@@ -1,0 +1,5 @@
+error: missing #[foundry(id = ...)] attribute
+ --> tests/ui/derive/fail_foundry_id_missing_id.rs:4:6
+  |
+4 | enum Guard {
+  |      ^^^^^

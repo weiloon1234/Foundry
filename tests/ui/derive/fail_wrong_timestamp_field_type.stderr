@@ -1,0 +1,5 @@
+error: `created_at` must use foundry::DateTime
+ --> tests/ui/derive/fail_wrong_timestamp_field_type.rs:8:5
+  |
+8 |     created_at: String,
+  |     ^^^^^^^^^^^^^^^^^^

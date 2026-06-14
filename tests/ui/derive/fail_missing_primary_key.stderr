@@ -1,0 +1,5 @@
+error: Model derive requires an `id` field or an explicit #[foundry(primary_key = "...")] attribute
+ --> tests/ui/derive/fail_missing_primary_key.rs:7:8
+  |
+7 | struct User {
+  |        ^^^^

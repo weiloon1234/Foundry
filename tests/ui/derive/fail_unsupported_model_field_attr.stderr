@@ -1,0 +1,5 @@
+error: unsupported foundry field attribute
+ --> tests/ui/derive/fail_unsupported_model_field_attr.rs:9:15
+  |
+9 |     #[foundry(unique)]
+  |               ^^^^^^

@@ -1,0 +1,5 @@
+error: `deleted_at` must use Option<foundry::DateTime>
+  --> tests/ui/derive/fail_wrong_deleted_at_type.rs:10:5
+   |
+10 |     deleted_at: DateTime,
+   |     ^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,9 @@
+[package]
+name = "foundry-api-doc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+scraper = "0.22"
+serde_json = "1"

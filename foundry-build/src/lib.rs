@@ -1,0 +1,435 @@
+use std::collections::BTreeMap;
+use std::env;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+pub const GENERATED_DATABASE_REGISTRY: &str = "foundry_database_generated.rs";
+pub const DEFAULT_MIGRATIONS_DIR: &str = "database/migrations";
+pub const DEFAULT_SEEDERS_DIR: &str = "database/seeders";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationSource {
+    pub id: String,
+    pub path: PathBuf,
+    pub module_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeederSource {
+    pub id: String,
+    pub path: PathBuf,
+    pub module_name: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DatabaseCodegen {
+    migration_dirs: Vec<PathBuf>,
+    seeder_dirs: Vec<PathBuf>,
+}
+
+impl DatabaseCodegen {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn migration_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.migration_dirs.push(path.into());
+        self
+    }
+
+    pub fn seeder_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.seeder_dirs.push(path.into());
+        self
+    }
+
+    pub fn generate(self) -> io::Result<()> {
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(io::Error::other)?);
+        let out_dir = PathBuf::from(env::var("OUT_DIR").map_err(io::Error::other)?);
+
+        let migration_dirs = resolve_dirs(
+            &manifest_dir,
+            self.migration_dirs,
+            &[PathBuf::from(DEFAULT_MIGRATIONS_DIR)],
+        );
+        let seeder_dirs = resolve_dirs(
+            &manifest_dir,
+            self.seeder_dirs,
+            &[PathBuf::from(DEFAULT_SEEDERS_DIR)],
+        );
+
+        emit_rerun_if_changed(&migration_dirs)?;
+        emit_rerun_if_changed(&seeder_dirs)?;
+
+        let migrations = discover_migration_sources(&migration_dirs)?;
+        let seeders = discover_seeder_sources(&seeder_dirs)?;
+        let rendered = render_registry(&migration_dirs, &seeder_dirs, &migrations, &seeders);
+
+        fs::create_dir_all(&out_dir)?;
+        fs::write(out_dir.join(GENERATED_DATABASE_REGISTRY), rendered)?;
+        Ok(())
+    }
+}
+
+pub fn discover_migration_sources(dirs: &[PathBuf]) -> io::Result<Vec<MigrationSource>> {
+    let mut sources = BTreeMap::<String, MigrationSource>::new();
+
+    for dir in dirs {
+        if !dir.exists() {
+            continue;
+        }
+        if !dir.is_dir() {
+            return Err(io::Error::other(format!(
+                "migration path `{}` is not a directory",
+                dir.display()
+            )));
+        }
+
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            if !file_name.ends_with(".rs") || file_name == "mod.rs" {
+                continue;
+            }
+
+            let id = parse_migration_file_stem(file_name)?;
+            let module_name = format!("migration_{}", sanitize_ident(&id));
+            let source = MigrationSource {
+                id: id.clone(),
+                path: path.canonicalize()?,
+                module_name,
+            };
+
+            if sources.insert(id.clone(), source).is_some() {
+                return Err(io::Error::other(format!(
+                    "duplicate migration file id `{id}` across registered folders"
+                )));
+            }
+        }
+    }
+
+    Ok(sources.into_values().collect())
+}
+
+pub fn discover_seeder_sources(dirs: &[PathBuf]) -> io::Result<Vec<SeederSource>> {
+    let mut sources = BTreeMap::<String, SeederSource>::new();
+
+    for dir in dirs {
+        if !dir.exists() {
+            continue;
+        }
+        if !dir.is_dir() {
+            return Err(io::Error::other(format!(
+                "seeder path `{}` is not a directory",
+                dir.display()
+            )));
+        }
+
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            if !file_name.ends_with(".rs") || file_name == "mod.rs" {
+                continue;
+            }
+
+            let id = parse_seeder_file_stem(file_name)?;
+            let module_name = format!("seeder_{}", sanitize_ident(&id));
+            let source = SeederSource {
+                id: id.clone(),
+                path: path.canonicalize()?,
+                module_name,
+            };
+
+            if sources.insert(id.clone(), source).is_some() {
+                return Err(io::Error::other(format!(
+                    "duplicate seeder file id `{id}` across registered folders"
+                )));
+            }
+        }
+    }
+
+    Ok(sources.into_values().collect())
+}
+
+pub fn render_registry(
+    migration_dirs: &[PathBuf],
+    seeder_dirs: &[PathBuf],
+    migrations: &[MigrationSource],
+    seeders: &[SeederSource],
+) -> String {
+    let mut output = String::new();
+    output.push_str("// @generated by foundry-build. Do not edit.\n");
+
+    for migration in migrations {
+        output.push_str(&format!(
+            "#[path = {:?}]\nmod {};\n",
+            migration.path.display().to_string(),
+            migration.module_name
+        ));
+    }
+
+    for seeder in seeders {
+        output.push_str(&format!(
+            "#[path = {:?}]\nmod {};\n",
+            seeder.path.display().to_string(),
+            seeder.module_name
+        ));
+    }
+
+    output.push_str(
+        "\npub fn register(registrar: &mut ::foundry::ServiceRegistrar) -> ::foundry::Result<()> {\n",
+    );
+    output.push_str("    ::foundry::__private::register_generated_database_paths(\n");
+    output.push_str("        registrar,\n");
+    output.push_str("        ::std::vec![");
+    output.push_str(
+        &migration_dirs
+            .iter()
+            .map(|path| {
+                format!(
+                    "::std::path::PathBuf::from({:?})",
+                    path.display().to_string()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    output.push_str("],\n");
+    output.push_str("        ::std::vec![");
+    output.push_str(
+        &seeder_dirs
+            .iter()
+            .map(|path| {
+                format!(
+                    "::std::path::PathBuf::from({:?})",
+                    path.display().to_string()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    output.push_str("],\n");
+    output.push_str("    )?;\n");
+
+    for migration in migrations {
+        output.push_str(&format!(
+            "    ::foundry::__private::register_generated_migration_file::<{}::Entry>(registrar, ::foundry::MigrationId::new({:?}))?;\n",
+            migration.module_name,
+            migration.id
+        ));
+    }
+
+    for seeder in seeders {
+        output.push_str(&format!(
+            "    ::foundry::__private::register_generated_seeder_file::<{}::Entry>(registrar, ::foundry::SeederId::new({:?}))?;\n",
+            seeder.module_name, seeder.id
+        ));
+    }
+
+    output.push_str("    Ok(())\n}\n");
+    output
+}
+
+fn resolve_dirs(base: &Path, configured: Vec<PathBuf>, defaults: &[PathBuf]) -> Vec<PathBuf> {
+    let dirs = if configured.is_empty() {
+        defaults.to_vec()
+    } else {
+        configured
+    };
+
+    dirs.into_iter()
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                base.join(path)
+            }
+        })
+        .collect()
+}
+
+fn emit_rerun_if_changed(dirs: &[PathBuf]) -> io::Result<()> {
+    for dir in dirs {
+        println!("cargo:rerun-if-changed={}", dir.display());
+        if !dir.exists() {
+            continue;
+        }
+
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            println!("cargo:rerun-if-changed={}", entry.path().display());
+        }
+    }
+    Ok(())
+}
+
+fn parse_migration_file_stem(file_name: &str) -> io::Result<String> {
+    let stem = file_name
+        .strip_suffix(".rs")
+        .ok_or_else(|| io::Error::other(format!("invalid migration file `{file_name}`")))?;
+    let (timestamp, slug) = stem.split_once('_').ok_or_else(|| {
+        io::Error::other(format!(
+            "migration file `{file_name}` must match YYYYMMDDHHMM_slug.rs"
+        ))
+    })?;
+
+    if timestamp.len() != 12
+        || !timestamp
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        return Err(io::Error::other(format!(
+            "migration file `{file_name}` must start with a 12-digit timestamp"
+        )));
+    }
+
+    if slug.is_empty()
+        || !slug.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+    {
+        return Err(io::Error::other(format!(
+            "migration file `{file_name}` must use a lowercase snake_case slug"
+        )));
+    }
+
+    Ok(stem.to_string())
+}
+
+fn parse_seeder_file_stem(file_name: &str) -> io::Result<String> {
+    let stem = file_name
+        .strip_suffix(".rs")
+        .ok_or_else(|| io::Error::other(format!("invalid seeder file `{file_name}`")))?;
+
+    if stem.is_empty()
+        || !stem.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+    {
+        return Err(io::Error::other(format!(
+            "seeder file `{file_name}` must use a lowercase snake_case filename"
+        )));
+    }
+
+    Ok(stem.to_string())
+}
+
+fn sanitize_ident(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        discover_migration_sources, discover_seeder_sources, parse_migration_file_stem,
+        parse_seeder_file_stem, render_registry,
+    };
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("foundry_build_{name}_{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn parses_valid_migration_file_stem() {
+        assert_eq!(
+            parse_migration_file_stem("202604101200_create_users.rs").unwrap(),
+            "202604101200_create_users"
+        );
+    }
+
+    #[test]
+    fn rejects_migration_file_without_timestamp() {
+        let error = parse_migration_file_stem("create_users.rs").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must start with a 12-digit timestamp"));
+    }
+
+    #[test]
+    fn rejects_migration_file_without_slug() {
+        let error = parse_migration_file_stem("202604101200.rs").unwrap_err();
+        assert!(error.to_string().contains("YYYYMMDDHHMM_slug.rs"));
+    }
+
+    #[test]
+    fn parses_valid_seeder_file_stem() {
+        assert_eq!(
+            parse_seeder_file_stem("users_seed.rs").unwrap(),
+            "users_seed"
+        );
+    }
+
+    #[test]
+    fn discovers_sources_in_lexical_order() {
+        let migrations_dir = temp_dir("migrations");
+        let seeders_dir = temp_dir("seeders");
+        fs::write(
+            migrations_dir.join("202604101300_add_profiles.rs"),
+            "pub struct Entry;",
+        )
+        .unwrap();
+        fs::write(
+            migrations_dir.join("202604101200_create_users.rs"),
+            "pub struct Entry;",
+        )
+        .unwrap();
+        fs::write(seeders_dir.join("users_seed.rs"), "pub struct Entry;").unwrap();
+
+        let migrations = discover_migration_sources(std::slice::from_ref(&migrations_dir)).unwrap();
+        let seeders = discover_seeder_sources(std::slice::from_ref(&seeders_dir)).unwrap();
+
+        assert_eq!(
+            migrations
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["202604101200_create_users", "202604101300_add_profiles"]
+        );
+        assert_eq!(
+            seeders
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["users_seed"]
+        );
+
+        let rendered = render_registry(&[migrations_dir], &[seeders_dir], &migrations, &seeders);
+        assert!(rendered.contains("__private::register_generated_migration_file"));
+        assert!(rendered.contains("__private::register_generated_seeder_file"));
+    }
+}

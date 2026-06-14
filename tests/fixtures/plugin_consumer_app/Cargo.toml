@@ -1,0 +1,13 @@
+[package]
+name = "foundry_plugin_fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+foundry = { path = "../../../" }
+foundry_fixture_plugin_base = { path = "../plugin_base" }
+foundry_fixture_plugin_dep = { path = "../plugin_dep" }
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
+

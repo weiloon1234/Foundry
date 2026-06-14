@@ -1,0 +1,16 @@
+[package]
+name = "foundry-macros"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Proc-macro derives for Foundry database model and projection metadata."
+repository = "https://github.com/weiloon1234/Foundry"
+documentation = "https://docs.rs/foundry-macros"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }

@@ -1,0 +1,5 @@
+error: #[foundry(soft_deletes = true)] requires `deleted_at: Option<foundry::DateTime>`
+ --> tests/ui/derive/fail_missing_deleted_at.rs:5:8
+  |
+5 | struct Post {
+  |        ^^^^

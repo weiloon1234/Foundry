@@ -1,0 +1,5 @@
+error: Loaded<T> fields are not supported on Projection derives
+ --> tests/ui/derive/fail_loaded_projection.rs:7:5
+  |
+7 |     tags: Loaded<Vec<String>>,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^

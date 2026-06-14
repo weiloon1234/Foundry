@@ -1,0 +1,5 @@
+error: #[foundry(timestamps = true)] requires `created_at: foundry::DateTime` and `updated_at: foundry::DateTime`
+ --> tests/ui/derive/fail_missing_timestamp_fields.rs:5:8
+  |
+5 | struct Post {
+  |        ^^^^

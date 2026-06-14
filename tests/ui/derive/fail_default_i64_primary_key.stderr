@@ -1,0 +1,5 @@
+error: Model derive defaults to `id: ModelId<User>`; add that field or use #[foundry(primary_key_strategy = "manual")] to opt out
+ --> tests/ui/derive/fail_default_i64_primary_key.rs:3:8
+  |
+3 | struct User {
+  |        ^^^^

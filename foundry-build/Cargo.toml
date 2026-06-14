@@ -1,0 +1,12 @@
+[package]
+name = "foundry-build"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Build-time helpers for Foundry database migration and seeder discovery."
+repository = "https://github.com/weiloon1234/Foundry"
+documentation = "https://docs.rs/foundry-build"
+
+[lib]
+name = "foundry_build"
+path = "src/lib.rs"

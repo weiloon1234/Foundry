@@ -1,0 +1,5 @@
+error: missing #[foundry(table = ...)] attribute
+ --> tests/ui/derive/fail_missing_table.rs:6:8
+  |
+6 | struct User {
+  |        ^^^^

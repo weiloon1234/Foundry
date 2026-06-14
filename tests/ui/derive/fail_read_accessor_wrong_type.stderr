@@ -1,0 +1,10 @@
+error[E0308]: mismatched types
+ --> tests/ui/derive/fail_read_accessor_wrong_type.rs:1:10
+  |
+1 | #[derive(foundry::Model)]
+  |          ^^^^^^^^^^^^^^ expected `String`, found `usize`
+...
+6 |     email: String,
+  |            ------ expected `std::string::String` because of return type
+  |
+  = note: this error originates in the derive macro `foundry::Model` (in Nightly builds, run with -Z macro-backtrace for more info)

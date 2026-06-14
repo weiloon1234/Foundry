@@ -1,0 +1,13 @@
+error[E0308]: `?` operator has incompatible types
+ --> tests/ui/derive/fail_write_mutator_wrong_type.rs:3:10
+  |
+3 | #[derive(foundry::Model)]
+  |          ^^^^^^^^^^^^^^ expected `String`, found `bool`
+  |
+  = note: `?` operator cannot convert from `bool` to `std::string::String`
+note: return type inferred to be `std::string::String` here
+ --> tests/ui/derive/fail_write_mutator_wrong_type.rs:3:10
+  |
+3 | #[derive(foundry::Model)]
+  |          ^^^^^^^^^^^^^^
+  = note: this error originates in the derive macro `foundry::Model` (in Nightly builds, run with -Z macro-backtrace for more info)

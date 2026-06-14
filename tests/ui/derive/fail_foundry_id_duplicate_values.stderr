@@ -1,0 +1,5 @@
+error: duplicate FoundryId value
+ --> tests/ui/derive/fail_foundry_id_duplicate_values.rs:8:23
+  |
+8 |     #[foundry(value = "api")]
+  |                       ^^^^^

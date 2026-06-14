@@ -1,0 +1,90 @@
+[package]
+name = "foundry"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A typed modular Rust backend framework with HTTP, CLI, scheduler, websocket, jobs, auth, observability, and compile-time plugins."
+readme = "README.md"
+repository = "https://github.com/weiloon1234/Foundry"
+documentation = "https://docs.rs/foundry"
+keywords = ["rust", "backend", "framework", "axum", "plugin"]
+categories = ["asynchronous", "web-programming", "network-programming", "development-tools"]
+rust-version = "1.94"
+
+[workspace]
+members = ["foundry-build", "foundry-macros"]
+exclude = [
+    "tests/fixtures/blueprint_app",
+    "tests/fixtures/plugin_base",
+    "tests/fixtures/plugin_consumer_app",
+    "tests/fixtures/plugin_dep",
+    "tools/foundry-api-doc",
+    ".worktrees/ws-dashboard/tests/fixtures/blueprint_app",
+    ".worktrees/ws-dashboard/tests/fixtures/plugin_base",
+    ".worktrees/ws-dashboard/tests/fixtures/plugin_consumer_app",
+    ".worktrees/ws-dashboard/tests/fixtures/plugin_dep",
+]
+resolver = "2"
+
+[dependencies]
+aes-gcm = "0.10"
+ammonia = "4"
+anyhow = "1"
+argon2 = "0.5"
+async-trait = "0.1"
+axum = { version = "0.8.8", features = ["macros", "json", "ws", "multipart"] }
+axum-extra = { version = "0.10", features = ["cookie"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["string"] }
+cron = "0.12"
+dotenvy = "0.15"
+foundry-build = { version = "0.1.0", path = "foundry-build" }
+foundry-macros = { version = "0.1.0", path = "foundry-macros" }
+futures-util = "0.3"
+inventory = "0.3"
+getrandom = "0.3"
+hmac = "0.12"
+image = "0.25"
+infer = "0.19"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
+object_store = { version = "0.13", features = ["aws"] }
+redis = { version = "1", features = ["tokio-comp"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+regex = "1"
+rust_xlsxwriter = "0.94"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid", "bigdecimal"] }
+thiserror = "2"
+tokio = { version = "1.37", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+ts-rs = { version = "10", features = ["serde-compat"] }
+toml = "0.9"
+tower = "0.5.3"
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip", "cors", "fs", "limit", "timeout"] }
+tracing = "0.1"
+url = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+validator = { version = "0.20", features = ["derive"] }
+
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry-otlp = { version = "0.27", optional = true, features = ["tonic"] }
+opentelemetry_sdk = { version = "0.27", optional = true, features = ["rt-tokio"] }
+tracing-opentelemetry = { version = "0.28", optional = true }
+
+[features]
+otel = ["opentelemetry", "opentelemetry-otlp", "opentelemetry_sdk", "tracing-opentelemetry"]
+webauthn = []
+
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = "0.28"
+trybuild = "1"
+
+[build-dependencies]
+foundry-build = { version = "0.1.0", path = "foundry-build" }

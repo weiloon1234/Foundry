@@ -1,0 +1,11 @@
+[server]
+host = "127.0.0.1"
+port = 0
+
+[websocket]
+host = "127.0.0.1"
+port = 0
+path = "/ws"
+
+[jobs]
+queue = "default"

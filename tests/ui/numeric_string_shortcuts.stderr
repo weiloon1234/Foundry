@@ -1,0 +1,47 @@
+error[E0277]: the trait bound `&str: IntoColumnValue<foundry::Numeric>` is not satisfied
+  --> tests/ui/numeric_string_shortcuts.rs:11:32
+   |
+11 |     let _ = Payment::AMOUNT.eq("12.50");
+   |                             -- ^^^^^^^ the trait `IntoColumnValue<foundry::Numeric>` is not implemented for `&str`
+   |                             |
+   |                             required by a bound introduced by this call
+   |
+help: the following other types implement trait `IntoColumnValue<T>`
+  --> src/database/model.rs
+   |
+   | impl IntoColumnValue<String> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<std::string::String>`
+...
+   | impl IntoColumnValue<Option<String>> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<Option<std::string::String>>`
+note: required by a bound in `foundry::Column::<M, T>::eq`
+  --> src/database/model.rs
+   |
+   |     pub fn eq<V>(&self, value: V) -> Condition
+   |            -- required by a bound in this associated function
+   |     where
+   |         V: IntoColumnValue<T>,
+   |            ^^^^^^^^^^^^^^^^^^ required by this bound in `Column::<M, T>::eq`
+
+error[E0277]: the trait bound `&str: IntoColumnValue<foundry::Numeric>` is not satisfied
+  --> tests/ui/numeric_string_shortcuts.rs:12:29
+   |
+12 |     let _ = Payment::AMOUNT.in_list(["10.00", "20.00"]);
+   |                             ^^^^^^^ the trait `IntoColumnValue<foundry::Numeric>` is not implemented for `&str`
+   |
+help: the following other types implement trait `IntoColumnValue<T>`
+  --> src/database/model.rs
+   |
+   | impl IntoColumnValue<String> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<std::string::String>`
+...
+   | impl IntoColumnValue<Option<String>> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<Option<std::string::String>>`
+note: required by a bound in `foundry::Column::<M, T>::in_list`
+  --> src/database/model.rs
+   |
+   |     pub fn in_list<I, V>(&self, values: I) -> Condition
+   |            ------- required by a bound in this associated function
+...
+   |         V: IntoColumnValue<T>,
+   |            ^^^^^^^^^^^^^^^^^^ required by this bound in `Column::<M, T>::in_list`
