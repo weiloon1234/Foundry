@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Pre-commit hook: regenerate API surface docs if any src/ or Cargo.toml changed.
+# Enable with: git config core.hooksPath .githooks
+
+set -e
+
+# Check if any source files are staged
+STAGED_SRC=$(git diff --cached --name-only --diff-filter=ACMR -- 'src/**/*.rs' 'Cargo.toml' 'forge-macros/**/*.rs' 'forge-build/**/*.rs')
+
+if [ -z "$STAGED_SRC" ]; then
+    exit 0
+fi
+
+echo "Source files changed — regenerating API docs..."
+
+# Build the tool if needed (fast if already built)
+cargo build --manifest-path tools/forge-api-doc/Cargo.toml --quiet 2>/dev/null || {
+    echo "Warning: forge-api-doc build failed, skipping API doc generation"
+    exit 0
+}
+
+# Regenerate docs (cargo doc + extract)
+cargo doc --no-deps --quiet 2>/dev/null
+cargo run --manifest-path tools/forge-api-doc/Cargo.toml --quiet -- --output-dir docs/api 2>/dev/null
+
+# Stage the generated files if they changed
+git add docs/api/

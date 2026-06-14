@@ -1,3 +1,43 @@
-.DS_Store
+# Rust
 target/
-/logs/
+**/*.rs.bk
+
+# Build artifacts
+*.d
+*.rlib
+*.dll
+*.dylib
+*.so
+*.exec
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Logs
+logs/
+
+# Generated raw TypeScript output
+bindings/
+
+# Claude Code session data (keep skills/)
+.claude/*
+!.claude/skills/
+
+# Profiling
+flamegraph.svg
+perf.data*
+
+# Git worktrees
+.worktrees/

@@ -1224,28 +1224,47 @@ export abstract class FoundryEndpoint<
     const display = this.validation.attributes?.find((entry) => entry.field === field)?.name ?? field;
     const custom = this.validation.messages?.find((entry) => entry.field === field && entry.rule === rule.code)?.message;
     const message = rule.message ?? custom ?? fallbackMessage(display, rule.code, params);
-    errors[field] = [...(errors[field] ?? []), message];
+    const writable = errors as Record<string, string[]>;
+    writable[field] = [...(writable[field] ?? []), message];
   }
 
   private applyServerErrors(error: unknown): void {
     const responseData = (error as { response?: { data?: unknown } }).response?.data;
     const serverErrors = (responseData as { errors?: unknown }).errors;
-    if (!Array.isArray(serverErrors)) {
+
+    if (!serverErrors || typeof serverErrors !== "object") {
       return;
     }
 
     const errors: FoundryFieldErrors<TRequest> = {};
-    for (const entry of serverErrors) {
-      if (!entry || typeof entry !== "object") {
-        continue;
+    const writable = errors as Record<string, string[]>;
+
+    if (Array.isArray(serverErrors)) {
+      for (const entry of serverErrors) {
+        if (!entry || typeof entry !== "object") {
+          continue;
+        }
+        const field = String((entry as { field?: unknown }).field ?? "");
+        const message = String((entry as { message?: unknown }).message ?? "Invalid value.");
+        if (!field) {
+          continue;
+        }
+        writable[field] = [...(writable[field] ?? []), message];
       }
-      const field = String((entry as { field?: unknown }).field ?? "");
-      const message = String((entry as { message?: unknown }).message ?? "Invalid value.");
-      if (!field) {
-        continue;
+    } else {
+      for (const [field, messages] of Object.entries(serverErrors)) {
+        const normalizedMessages = Array.isArray(messages)
+          ? messages.filter((message): message is string => typeof message === "string")
+          : typeof messages === "string"
+            ? [messages]
+            : [];
+
+        if (normalizedMessages.length > 0) {
+          writable[field] = [...(writable[field] ?? []), ...normalizedMessages];
+        }
       }
-      errors[field] = [...(errors[field] ?? []), message];
     }
+
     this.errors = errors;
   }
 }
