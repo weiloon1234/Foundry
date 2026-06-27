@@ -5,7 +5,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::metrics;
 use crate::auth::AccessScope;
@@ -112,98 +112,120 @@ impl ObservabilityOptions {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct JobsStatsResponse {
-    stats: Vec<JobStatusCountResponse>,
+#[derive(
+    Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct JobsStatsResponse {
+    pub stats: Vec<JobStatusCountResponse>,
 }
 
-#[derive(Debug, Serialize)]
-struct JobStatusCountResponse {
-    status: String,
-    count: i64,
+#[derive(
+    Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct JobStatusCountResponse {
+    pub status: String,
+    pub count: i64,
 }
 
-#[derive(Debug, Serialize)]
-struct JobsFailedResponse {
-    failed_jobs: Vec<FailedJobResponse>,
+#[derive(
+    Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct JobsFailedResponse {
+    pub failed_jobs: Vec<FailedJobResponse>,
 }
 
-#[derive(Debug, Serialize)]
-struct FailedJobResponse {
-    job_id: String,
-    queue: String,
-    status: String,
-    attempt: Option<i64>,
-    error: Option<String>,
-    started_at: Option<String>,
-    completed_at: Option<String>,
-    duration_ms: Option<i64>,
-    created_at: Option<String>,
-    request_id: Option<String>,
-    trace_id: Option<String>,
+#[derive(
+    Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct FailedJobResponse {
+    pub job_id: String,
+    pub queue: String,
+    pub status: String,
+    pub attempt: Option<i64>,
+    pub error: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub created_at: Option<String>,
+    pub request_id: Option<String>,
+    pub trace_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct WebSocketChannelsResponse {
-    channels: Vec<crate::websocket::WebSocketChannelDescriptor>,
+#[derive(
+    Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct WebSocketChannelsResponse {
+    pub channels: Vec<crate::websocket::WebSocketChannelDescriptor>,
 }
 
-#[derive(Debug, Serialize)]
-struct WebSocketPresenceResponse {
-    channel: String,
-    count: usize,
-    members: Vec<WebSocketPresenceMemberResponse>,
+#[derive(
+    Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct WebSocketPresenceResponse {
+    pub channel: String,
+    pub count: usize,
+    pub members: Vec<WebSocketPresenceMemberResponse>,
 }
 
-#[derive(Debug, Serialize)]
-struct WebSocketPresenceMemberResponse {
-    actor_id: String,
-    joined_at: i64,
+#[derive(
+    Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct WebSocketPresenceMemberResponse {
+    pub actor_id: String,
+    pub joined_at: i64,
 }
 
-#[derive(Debug, Serialize)]
-struct WebSocketHistoryResponse {
-    channel: String,
-    messages: Vec<WebSocketHistoryMessageResponse>,
+#[derive(
+    Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct WebSocketHistoryResponse {
+    pub channel: String,
+    pub messages: Vec<WebSocketHistoryMessageResponse>,
 }
 
-#[derive(Debug, Serialize)]
-struct WebSocketHistoryMessageResponse {
-    channel: String,
-    event: String,
-    room: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    payload: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    payload_size_bytes: Option<u64>,
+#[derive(
+    Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct WebSocketHistoryMessageResponse {
+    pub channel: String,
+    pub event: String,
+    pub room: Option<String>,
+    pub payload: Option<serde_json::Value>,
+    pub payload_size_bytes: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
-struct WebSocketStatsResponse {
-    global: WebSocketGlobalStatsResponse,
-    channels: Vec<WebSocketChannelStatsResponse>,
+#[derive(
+    Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct WebSocketStatsResponse {
+    pub global: WebSocketGlobalStatsResponse,
+    pub channels: Vec<WebSocketChannelStatsResponse>,
 }
 
-#[derive(Debug, Serialize)]
-struct WebSocketGlobalStatsResponse {
-    active_connections: u64,
-    active_subscriptions: u64,
-    subscriptions_total: u64,
-    unsubscribes_total: u64,
-    inbound_messages_total: u64,
-    outbound_messages_total: u64,
-    opened_total: u64,
-    closed_total: u64,
+#[derive(
+    Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct WebSocketGlobalStatsResponse {
+    pub active_connections: u64,
+    pub active_subscriptions: u64,
+    pub subscriptions_total: u64,
+    pub unsubscribes_total: u64,
+    pub inbound_messages_total: u64,
+    pub outbound_messages_total: u64,
+    pub opened_total: u64,
+    pub closed_total: u64,
 }
 
-#[derive(Debug, Serialize)]
-struct WebSocketChannelStatsResponse {
-    id: String,
-    subscriptions_total: u64,
-    unsubscribes_total: u64,
-    active_subscriptions: u64,
-    inbound_messages_total: u64,
-    outbound_messages_total: u64,
+#[derive(
+    Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct WebSocketChannelStatsResponse {
+    pub id: String,
+    pub subscriptions_total: u64,
+    pub unsubscribes_total: u64,
+    pub active_subscriptions: u64,
+    pub inbound_messages_total: u64,
+    pub outbound_messages_total: u64,
 }
 
 pub(crate) fn register_observability_routes(

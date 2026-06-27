@@ -77,7 +77,7 @@ fn http_registration_panic_error(
     Error::message(format!("{subject} panicked: {message}"))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RouteManifestEntry {
     pub id: RouteId,
     pub path: String,
@@ -91,10 +91,11 @@ pub struct RouteManifestEntry {
     pub responses: Vec<RouteManifestResponse>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RouteManifestResponse {
     pub status: u16,
     pub schema: &'static str,
+    pub(crate) schema_json: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -738,6 +739,16 @@ pub struct HttpRouteBuilder {
 }
 
 impl HttpRouteBuilder {
+    fn root(method: &str) -> Self {
+        let mut options = HttpRouteOptions::default();
+        mutate_doc(&mut options, |doc| doc.method(method));
+
+        Self {
+            options,
+            explicit_tags_started: false,
+        }
+    }
+
     fn from_scope(scope: &ResolvedHttpScopeState, method: &str) -> Self {
         let mut options = scope.options.clone();
         mutate_doc(&mut options, |doc| doc.method(method));
@@ -1030,6 +1041,81 @@ impl HttpRegistrar {
         self.route_named_with_options_and_method(name, path, method_router, options, None)
     }
 
+    pub fn get<I, H, T>(
+        &mut self,
+        name: I,
+        path: &str,
+        handler: H,
+        configure: impl FnOnce(&mut HttpRouteBuilder),
+    ) -> &mut Self
+    where
+        I: Into<RouteId>,
+        H: Handler<T, AppContext>,
+        T: 'static,
+    {
+        self.register_method_route(name, path, axum::routing::get(handler), "get", configure)
+    }
+
+    pub fn post<I, H, T>(
+        &mut self,
+        name: I,
+        path: &str,
+        handler: H,
+        configure: impl FnOnce(&mut HttpRouteBuilder),
+    ) -> &mut Self
+    where
+        I: Into<RouteId>,
+        H: Handler<T, AppContext>,
+        T: 'static,
+    {
+        self.register_method_route(name, path, axum::routing::post(handler), "post", configure)
+    }
+
+    pub fn put<I, H, T>(
+        &mut self,
+        name: I,
+        path: &str,
+        handler: H,
+        configure: impl FnOnce(&mut HttpRouteBuilder),
+    ) -> &mut Self
+    where
+        I: Into<RouteId>,
+        H: Handler<T, AppContext>,
+        T: 'static,
+    {
+        self.register_method_route(name, path, axum::routing::put(handler), "put", configure)
+    }
+
+    pub fn patch<I, H, T>(
+        &mut self,
+        name: I,
+        path: &str,
+        handler: H,
+        configure: impl FnOnce(&mut HttpRouteBuilder),
+    ) -> &mut Self
+    where
+        I: Into<RouteId>,
+        H: Handler<T, AppContext>,
+        T: 'static,
+    {
+        self.register_method_route(name, path, axum::routing::patch(handler), "patch", configure)
+    }
+
+    pub fn delete<I, H, T>(
+        &mut self,
+        name: I,
+        path: &str,
+        handler: H,
+        configure: impl FnOnce(&mut HttpRouteBuilder),
+    ) -> &mut Self
+    where
+        I: Into<RouteId>,
+        H: Handler<T, AppContext>,
+        T: 'static,
+    {
+        self.register_method_route(name, path, axum::routing::delete(handler), "delete", configure)
+    }
+
     pub fn scope(
         &mut self,
         path: &str,
@@ -1050,6 +1136,32 @@ impl HttpRegistrar {
             path: path.to_string(),
             router,
         });
+        self
+    }
+
+    fn register_method_route<I>(
+        &mut self,
+        name: I,
+        path: &str,
+        method_router: MethodRouter<AppContext>,
+        method: &str,
+        configure: impl FnOnce(&mut HttpRouteBuilder),
+    ) -> &mut Self
+    where
+        I: Into<RouteId>,
+    {
+        let mut route = HttpRouteBuilder::root(method);
+        if let Err(error) =
+            run_http_registration_callback("http route configure callback", &mut route, |route| {
+                configure(route);
+                Ok(())
+            })
+        {
+            self.record_registration_error(error);
+            return self;
+        }
+
+        self.route_named_resolved(name.into(), path, Some(method), method_router, route.finish());
         self
     }
 
@@ -1465,6 +1577,7 @@ impl HttpRegistrar {
                         .map(|(status, schema)| RouteManifestResponse {
                             status: *status,
                             schema: schema.name,
+                            schema_json: (schema.schema_fn)(),
                         })
                         .collect::<Vec<_>>()
                 })

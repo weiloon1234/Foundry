@@ -9,7 +9,7 @@ use crate::database::{DbValue, Query};
 use crate::email::EmailMessage;
 use crate::foundation::{AppContext, Error, Result};
 use crate::support::sync::lock_unpoisoned;
-use crate::support::NotificationChannelId;
+use crate::support::{ChannelEventId, ChannelId, NotificationChannelId};
 
 pub use channel::{
     BroadcastNotificationChannel, DatabaseNotificationChannel, EmailNotificationChannel,
@@ -18,6 +18,9 @@ pub use channel::{
 pub use job::SendNotificationJob;
 
 const NOTIFICATIONS_TABLE: &str = "notifications";
+
+pub const NOTIFICATION_BROADCAST_CHANNEL: ChannelId = ChannelId::new("notifications");
+pub const NOTIFICATION_BROADCAST_EVENT: ChannelEventId = ChannelEventId::new("notification");
 
 pub(crate) async fn store_database_notification(
     app: &AppContext,

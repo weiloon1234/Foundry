@@ -1244,8 +1244,8 @@ impl AppBuilder {
         }
 
         if profile.websocket_routes {
-            let mut boot_websocket_routes = prepared_plugins.websocket_routes;
-            boot_websocket_routes.extend(websocket_routes);
+            let mut boot_websocket_routes = prepared_plugins.websocket_routes.clone();
+            boot_websocket_routes.extend(websocket_routes.clone());
 
             let ws_registrar = crate::websocket::build_registrar(&boot_websocket_routes)?;
             let ws_registry =
@@ -1309,8 +1309,11 @@ impl AppBuilder {
             if !prepared_plugins.registry.is_empty() {
                 boot_commands.push(crate::plugin::builtin_cli_registrar());
             }
+            let mut type_export_websocket_routes = prepared_plugins.websocket_routes.clone();
+            type_export_websocket_routes.extend(websocket_routes.clone());
             boot_commands.push(crate::typescript::builtin_cli_registrar(
                 boot_routes.clone(),
+                type_export_websocket_routes,
             ));
             boot_commands.extend(prepared_plugins.commands);
             boot_commands.extend(commands);

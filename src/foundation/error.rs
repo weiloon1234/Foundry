@@ -166,15 +166,19 @@ impl Error {
 }
 
 /// The standard JSON error response body.
-#[derive(Debug, Serialize)]
+#[derive(
+    Debug,
+    Serialize,
+    serde::Deserialize,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct ErrorResponse {
     pub message: String,
     pub status: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub message_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<Vec<crate::validation::FieldError>>,
 }
 

@@ -130,6 +130,7 @@ fn contract_manifest_from_documented_routes(routes: &[DocumentedRoute]) -> Contr
                 ContractResponse {
                     status: *status,
                     schema: schema.name.to_string(),
+                    schema_json: (schema.schema_fn)(),
                 }
             })
             .collect::<Vec<_>>();

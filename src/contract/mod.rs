@@ -84,7 +84,7 @@ pub struct ContractSchema {
     pub schema: Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ContractAction {
     pub id: String,
     pub action_name: String,
@@ -132,6 +132,7 @@ impl ContractAction {
                 .map(|response| ContractResponse {
                     status: response.status,
                     schema: response.schema.to_string(),
+                    schema_json: response.schema_json.clone(),
                 })
                 .collect(),
             auth: ContractAuth {
@@ -158,10 +159,12 @@ pub struct ContractPayload {
     pub schema: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ContractResponse {
     pub status: u16,
     pub schema: String,
+    #[serde(skip)]
+    pub(crate) schema_json: Value,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -349,8 +352,8 @@ impl From<&crate::websocket::WebSocketChannelDescriptor> for ContractRealtimeCha
                 .iter()
                 .map(|event| ContractRealtimeEvent {
                     event: event.event.as_str().to_string(),
-                    payload: event.payload.map(|schema| ContractPayload {
-                        schema: schema.to_string(),
+                    payload: event.payload.as_ref().map(|schema| ContractPayload {
+                        schema: schema.clone(),
                     }),
                 })
                 .collect(),
@@ -359,8 +362,8 @@ impl From<&crate::websocket::WebSocketChannelDescriptor> for ContractRealtimeCha
                 .iter()
                 .map(|event| ContractRealtimeEvent {
                     event: event.event.as_str().to_string(),
-                    payload: event.payload.map(|schema| ContractPayload {
-                        schema: schema.to_string(),
+                    payload: event.payload.as_ref().map(|schema| ContractPayload {
+                        schema: schema.clone(),
                     }),
                 })
                 .collect(),

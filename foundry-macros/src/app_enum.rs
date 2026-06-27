@@ -605,6 +605,21 @@ fn generate_foundry_app_enum_impl(
                 #key_kind
             }
         }
+
+        impl ::std::str::FromStr for #ident {
+            type Err = ::foundry::foundation::Error;
+
+            fn from_str(value: &str) -> ::std::result::Result<Self, Self::Err> {
+                <Self as ::foundry::app_enum::FoundryAppEnum>::parse_key(value)
+                    .ok_or_else(|| {
+                        ::foundry::foundation::Error::message(format!(
+                            "invalid {} value `{}`",
+                            <Self as ::foundry::app_enum::FoundryAppEnum>::id(),
+                            value
+                        ))
+                    })
+            }
+        }
     })
 }
 

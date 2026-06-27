@@ -13,11 +13,21 @@ pub const FRAMEWORK_BOOTSTRAP_PROBE: ProbeId = ProbeId::new("foundry.bootstrap")
 pub const RUNTIME_BACKEND_PROBE: ProbeId = ProbeId::new("foundry.runtime_backend");
 pub const REDIS_PING_PROBE: ProbeId = ProbeId::new("foundry.redis_ping");
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct ProbeResult {
     pub id: ProbeId,
     pub state: ProbeState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub message: Option<String>,
 }
 
@@ -45,12 +55,32 @@ impl ProbeResult {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct LivenessReport {
     pub state: ProbeState,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct ReadinessReport {
     pub state: ProbeState,
     pub probes: Vec<ProbeResult>,

@@ -1,8 +1,18 @@
 use axum::response::{IntoResponse, Response};
 use axum::{http::StatusCode, Json};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct ValidationError {
     pub code: String,
     pub message: String,
@@ -17,14 +27,33 @@ impl ValidationError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct FieldError {
     pub field: String,
     pub code: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, thiserror::Error)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+    thiserror::Error,
+)]
 #[error("validation failed")]
 pub struct ValidationErrors {
     pub errors: Vec<FieldError>,

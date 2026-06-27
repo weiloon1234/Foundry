@@ -83,7 +83,17 @@ impl SqlLogConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct SlowQueryEntry {
     pub sql: String,
     pub duration_ms: u64,
@@ -93,16 +103,36 @@ pub struct SlowQueryEntry {
     pub recorded_at: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct SqlObservabilitySnapshot {
+#[derive(
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
+pub struct SqlObservabilitySnapshot {
     pub stats: SqlObservabilityStats,
     pub top_slowest: Vec<SlowQueryEntry>,
     pub n_plus_one_suspects: Vec<NPlusOneSuspect>,
     pub slow_queries: Vec<SlowQueryEntry>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct SqlObservabilityStats {
+#[derive(
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
+pub struct SqlObservabilityStats {
     pub retained_count: usize,
     pub capacity: usize,
     pub slow_query_threshold_ms: u64,
@@ -112,8 +142,18 @@ pub(crate) struct SqlObservabilityStats {
     pub n_plus_one_suspect_count: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct NPlusOneSuspect {
+#[derive(
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
+pub struct NPlusOneSuspect {
     pub method: String,
     pub path: String,
     pub request_id: Option<String>,

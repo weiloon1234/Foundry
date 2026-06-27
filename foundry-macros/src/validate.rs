@@ -10,11 +10,12 @@ use crate::common::{
 };
 
 // ---------------------------------------------------------------------------
-// Struct-level args: #[validate(messages(...), attributes(...))]
+// Struct-level args: #[validate(after(validate_request), messages(...), attributes(...))]
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct ValidateArgs {
+    after: Vec<syn::Path>,
     messages: Vec<(String, String, String)>, // (field, rule_code, message)
     attributes: Vec<(String, String)>,       // (field, display_name)
 }
@@ -40,6 +41,11 @@ fn parse_validate_args(attrs: &[syn::Attribute]) -> syn::Result<ValidateArgs> {
                         Ok(())
                     })
                 })?;
+            } else if meta.path.is_ident("after") {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let hook: syn::Path = content.parse()?;
+                args.after.push(hook);
             } else if meta.path.is_ident("attributes") {
                 meta.parse_nested_meta(|inner| {
                     let field = inner
@@ -60,7 +66,7 @@ fn parse_validate_args(attrs: &[syn::Attribute]) -> syn::Result<ValidateArgs> {
                 })?;
             } else {
                 return Err(meta.error(
-                    "unsupported validate struct attribute; expected messages(...) or attributes(...)",
+                    "unsupported validate struct attribute; expected after(...), messages(...) or attributes(...)",
                 ));
             }
             Ok(())
@@ -159,6 +165,20 @@ fn is_vec_uploaded_file_field(ty: &Type) -> bool {
         .is_some_and(|inner| last_segment_is(inner, "UploadedFile"))
 }
 
+fn is_vec_type(ty: &Type) -> bool {
+    type_argument_if_last_segment_ident(ty, "Vec").is_some()
+        || type_argument_if_last_segment_ident(ty, "Option")
+            .and_then(|inner| type_argument_if_last_segment_ident(inner, "Vec"))
+            .is_some()
+}
+
+fn vec_inner_type(ty: &Type) -> Option<&Type> {
+    type_argument_if_last_segment_ident(ty, "Vec").or_else(|| {
+        type_argument_if_last_segment_ident(ty, "Option")
+            .and_then(|inner| type_argument_if_last_segment_ident(inner, "Vec"))
+    })
+}
+
 fn is_json_value_type(ty: &Type) -> bool {
     type_path_last_segment_matches(ty, "Value")
 }
@@ -224,7 +244,7 @@ fn parse_field_validations(
         let field_name = field_ident.to_string();
         let field_ty = &field.ty;
         let is_option = type_argument_if_last_segment_ident(field_ty, "Option").is_some();
-        let is_vec = type_argument_if_last_segment_ident(field_ty, "Vec").is_some();
+        let is_vec = is_vec_type(field_ty);
         let is_uploaded_file = is_uploaded_file_field(field_ty);
         let is_vec_uploaded_file = is_vec_uploaded_file_field(field_ty);
         if contains_uploaded_file(field_ty) && !is_uploaded_file && !is_vec_uploaded_file {
@@ -448,6 +468,11 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let field_name_set: Vec<String> = all_fields.iter().map(|f| f.name.clone()).collect();
 
     let validate_stmts = generate_validate_body(&field_validations, &ident, &field_name_set)?;
+    let after_stmts = args.after.iter().map(|after| {
+        quote! {
+            #after(self, validator).await?;
+        }
+    });
     let messages_body = generate_messages_body(&args.messages);
     let attributes_body = generate_attributes_body(&args.attributes);
 
@@ -460,6 +485,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         impl ::foundry::validation::RequestValidator for #ident {
             async fn validate(&self, validator: &mut ::foundry::validation::Validator) -> ::foundry::foundation::Result<()> {
                 #(#validate_stmts)*
+                #(#after_stmts)*
                 Ok(())
             }
 
@@ -792,13 +818,13 @@ fn generate_ts_parametric_rule(
         if args.len() != 1 {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "`rule` requires exactly 1 argument (the rule name string)",
+                "`rule` requires exactly 1 argument (a ValidationRuleId or string literal)",
             ));
         }
-        let rule_name = extract_string_literal(&args[0], "rule")?;
+        let rule_name = rule_name_expr(&args[0]);
         return Ok(generate_ts_rule(
             "rule",
-            vec![("rule", quote!(#rule_name))],
+            vec![("rule", rule_name)],
             quote!(Vec::new()),
             message,
             true,
@@ -867,6 +893,22 @@ fn is_file_rule(rule: &RuleSpec) -> bool {
     )
 }
 
+fn app_enum_rule_type(rules: &[RuleSpec]) -> Option<&syn::Path> {
+    rules.iter().find_map(|rule| match rule {
+        RuleSpec::AppEnum { type_path } => Some(type_path),
+        _ => None,
+    })
+}
+
+fn app_enum_key_string(type_path: &syn::Path, value: TokenStream) -> TokenStream {
+    quote! {
+        match <#type_path as ::foundry::FoundryAppEnum>::key(#value) {
+            ::foundry::EnumKey::String(__value) => __value,
+            ::foundry::EnumKey::Int(__value) => __value.to_string(),
+        }
+    }
+}
+
 fn generate_validate_body(
     field_validations: &[FieldValidation],
     struct_ident: &Ident,
@@ -915,12 +957,41 @@ fn generate_validate_body(
             let rule_chain =
                 generate_rule_chain(rules, struct_ident, all_field_names, field_ident)?;
 
-            stmts.push(quote! {
-                validator.each(#field_name, &self.#field_ident)
-                    #rule_chain
-                    .apply()
-                    .await?;
-            });
+            if let Some(type_path) = app_enum_rule_type(rules) {
+                let key_expr = app_enum_key_string(type_path, quote!((*__item).clone()));
+                if fv.is_option {
+                    stmts.push(quote! {
+                        if let Some(__items) = self.#field_ident.as_ref() {
+                            let __values = __items
+                                .iter()
+                                .map(|__item| #key_expr)
+                                .collect::<Vec<String>>();
+                            validator.each(#field_name, &__values)
+                                #rule_chain
+                                .apply()
+                                .await?;
+                        }
+                    });
+                } else {
+                    stmts.push(quote! {
+                        let __values = self.#field_ident
+                            .iter()
+                            .map(|__item| #key_expr)
+                            .collect::<Vec<String>>();
+                        validator.each(#field_name, &__values)
+                            #rule_chain
+                            .apply()
+                            .await?;
+                    });
+                }
+            } else {
+                stmts.push(quote! {
+                    validator.each(#field_name, &self.#field_ident)
+                        #rule_chain
+                        .apply()
+                        .await?;
+                });
+            }
         } else if fv.is_uploaded_file {
             // File field: generate text rule chain (for "required" etc.) + file validation code
             if !text_rules.is_empty() {
@@ -964,7 +1035,19 @@ fn generate_validate_body(
                 stmts.push(file_validation_code);
             }
         } else {
-            let value_expr = if fv.is_option {
+            let value_expr = if let Some(type_path) = app_enum_rule_type(&fv.rules) {
+                if fv.is_option {
+                    let key_expr = app_enum_key_string(type_path, quote!((*__value).clone()));
+                    quote! {
+                        self.#field_ident
+                            .as_ref()
+                            .map(|__value| #key_expr)
+                            .unwrap_or_default()
+                    }
+                } else {
+                    app_enum_key_string(type_path, quote!(self.#field_ident.clone()))
+                }
+            } else if fv.is_option {
                 quote!(self.#field_ident.as_deref().unwrap_or(""))
             } else {
                 quote!(&self.#field_ident)
@@ -1295,15 +1378,20 @@ fn generate_parametric_rule_call(
         if args.len() != 1 {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "`rule` requires exactly 1 argument (the rule name string)",
+                "`rule` requires exactly 1 argument (a ValidationRuleId or string literal)",
             ));
         }
-        let rule_name = extract_string_literal(&args[0], "rule")?;
-        let rule_name_lit = syn::LitStr::new(&rule_name, args[0].span());
-        return Ok(quote!(
-            .rule(::foundry::support::ValidationRuleId::new(#rule_name_lit))
-            #with_msg
-        ));
+        let rule_call = match extract_string_literal(&args[0], "rule") {
+            Ok(rule_name) => {
+                let rule_name_lit = syn::LitStr::new(&rule_name, args[0].span());
+                quote!(.rule(::foundry::support::ValidationRuleId::new(#rule_name_lit)))
+            }
+            Err(_) => {
+                let rule_id = &args[0];
+                quote!(.rule(#rule_id))
+            }
+        };
+        return Ok(quote!(#rule_call #with_msg));
     }
 
     // Simple rules with message kwarg: required(message = "..."), email(message = "..."), etc.
@@ -1336,6 +1424,13 @@ fn extract_string_literal(expr: &syn::Expr, rule_name: &str) -> syn::Result<Stri
             expr.span(),
             format!("`{}` expects a string literal argument", rule_name),
         ))
+    }
+}
+
+fn rule_name_expr(expr: &syn::Expr) -> TokenStream {
+    match extract_string_literal(expr, "rule") {
+        Ok(rule_name) => quote!(#rule_name),
+        Err(_) => quote!((#expr).as_str()),
     }
 }
 
@@ -1471,7 +1566,7 @@ fn generate_from_multipart_impl(
             }
         } else if fi.is_vec {
             // Vec<T>: collect repeated text fields in request order
-            let inner_ty = type_argument_if_last_segment_ident(&fi.ty, "Vec")
+            let inner_ty = vec_inner_type(&fi.ty)
                 .expect("Vec fields should expose an inner type");
 
             var_decls.push(quote! {
@@ -1487,13 +1582,30 @@ fn generate_from_multipart_impl(
             });
 
             let parse_expr = generate_parse_text_value(quote!(__item), inner_ty, name);
-            field_assignments.push(quote! {
-                #ident: {
+            let assignment = if fi.is_option {
+                quote! {
+                    let mut __items = Vec::with_capacity(#var_name.len());
+                    for __item in #var_name {
+                        __items.push(#parse_expr);
+                    }
+                    if __items.is_empty() {
+                        None
+                    } else {
+                        Some(__items)
+                    }
+                }
+            } else {
+                quote! {
                     let mut __items = Vec::with_capacity(#var_name.len());
                     for __item in #var_name {
                         __items.push(#parse_expr);
                     }
                     __items
+                }
+            };
+            field_assignments.push(quote! {
+                #ident: {
+                    #assignment
                 }
             });
         } else if fi.is_option {
@@ -1539,7 +1651,9 @@ fn generate_from_multipart_impl(
             field_assignments.push(quote! {
                 #ident: match #var_name {
                     Some(__val) => #parse_expr,
-                    None => ::std::default::Default::default(),
+                    None => return Err(::foundry::foundation::Error::message(
+                        format!("field '{}' is required", #name)
+                    )),
                 }
             });
         }

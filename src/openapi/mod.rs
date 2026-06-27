@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 pub mod spec;
 
 use serde_json::Value;
@@ -43,6 +45,42 @@ impl ApiSchema for i64 {
     }
     fn schema_name() -> &'static str {
         "i64"
+    }
+}
+
+impl ApiSchema for u64 {
+    fn schema() -> Value {
+        serde_json::json!({"type": "integer", "format": "uint64"})
+    }
+    fn schema_name() -> &'static str {
+        "u64"
+    }
+}
+
+impl ApiSchema for u32 {
+    fn schema() -> Value {
+        serde_json::json!({"type": "integer", "format": "uint32"})
+    }
+    fn schema_name() -> &'static str {
+        "u32"
+    }
+}
+
+impl ApiSchema for u16 {
+    fn schema() -> Value {
+        serde_json::json!({"type": "integer", "format": "uint16"})
+    }
+    fn schema_name() -> &'static str {
+        "u16"
+    }
+}
+
+impl ApiSchema for usize {
+    fn schema() -> Value {
+        serde_json::json!({"type": "integer", "format": "uint64"})
+    }
+    fn schema_name() -> &'static str {
+        "usize"
     }
 }
 
@@ -92,6 +130,18 @@ impl<T: ApiSchema> ApiSchema for Vec<T> {
     }
     fn schema_name() -> &'static str {
         "Array"
+    }
+}
+
+impl<T: ApiSchema> ApiSchema for BTreeMap<String, T> {
+    fn schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": T::schema(),
+        })
+    }
+    fn schema_name() -> &'static str {
+        "Record"
     }
 }
 

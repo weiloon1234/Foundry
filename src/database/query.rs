@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, future::Future, marker::PhantomData, pin::Pin};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::audit::{record_with_assignments, write_model_audit, AuditEventType};
 use crate::events::{Event, EventOrigin};
@@ -38,9 +38,21 @@ use super::relation::{
 };
 use super::runtime::{DbRecord, DbRecordStream, QueryExecutionOptions, QueryExecutor};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+const fn default_page() -> u64 {
+    1
+}
+
+const fn default_per_page() -> u64 {
+    15
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize,
+)]
 pub struct Pagination {
+    #[serde(default = "default_page")]
     pub page: u64,
+    #[serde(default = "default_per_page")]
     pub per_page: u64,
 }
 
@@ -54,6 +66,58 @@ impl Pagination {
 
     pub fn offset(&self) -> u64 {
         (self.page - 1) * self.per_page
+    }
+}
+
+impl ts_rs::TS for Pagination {
+    type WithoutGenerics = Self;
+
+    fn name() -> String {
+        "Pagination".to_string()
+    }
+
+    fn inline() -> String {
+        Self::name()
+    }
+
+    fn inline_flattened() -> String {
+        panic!("{} cannot be flattened", Self::name())
+    }
+
+    fn decl() -> String {
+        "type Pagination = { page?: number, per_page?: number, };".to_string()
+    }
+
+    fn decl_concrete() -> String {
+        Self::decl()
+    }
+
+    fn output_path() -> Option<&'static std::path::Path> {
+        Some(std::path::Path::new("Pagination.ts"))
+    }
+}
+
+impl crate::openapi::ApiSchema for Pagination {
+    fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "page": {"type": "integer", "format": "uint64"},
+                "per_page": {"type": "integer", "format": "uint64"},
+            },
+        })
+    }
+
+    fn schema_name() -> &'static str {
+        "Pagination"
+    }
+}
+
+inventory::submit! {
+    crate::typescript::TsType {
+        name: "Pagination",
+        export_fn: |dir| <Pagination as ts_rs::TS>::export_all_to(dir),
+        output_path_fn: || <Pagination as ts_rs::TS>::output_path(),
     }
 }
 
@@ -71,15 +135,47 @@ pub struct PaginatedResponse<T: Serialize> {
     pub links: PaginationLinks,
 }
 
-#[derive(Clone, Debug, Serialize)]
+impl<T> crate::openapi::ApiSchema for PaginatedResponse<T>
+where
+    T: Serialize + crate::openapi::ApiSchema,
+{
+    fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "array",
+                    "items": T::schema(),
+                },
+                "meta": PaginationMeta::schema(),
+                "links": PaginationLinks::schema(),
+            },
+            "required": ["data", "meta", "links"],
+        })
+    }
+
+    fn schema_name() -> &'static str {
+        "PaginatedResponse"
+    }
+}
+
+#[derive(
+    Clone, Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct PaginationMeta {
+    #[ts(type = "number")]
     pub current_page: u64,
+    #[ts(type = "number")]
     pub per_page: u64,
+    #[ts(type = "number")]
     pub total: u64,
+    #[ts(type = "number")]
     pub last_page: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(
+    Clone, Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct PaginationLinks {
     pub next: Option<String>,
     pub prev: Option<String>,
@@ -122,6 +218,20 @@ impl<T: Serialize> Paginated<T> {
                 last_page,
             },
             links: PaginationLinks { next, prev },
+        }
+    }
+
+    pub fn map_response<U, F>(&self, base_url: &str, f: F) -> PaginatedResponse<U>
+    where
+        U: Serialize,
+        F: Fn(&T) -> U,
+    {
+        let response = self.to_response(base_url);
+
+        PaginatedResponse {
+            data: self.data.iter().map(f).collect(),
+            meta: response.meta,
+            links: response.links,
         }
     }
 }

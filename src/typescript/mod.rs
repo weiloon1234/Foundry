@@ -20,9 +20,9 @@ use std::sync::Arc;
 use crate::app_enum::{EnumKey, EnumKeyKind, EnumMeta};
 use crate::cli::CommandRegistrar;
 use crate::contract::{
-    ContractAction, ContractHttpBody, ContractManifest, ContractSchema, ContractTransport,
-    ContractValidationAttribute, ContractValidationField, ContractValidationMessage,
-    ContractValidationRule, ContractValidationSchema, ContractValueKind,
+    ContractAction, ContractHttpBody, ContractManifest, ContractRealtimeChannel, ContractSchema,
+    ContractTransport, ContractValidationAttribute, ContractValidationField,
+    ContractValidationMessage, ContractValidationRule, ContractValidationSchema, ContractValueKind,
 };
 use crate::foundation::{Error, Result};
 use crate::http::{HttpRegistrar, RouteManifestEntry, RouteRegistrar};
@@ -32,6 +32,7 @@ use crate::support::generated_manifest::{
     write_generated_file, write_manifest,
 };
 use crate::support::CommandId;
+use crate::websocket::WebSocketRouteRegistrar;
 
 const TYPES_EXPORT_COMMAND: CommandId = CommandId::new("types:export");
 const TYPES_EXPORT_MANIFEST: &str = ".foundry-types-manifest.json";
@@ -41,6 +42,9 @@ const ENDPOINT_RUNTIME_FILE: &str = "FoundryEndpoint.ts";
 const ERROR_RUNTIME_FILE: &str = "FoundryErrors.ts";
 const SDK_RUNTIME_FILE: &str = "FoundrySdk.ts";
 const SDK_CLIENT_FILE: &str = "FoundryClient.ts";
+const I18N_MANIFEST_FILE: &str = "I18nManifest.ts";
+const WEBSOCKET_MANIFEST_FILE: &str = "WebSocketChannelManifest.ts";
+const DATATABLE_MANIFEST_FILE: &str = "DatatableManifest.ts";
 const ROUTE_HELPER_DIR: &str = "routes";
 const SDK_ACTION_DIR: &str = "sdk";
 
@@ -338,6 +342,39 @@ fn render_groups(name: &str, groups: &[EnumGroup]) -> String {
     )
 }
 
+fn render_app_enum_keys(name: &str, meta: &EnumMeta) -> Result<String> {
+    let mut properties = BTreeMap::<String, String>::new();
+
+    for option in meta.options.iter() {
+        let raw_key = match &option.value {
+            EnumKey::String(value) => value.clone(),
+            EnumKey::Int(value) => format!("value_{value}"),
+        };
+        let property = to_lower_camel_case_identifier(
+            &raw_key,
+            &format!("AppEnum `{name}` key TypeScript export"),
+        )?;
+
+        if let Some(existing) = properties.insert(property.clone(), enum_key_literal(&option.value))
+        {
+            return Err(Error::message(format!(
+                "AppEnum `{name}` has keys that both normalize to `{property}` in TypeScript: {existing} and {}",
+                enum_key_literal(&option.value)
+            )));
+        }
+    }
+
+    let key_literals = properties
+        .iter()
+        .map(|(property, value)| format!("  {property}: {value}"))
+        .collect::<Vec<_>>();
+
+    Ok(format!(
+        "export const {name}Keys = {{\n{},\n}} as const;\n\n",
+        key_literals.join(",\n")
+    ))
+}
+
 fn render_app_enum(name: &str, meta: &EnumMeta) -> Result<RenderedAppEnum> {
     let value_literals: Vec<String> = meta
         .options
@@ -362,10 +399,12 @@ fn render_app_enum(name: &str, meta: &EnumMeta) -> Result<RenderedAppEnum> {
         .collect();
 
     let groups = app_enum_groups(name, meta)?;
+    let keys = render_app_enum_keys(name, meta)?;
     let mut content = format!(
         "// Auto-generated from AppEnum. Do not edit.\n\n\
          export type {name} = {type_union};\n\n\
          export const {name}Values = {} as const;\n\n\
+         {keys}\
          export const {name}Options = {} as const;\n\n\
          export const {name}Meta = {{\n\
            id: {},\n\
@@ -608,6 +647,7 @@ fn render_route_manifest(routes: &[RouteManifestEntry]) -> Result<String> {
     Ok(format!(
         "// Auto-generated from Foundry routes. Do not edit.\n\n\
          export type RouteParamValue = string | number | boolean;\n\
+         export type EmptyRouteParams = Record<never, never>;\n\
          export type RouteUrlOptions = {{ basePath?: string }};\n\
          type RouteManifestRuntimeEntry = {{ readonly path: string; readonly params: readonly string[] }};\n\n\
          export const RouteManifest = {{\n{}\n\
@@ -695,6 +735,404 @@ fn render_route_manifest(routes: &[RouteManifestEntry]) -> Result<String> {
     ))
 }
 
+fn render_i18n_manifest(manifest: Option<&I18nTypeScriptManifest>) -> Result<String> {
+    let default_locale = manifest
+        .map(|manifest| manifest.default_locale.as_str())
+        .unwrap_or("en");
+    let fallback_locale = manifest
+        .map(|manifest| manifest.fallback_locale.as_str())
+        .unwrap_or(default_locale);
+    let mut locales = manifest
+        .map(|manifest| manifest.locales.clone())
+        .unwrap_or_else(|| vec![default_locale.to_string()]);
+    locales.push(default_locale.to_string());
+    locales.push(fallback_locale.to_string());
+    locales.sort();
+    locales.dedup();
+
+    let entries = locales
+        .iter()
+        .map(|locale| {
+            format!(
+                "  {{ locale: {}, default: {}, fallback: {} }}",
+                json_string(locale),
+                if locale == default_locale { "true" } else { "false" },
+                if locale == fallback_locale { "true" } else { "false" },
+            )
+        })
+        .collect::<Vec<_>>();
+    let ids = locales
+        .iter()
+        .map(|locale| {
+            let property =
+                to_camel_case_identifier_with_context(locale, "I18n locale TypeScript export")?;
+            Ok(format!("  {property}: {},", json_string(locale)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(format!(
+        "// Auto-generated from Foundry i18n config. Do not edit.\n\n\
+         export type I18nLocaleManifestEntry = {{\n\
+           readonly locale: string;\n\
+           readonly default: boolean;\n\
+           readonly fallback: boolean;\n\
+         }};\n\n\
+         export type I18nManifestShape = {{\n\
+           readonly defaultLocale: string;\n\
+           readonly fallbackLocale: string;\n\
+           readonly locales: readonly I18nLocaleManifestEntry[];\n\
+         }};\n\n\
+         export const I18nManifest = {{\n\
+           defaultLocale: {},\n\
+           fallbackLocale: {},\n\
+           locales: [\n{}\n\
+           ],\n\
+         }} as const satisfies I18nManifestShape;\n\n\
+         export const I18nLocaleIds = {{\n{}\n\
+         }} as const;\n\n\
+         export type I18nLocaleName = (typeof I18nManifest.locales)[number][\"locale\"];\n\
+         export const I18nDefaultLocale = I18nManifest.defaultLocale;\n\
+         export const I18nFallbackLocale = I18nManifest.fallbackLocale;\n\n\
+         export function isI18nLocaleName(value: string): value is I18nLocaleName {{\n\
+           return I18nManifest.locales.some((entry) => entry.locale === value);\n\
+         }}\n\n\
+         export function i18nLocaleManifestEntry<Name extends I18nLocaleName>(locale: Name): (typeof I18nManifest.locales)[number] {{\n\
+           const entry = I18nManifest.locales.find((candidate) => candidate.locale === locale);\n\
+           if (!entry) {{\n\
+             throw new Error(`Unknown locale ${{locale}}`);\n\
+           }}\n\
+           return entry;\n\
+         }}\n\n\
+         export function i18nLocaleIsDefault<Name extends I18nLocaleName>(locale: Name): boolean {{\n\
+           return locale === I18nManifest.defaultLocale;\n\
+         }}\n\n\
+         export function i18nLocaleIsFallback<Name extends I18nLocaleName>(locale: Name): boolean {{\n\
+           return locale === I18nManifest.fallbackLocale;\n\
+         }}\n",
+        json_string(default_locale),
+        json_string(fallback_locale),
+        entries.join(",\n"),
+        ids.join("\n"),
+    ))
+}
+
+fn render_datatable_manifest(ids: &[String]) -> Result<String> {
+    let mut ids = ids.to_vec();
+    ids.sort();
+    ids.dedup();
+
+    let manifest_entries = ids
+        .iter()
+        .map(|id| format!("  {}: {{ id: {} }}", json_string(id), json_string(id)))
+        .collect::<Vec<_>>();
+
+    let mut groups = BTreeMap::<String, Vec<(String, String)>>::new();
+    for id in &ids {
+        let (group, name) = id
+            .split_once('.')
+            .map(|(group, name)| (group, name))
+            .unwrap_or(("app", id.as_str()));
+        let group_property =
+            to_camel_case_identifier_with_context(group, "Datatable ID group TypeScript export")?;
+        let name_property = to_camel_case_identifier_with_context(
+            name,
+            "Datatable ID TypeScript export",
+        )?;
+        groups
+            .entry(group_property)
+            .or_default()
+            .push((name_property, id.clone()));
+    }
+
+    let group_entries = groups
+        .into_iter()
+        .map(|(group, mut values)| {
+            values.sort_by(|left, right| left.0.cmp(&right.0));
+            let value_entries = values
+                .into_iter()
+                .map(|(property, id)| format!("    {property}: {},", json_string(&id)))
+                .collect::<Vec<_>>();
+            format!("  {group}: {{\n{}\n  }},", value_entries.join("\n"))
+        })
+        .collect::<Vec<_>>();
+
+    Ok(format!(
+        "// Auto-generated from Foundry datatable registry. Do not edit.\n\n\
+         export type DatatableManifestEntry = {{ readonly id: string }};\n\n\
+         export const DatatableManifest = {{\n{}\n\
+         }} as const satisfies Record<string, DatatableManifestEntry>;\n\n\
+         export const DatatableIds = {{\n{}\n\
+         }} as const;\n\n\
+         export type DatatableName = keyof typeof DatatableManifest;\n",
+        manifest_entries.join(",\n"),
+        group_entries.join("\n"),
+    ))
+}
+
+fn websocket_event_array(events: &[crate::contract::ContractRealtimeEvent]) -> String {
+    string_array_literal(events.iter().map(|event| event.event.as_str()))
+}
+
+fn websocket_payload_type(
+    payload: Option<&crate::contract::ContractPayload>,
+    exported_types: &BTreeMap<String, String>,
+    imports: &mut BTreeSet<String>,
+) -> String {
+    let Some(payload) = payload else {
+        return "JsonValue".to_string();
+    };
+    if exported_types.contains_key(&payload.schema) {
+        imports.insert(payload.schema.clone());
+        payload.schema.clone()
+    } else {
+        "JsonValue".to_string()
+    }
+}
+
+fn render_websocket_payload_map(
+    channels: &[ContractRealtimeChannel],
+    exported_types: &BTreeMap<String, String>,
+    imports: &mut BTreeSet<String>,
+    direction: &str,
+) -> String {
+    let channel_entries = channels
+        .iter()
+        .filter_map(|channel| {
+            let events = if direction == "server" {
+                &channel.outgoing
+            } else {
+                &channel.incoming
+            };
+            let event_entries = events
+                .iter()
+                .filter_map(|event| {
+                    event.payload.as_ref()?;
+                    let payload_type =
+                        websocket_payload_type(event.payload.as_ref(), exported_types, imports);
+                    Some(format!(
+                        "    readonly {}: {payload_type};",
+                        json_string(&event.event)
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if event_entries.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "  readonly {}: {{\n{}\n  }};",
+                    json_string(&channel.id),
+                    event_entries.join("\n")
+                ))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if channel_entries.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{\n{}\n}}", channel_entries.join("\n"))
+    }
+}
+
+fn render_websocket_manifest(
+    channels: &[ContractRealtimeChannel],
+    exported_types: &BTreeMap<String, String>,
+) -> Result<String> {
+    let mut channels = channels.to_vec();
+    channels.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let channel_entries = channels
+        .iter()
+        .map(|channel| {
+            format!(
+                "  {}: {{ id: {}, presence: {}, replayCount: {}, allowClientEvents: {}, clientEvents: {}, serverEvents: {}, requiresAuth: {}, guard: {}, permissions: {} }}",
+                json_string(&channel.id),
+                json_string(&channel.id),
+                if channel.presence { "true" } else { "false" },
+                channel.replay_count,
+                if channel.allow_client_events { "true" } else { "false" },
+                websocket_event_array(&channel.incoming),
+                websocket_event_array(&channel.outgoing),
+                if channel.auth.guard.is_some() { "true" } else { "false" },
+                option_string_literal(channel.auth.guard.as_deref()),
+                string_array_literal(channel.auth.permissions.iter().map(String::as_str)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let channel_ids = channels
+        .iter()
+        .map(|channel| {
+            let property = to_lower_camel_case_identifier(
+                &channel.id,
+                "WebSocket channel TypeScript export",
+            )?;
+            Ok(format!("  {property}: {},", json_string(&channel.id)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut imports = BTreeSet::new();
+    let server_payload_map =
+        render_websocket_payload_map(&channels, exported_types, &mut imports, "server");
+    let client_payload_map =
+        render_websocket_payload_map(&channels, exported_types, &mut imports, "client");
+    let import_lines = imports
+        .iter()
+        .filter_map(|import| {
+            exported_types.get(import).map(|file| {
+                ts_module_specifier(file).map(|module| {
+                    format!("import type {{ {import} }} from {};", json_string(&module))
+                })
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(format!(
+        "// Auto-generated from Foundry WebSocket channels. Do not edit.\n\n\
+         import type {{ ErrorResponse }} from \"./FoundryErrors\";\n\
+         import type {{ JsonValue }} from \"./FoundryEndpoint\";\n\
+         {}\n\
+         export type WebSocketChannelManifestEntry = {{\n\
+           readonly id: string;\n\
+           readonly presence: boolean;\n\
+           readonly replayCount: number;\n\
+           readonly allowClientEvents: boolean;\n\
+           readonly clientEvents: readonly string[];\n\
+           readonly serverEvents: readonly string[];\n\
+           readonly requiresAuth: boolean;\n\
+           readonly guard: string | null;\n\
+           readonly permissions: readonly string[];\n\
+         }};\n\n\
+         export const WebSocketChannelManifest = {{\n{}\n\
+         }} as const satisfies Record<string, WebSocketChannelManifestEntry>;\n\n\
+         export const WebSocketChannelIds = {{\n{}\n\
+         }} as const;\n\n\
+         export const WebSocketProtocol = {{\n\
+           systemChannel: \"system\",\n\
+           events: {{\n\
+             error: \"error\",\n\
+             subscribed: \"subscribed\",\n\
+             unsubscribed: \"unsubscribed\",\n\
+             presenceJoin: \"presence:join\",\n\
+             presenceLeave: \"presence:leave\",\n\
+             ack: \"ack\",\n\
+           }},\n\
+         }} as const;\n\n\
+         export type WebSocketChannelName = keyof typeof WebSocketChannelManifest;\n\
+         export type WebSocketPresenceChannelName = {{\n\
+           readonly [Name in WebSocketChannelName]: (typeof WebSocketChannelManifest)[Name][\"presence\"] extends true ? Name : never;\n\
+         }}[WebSocketChannelName];\n\
+         export type WebSocketSystemChannel = typeof WebSocketProtocol.systemChannel;\n\
+         export type WebSocketSystemEventName = typeof WebSocketProtocol.events.error | typeof WebSocketProtocol.events.ack;\n\
+         export type WebSocketChannelProtocolEventName = typeof WebSocketProtocol.events.subscribed | typeof WebSocketProtocol.events.unsubscribed | typeof WebSocketProtocol.events.presenceJoin | typeof WebSocketProtocol.events.presenceLeave;\n\
+         export type WebSocketProtocolEventName = WebSocketSystemEventName | WebSocketChannelProtocolEventName;\n\
+         export type WebSocketClientEventChannelName = {{\n\
+           readonly [Name in WebSocketChannelName]: (typeof WebSocketChannelManifest)[Name][\"allowClientEvents\"] extends true ? Name : never;\n\
+         }}[WebSocketChannelName];\n\
+         export type WebSocketClientEventName<Name extends WebSocketClientEventChannelName> = (typeof WebSocketChannelManifest)[Name][\"clientEvents\"][number] extends never ? string : (typeof WebSocketChannelManifest)[Name][\"clientEvents\"][number];\n\
+         export type WebSocketServerEventName<Name extends string> = [WebSocketChannelName] extends [never] ? string : Name extends WebSocketSystemChannel ? WebSocketSystemEventName : Name extends WebSocketChannelName ? (typeof WebSocketChannelManifest)[Name][\"serverEvents\"][number] extends never ? string | WebSocketChannelProtocolEventName : WebSocketChannelProtocolEventName | (typeof WebSocketChannelManifest)[Name][\"serverEvents\"][number] : string;\n\
+         export type WebSocketAppServerEventName<Name extends WebSocketChannelName> = [WebSocketChannelName] extends [never] ? string : (typeof WebSocketChannelManifest)[Name][\"serverEvents\"][number] extends never ? string : Exclude<(typeof WebSocketChannelManifest)[Name][\"serverEvents\"][number], WebSocketChannelProtocolEventName>;\n\
+         export type WebSocketServerPayloadMap = {server_payload_map};\n\
+         export type WebSocketClientEventPayloadMap = {client_payload_map};\n\
+         export type WebSocketServerPayload<Name extends WebSocketChannelName, Event extends WebSocketAppServerEventName<Name>> = Name extends keyof WebSocketServerPayloadMap ? Event extends keyof WebSocketServerPayloadMap[Name] ? WebSocketServerPayloadMap[Name][Event] : JsonValue : JsonValue;\n\
+         export type WebSocketClientEventPayload<Name extends WebSocketClientEventChannelName, Event extends WebSocketClientEventName<Name>> = Name extends keyof WebSocketClientEventPayloadMap ? Event extends keyof WebSocketClientEventPayloadMap[Name] ? WebSocketClientEventPayloadMap[Name][Event] : JsonValue : JsonValue;\n\n\
+         export type WebSocketFrameOptions = {{ readonly room?: string }};\n\
+         export type WebSocketMessageOptions = WebSocketFrameOptions & {{ readonly ackId?: string }};\n\
+         export type WebSocketSubscribeFrame<Name extends WebSocketChannelName = WebSocketChannelName> = {{ readonly action: \"subscribe\"; readonly channel: Name; readonly room?: string }};\n\
+         export type WebSocketUnsubscribeFrame<Name extends WebSocketChannelName = WebSocketChannelName> = {{ readonly action: \"unsubscribe\"; readonly channel: Name; readonly room?: string }};\n\
+         export type WebSocketMessageFrame<Name extends WebSocketChannelName = WebSocketChannelName, Payload extends JsonValue = JsonValue> = {{ readonly action: \"message\"; readonly channel: Name; readonly room?: string; readonly payload: Payload; readonly ack_id?: string }};\n\
+         export type WebSocketClientEventFrame<Name extends WebSocketClientEventChannelName = WebSocketClientEventChannelName, Payload extends JsonValue = JsonValue, Event extends WebSocketClientEventName<Name> = WebSocketClientEventName<Name>> = {{ readonly action: \"client_event\"; readonly channel: Name; readonly room?: string; readonly event: Event; readonly payload: Payload }};\n\
+         export type WebSocketClientFrame<Name extends WebSocketChannelName = WebSocketChannelName, Payload extends JsonValue = JsonValue> = WebSocketSubscribeFrame<Name> | WebSocketUnsubscribeFrame<Name> | WebSocketMessageFrame<Name, Payload> | WebSocketClientEventFrame<Extract<Name, WebSocketClientEventChannelName>, Payload>;\n\
+         export type WebSocketServerFrame<Name extends string = string, Event extends string = string, Payload extends JsonValue = JsonValue> = {{ readonly channel: Name; readonly event: Event; readonly room?: string; readonly payload: Payload }};\n\
+         export type WebSocketAppServerFrame<Name extends WebSocketChannelName = WebSocketChannelName, Payload extends JsonValue = JsonValue> = WebSocketAppServerEventName<Name> extends never ? never : WebSocketServerFrame<Name, WebSocketAppServerEventName<Name>, Payload>;\n\
+         export type TypedWebSocketAppServerFrame<Name extends WebSocketChannelName = WebSocketChannelName, Event extends WebSocketAppServerEventName<Name> = WebSocketAppServerEventName<Name>> = Event extends WebSocketAppServerEventName<Name> ? WebSocketServerFrame<Name, Event, WebSocketServerPayload<Name, Event>> : never;\n\
+         export type TypedWebSocketClientEventFrame<Name extends WebSocketClientEventChannelName = WebSocketClientEventChannelName, Event extends WebSocketClientEventName<Name> = WebSocketClientEventName<Name>> = WebSocketClientEventFrame<Name, WebSocketClientEventPayload<Name, Event>, Event>;\n\
+         export type WebSocketErrorPayload = ErrorResponse;\n\
+         export type WebSocketErrorFrame = WebSocketServerFrame<WebSocketSystemChannel, typeof WebSocketProtocol.events.error, WebSocketErrorPayload>;\n\
+         export type WebSocketAckFrame = WebSocketServerFrame<WebSocketSystemChannel, typeof WebSocketProtocol.events.ack, JsonValue>;\n\
+         export type WebSocketSubscribedFrame<Name extends WebSocketChannelName = WebSocketChannelName> = WebSocketServerFrame<Name, typeof WebSocketProtocol.events.subscribed, null>;\n\
+         export type WebSocketUnsubscribedFrame<Name extends WebSocketChannelName = WebSocketChannelName> = WebSocketServerFrame<Name, typeof WebSocketProtocol.events.unsubscribed, null>;\n\
+         export type WebSocketPresenceJoinFrame<Name extends WebSocketPresenceChannelName = WebSocketPresenceChannelName> = WebSocketServerFrame<Name, typeof WebSocketProtocol.events.presenceJoin, JsonValue>;\n\
+         export type WebSocketPresenceLeaveFrame<Name extends WebSocketPresenceChannelName = WebSocketPresenceChannelName> = WebSocketServerFrame<Name, typeof WebSocketProtocol.events.presenceLeave, JsonValue>;\n\
+         type WebSocketPresenceProtocolFrame<Name extends WebSocketChannelName> = Extract<Name, WebSocketPresenceChannelName> extends never ? never : WebSocketPresenceJoinFrame<Extract<Name, WebSocketPresenceChannelName>> | WebSocketPresenceLeaveFrame<Extract<Name, WebSocketPresenceChannelName>>;\n\
+         export type WebSocketProtocolFrame<Name extends WebSocketChannelName = WebSocketChannelName> = WebSocketErrorFrame | WebSocketAckFrame | WebSocketSubscribedFrame<Name> | WebSocketUnsubscribedFrame<Name> | WebSocketPresenceProtocolFrame<Name>;\n\
+         export type WebSocketInboundFrame<Name extends WebSocketChannelName = WebSocketChannelName, Payload extends JsonValue = JsonValue> = WebSocketAppServerFrame<Name, Payload> | WebSocketProtocolFrame<Name>;\n\n\
+         function hasOwn<T extends object>(target: T, key: PropertyKey): key is keyof T {{\n\
+           return Object.prototype.hasOwnProperty.call(target, key);\n\
+         }}\n\n\
+         function isRecord(value: unknown): value is Record<string, unknown> {{\n\
+           return !!value && typeof value === \"object\" && !Array.isArray(value);\n\
+         }}\n\n\
+         function isJsonValue(value: unknown): value is JsonValue {{\n\
+           if (value === null || typeof value === \"string\" || typeof value === \"number\" || typeof value === \"boolean\") return true;\n\
+           if (Array.isArray(value)) return value.every(isJsonValue);\n\
+           if (isRecord(value)) return Object.values(value).every(isJsonValue);\n\
+           return false;\n\
+         }}\n\n\
+         export function isWebSocketSystemEventName(event: string): event is WebSocketSystemEventName {{\n\
+           return event === WebSocketProtocol.events.error || event === WebSocketProtocol.events.ack;\n\
+         }}\n\n\
+         export function isWebSocketProtocolEventName(event: string): event is WebSocketProtocolEventName {{\n\
+           return isWebSocketSystemEventName(event) || event === WebSocketProtocol.events.subscribed || event === WebSocketProtocol.events.unsubscribed || event === WebSocketProtocol.events.presenceJoin || event === WebSocketProtocol.events.presenceLeave;\n\
+         }}\n\n\
+         export function hasWebSocketServerPayload(channel: string, event: string): boolean {{\n\
+           const channelPayloads = ({{}} as WebSocketServerPayloadMap)[channel as keyof WebSocketServerPayloadMap] as Record<string, unknown> | undefined;\n\
+           return !!channelPayloads && hasOwn(channelPayloads, event);\n\
+         }}\n\n\
+         export function hasWebSocketClientEventPayload(channel: string, event: string): boolean {{\n\
+           const channelPayloads = ({{}} as WebSocketClientEventPayloadMap)[channel as keyof WebSocketClientEventPayloadMap] as Record<string, unknown> | undefined;\n\
+           return !!channelPayloads && hasOwn(channelPayloads, event);\n\
+         }}\n\n\
+         export function isWebSocketChannelName(value: string): value is WebSocketChannelName {{\n\
+           return hasOwn(WebSocketChannelManifest, value);\n\
+         }}\n\n\
+         export function isWebSocketPresenceChannelName(value: string): value is WebSocketPresenceChannelName {{\n\
+           return isWebSocketChannelName(value) && WebSocketChannelManifest[value].presence;\n\
+         }}\n\n\
+         export function isWebSocketServerEventName<Name extends string>(channel: Name, event: string): event is WebSocketServerEventName<Name> {{\n\
+           if (channel === WebSocketProtocol.systemChannel) return isWebSocketSystemEventName(event);\n\
+           if (!isWebSocketChannelName(channel)) return false;\n\
+           return isWebSocketProtocolEventName(event) || (WebSocketChannelManifest[channel].serverEvents as readonly string[]).includes(event);\n\
+         }}\n\n\
+         export function isWebSocketProtocolFrame(value: unknown): value is WebSocketProtocolFrame {{\n\
+           if (!isRecord(value) || typeof value.channel !== \"string\" || typeof value.event !== \"string\") return false;\n\
+           return value.channel === WebSocketProtocol.systemChannel ? isWebSocketSystemEventName(value.event) : isWebSocketChannelName(value.channel) && isWebSocketProtocolEventName(value.event);\n\
+         }}\n\n\
+         export function isWebSocketServerFrame(value: unknown): value is WebSocketInboundFrame {{\n\
+           if (!isRecord(value) || typeof value.channel !== \"string\" || typeof value.event !== \"string\") return false;\n\
+           if (value.channel === WebSocketProtocol.systemChannel) return isWebSocketSystemEventName(value.event) && isJsonValue(value.payload ?? null);\n\
+           return isWebSocketChannelName(value.channel) && isWebSocketServerEventName(value.channel, value.event) && isJsonValue(value.payload ?? null);\n\
+         }}\n\n\
+         export function parseWebSocketServerFrame(value: unknown): WebSocketInboundFrame | null {{\n\
+           let parsed: unknown;\n\
+           try {{\n\
+             parsed = typeof value === \"string\" ? JSON.parse(value) : value;\n\
+           }} catch {{\n\
+             return null;\n\
+           }}\n\
+           if (!isWebSocketServerFrame(parsed)) return null;\n\
+           return {{ ...parsed, payload: parsed.payload ?? null }} as WebSocketInboundFrame;\n\
+         }}\n\n\
+         export function subscribeToChannel<Name extends WebSocketChannelName>(channel: Name, options: WebSocketFrameOptions = {{}}): WebSocketSubscribeFrame<Name> {{\n\
+           return {{ action: \"subscribe\", channel, room: options.room }};\n\
+         }}\n\n\
+         export function unsubscribeFromChannel<Name extends WebSocketChannelName>(channel: Name, options: WebSocketFrameOptions = {{}}): WebSocketUnsubscribeFrame<Name> {{\n\
+           return {{ action: \"unsubscribe\", channel, room: options.room }};\n\
+         }}\n\n\
+         export function messageToChannel<Name extends WebSocketChannelName, Payload extends JsonValue = JsonValue>(channel: Name, payload: Payload, options: WebSocketMessageOptions = {{}}): WebSocketMessageFrame<Name, Payload> {{\n\
+           return {{ action: \"message\", channel, room: options.room, payload, ack_id: options.ackId }};\n\
+         }}\n\n\
+         export function clientEventToChannel<Name extends WebSocketClientEventChannelName, Event extends WebSocketClientEventName<Name>, Payload extends JsonValue = JsonValue>(channel: Name, event: Event, payload: Payload, options: WebSocketFrameOptions = {{}}): WebSocketClientEventFrame<Name, Payload, Event> {{\n\
+           return {{ action: \"client_event\", channel, room: options.room, event, payload }};\n\
+         }}\n\n\
+         export function typedClientEventToChannel<Name extends WebSocketClientEventChannelName, Event extends WebSocketClientEventName<Name>>(channel: Name, event: Event, payload: WebSocketClientEventPayload<Name, Event>, options: WebSocketFrameOptions = {{}}): TypedWebSocketClientEventFrame<Name, Event> {{\n\
+           return clientEventToChannel(channel, event, payload, options) as TypedWebSocketClientEventFrame<Name, Event>;\n\
+         }}\n",
+        import_lines.join("\n"),
+        channel_entries.join(",\n"),
+        channel_ids.join("\n"),
+    ))
+}
+
 #[derive(Debug)]
 struct PlannedRouteHelper<'a> {
     route: &'a RouteManifestEntry,
@@ -708,6 +1146,20 @@ struct PlannedSdkAction<'a> {
     name: String,
     function_name: String,
     file: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct I18nTypeScriptManifest {
+    pub default_locale: String,
+    pub fallback_locale: String,
+    pub locales: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TypeScriptExportContext {
+    pub realtime_channels: Vec<ContractRealtimeChannel>,
+    pub i18n: Option<I18nTypeScriptManifest>,
+    pub datatable_ids: Vec<String>,
 }
 
 fn to_pascal_case_identifier_with_context(value: &str, context: &str) -> Result<String> {
@@ -869,6 +1321,8 @@ fn render_endpoint_runtime() -> String {
 
 import { routeUrl, type RouteName, type RouteParamValue, type RouteUrlOptions } from "./RouteManifest";
 
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
 export type FoundryHttpMethod = "get" | "post" | "put" | "patch" | "delete" | "head" | "options";
 export type FoundryHttpHeaders = Record<string, string>;
 
@@ -964,6 +1418,13 @@ export class FoundryValidationClientError<TRequest> extends Error {
 }
 
 type Subscriber = () => void;
+type FoundryValidationTranslator = (key: string, replacements?: Readonly<Record<string, string>>) => string;
+
+let foundryValidationTranslator: FoundryValidationTranslator = (key) => key;
+
+export function setFoundryValidationTranslator(translator: FoundryValidationTranslator): void {
+  foundryValidationTranslator = translator;
+}
 
 function routeUrlUntyped(name: RouteName, params: Record<string, RouteParamValue>, options: RouteUrlOptions): string {
   return (routeUrl as (name: RouteName, params?: Record<string, RouteParamValue>, options?: RouteUrlOptions) => string)(
@@ -1052,6 +1513,10 @@ function appendFormValue(form: FormData, key: string, value: unknown): void {
 }
 
 function fallbackMessage(field: string, code: string, params: Readonly<Record<string, string>>): string {
+  const translated = foundryValidationTranslator(`validation.${code}`, { field, ...params });
+  if (translated !== `validation.${code}`) {
+    return translated;
+  }
   const value = (name: string) => params[name] ?? "";
   switch (code) {
     case "required": return `The ${field} field is required.`;
@@ -1207,7 +1672,7 @@ export abstract class FoundryEndpoint<
 
   private subscribers = new Set<Subscriber>();
 
-  constructor(protected readonly client: FoundryHttpClient, data: TRequest) {
+  constructor(protected readonly client: FoundryHttpClient, data: TRequest, protected readonly params?: TParams) {
     this.data = data;
   }
 
@@ -1270,7 +1735,7 @@ export abstract class FoundryEndpoint<
     this.notify();
 
     try {
-      const url = options.url ?? routeUrlUntyped(this.routeName, options.params ?? {}, options.route ?? {});
+      const url = options.url ?? routeUrlUntyped(this.routeName, { ...(this.params ?? {}), ...(options.params ?? {}) }, options.route ?? {});
       const useFormData = options.formData ?? hasFileLike(this.data);
       const data = useFormData ? this.toFormData() : this.data;
       const response = await this.client.request<TResponse>({
@@ -1410,8 +1875,14 @@ export type FoundryErrorResponse = {
   message: string;
   status?: number;
   code?: FoundryErrorCode;
+  error_code?: string;
+  message_key?: string;
   errors?: FoundryValidationErrors;
 };
+
+export type FieldError = FoundryFieldError;
+export type ValidationErrors = FoundryValidationErrors;
+export type ErrorResponse = FoundryErrorResponse;
 
 export class FoundrySdkError extends Error {
   readonly status: number | null;
@@ -1500,11 +1971,29 @@ export type FoundryActionOptions<TParams extends Record<string, RouteParamValue>
   request?: Omit<FoundrySdkRequestConfig, "url" | "method" | "data">;
 };
 
+export type FoundryClientOptions = {
+  route?: RouteUrlOptions;
+  headers?: FoundrySdkHeaders;
+  request?: Omit<FoundrySdkRequestConfig, "url" | "method" | "data">;
+};
+
 export type FoundryActionDefinition<TParams extends Record<string, RouteParamValue>> = {
   routeName: RouteName;
   method: FoundrySdkHttpMethod | string;
   body: FoundrySdkBodyKind;
 };
+
+export function mergeFoundryActionOptions<TParams extends Record<string, RouteParamValue>>(
+  defaults: FoundryClientOptions | undefined,
+  options: FoundryActionOptions<TParams> = {},
+): FoundryActionOptions<TParams> {
+  return {
+    ...options,
+    route: { ...(defaults?.route ?? {}), ...(options.route ?? {}) },
+    headers: { ...(defaults?.headers ?? {}), ...(options.headers ?? {}) },
+    request: { ...(defaults?.request ?? {}), ...(options.request ?? {}) },
+  };
+}
 
 function routeUrlUntyped(name: RouteName, params: Record<string, RouteParamValue>, options: RouteUrlOptions): string {
   return (routeUrl as (name: RouteName, params?: Record<string, RouteParamValue>, options?: RouteUrlOptions) => string)(
@@ -1578,6 +2067,20 @@ function actionData<TRequest>(body: FoundrySdkBodyKind, data: TRequest | undefin
   return data;
 }
 
+function actionParams<TRequest>(
+  body: FoundrySdkBodyKind,
+  data: TRequest | undefined,
+  requestParams: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (body !== "none" || data === undefined) {
+    return requestParams;
+  }
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    return { ...(data as Record<string, unknown>), ...(requestParams ?? {}) };
+  }
+  return requestParams;
+}
+
 export async function sendFoundryAction<
   TRequest,
   TResponse,
@@ -1589,11 +2092,13 @@ export async function sendFoundryAction<
   options: FoundryActionOptions<TParams> = {},
 ): Promise<TResponse> {
   const url = options.url ?? routeUrlUntyped(definition.routeName, options.params ?? {}, options.route ?? {});
+  const params = actionParams(definition.body, data, options.request?.params as Record<string, unknown> | undefined);
   try {
     const response = await transport.request<TResponse>({
       ...(options.request ?? {}),
       method: definition.method,
       url,
+      params,
       data: actionData(definition.body, data),
       headers: { ...(options.request?.headers as FoundrySdkHeaders | undefined), ...(options.headers ?? {}) },
     });
@@ -1967,6 +2472,7 @@ fn postprocess_ts_type_file(path: &Path, validation: Option<&TsValidationSchema>
     if !content.starts_with(TYPE_FILE_HEADER) {
         content = format!("{TYPE_FILE_HEADER}\n{content}");
     }
+    content = content.replace("bigint", "number");
 
     if let Some(validation) = validation {
         content = add_validation_comments(&content, validation);
@@ -2088,6 +2594,7 @@ fn contract_schemas() -> Result<Vec<ContractSchema>> {
 fn contract_manifest(
     routes: &[RouteManifestEntry],
     validations: &BTreeMap<&'static str, TsValidationSchema>,
+    realtime_channels: Vec<ContractRealtimeChannel>,
 ) -> Result<ContractManifest> {
     let validation_schemas = validations
         .iter()
@@ -2096,7 +2603,8 @@ fn contract_manifest(
 
     Ok(ContractManifest::from_http_routes(routes)?
         .with_schemas(contract_schemas()?)
-        .with_validation_schemas(validation_schemas))
+        .with_validation_schemas(validation_schemas)
+        .with_realtime_channels(realtime_channels))
 }
 
 fn route_type_name(helper_name: &str, suffix: &str) -> String {
@@ -2121,8 +2629,108 @@ fn schema_type_reference(
     }
 }
 
+fn named_type_for_schema(
+    schema_json: &serde_json::Value,
+    schema_exports: &BTreeMap<String, serde_json::Value>,
+    exported_types: &BTreeMap<String, String>,
+    imports: &mut BTreeSet<String>,
+) -> Option<String> {
+    schema_exports.iter().find_map(|(name, schema)| {
+        if schema == schema_json && exported_types.contains_key(name) {
+            imports.insert(name.clone());
+            Some(name.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn schema_json_to_ts_type(
+    schema_json: &serde_json::Value,
+    schema_exports: &BTreeMap<String, serde_json::Value>,
+    exported_types: &BTreeMap<String, String>,
+    imports: &mut BTreeSet<String>,
+) -> String {
+    if let Some(name) = named_type_for_schema(schema_json, schema_exports, exported_types, imports)
+    {
+        return name;
+    }
+
+    if schema_json
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        == Some("array")
+    {
+        let item_type = schema_json
+            .get("items")
+            .map(|items| schema_json_to_ts_type(items, schema_exports, exported_types, imports))
+            .unwrap_or_else(|| "unknown".to_string());
+        return format!("{item_type}[]");
+    }
+
+    if schema_json
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        == Some("object")
+    {
+        let Some(properties) = schema_json
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return "Record<string, unknown>".to_string();
+        };
+        let required = schema_json
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let fields = properties
+            .iter()
+            .map(|(name, property_schema)| {
+                let optional = if required.contains(name.as_str()) {
+                    ""
+                } else {
+                    "?"
+                };
+                let field_type =
+                    schema_json_to_ts_type(property_schema, schema_exports, exported_types, imports);
+                format!("{}{}: {}", json_string(name), optional, field_type)
+            })
+            .collect::<Vec<_>>();
+        return format!("{{ {} }}", fields.join("; "));
+    }
+
+    match schema_json.get("type").and_then(serde_json::Value::as_str) {
+        Some("string") => "string".to_string(),
+        Some("integer") | Some("number") => "number".to_string(),
+        Some("boolean") => "boolean".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn response_type_reference(
+    schema: &str,
+    schema_json: &serde_json::Value,
+    schema_exports: &BTreeMap<String, serde_json::Value>,
+    exported_types: &BTreeMap<String, String>,
+    imports: &mut BTreeSet<String>,
+) -> String {
+    if exported_types.contains_key(schema) {
+        imports.insert(schema.to_string());
+        schema.to_string()
+    } else {
+        schema_json_to_ts_type(schema_json, schema_exports, exported_types, imports)
+    }
+}
+
 fn route_response_type(
     route: &RouteManifestEntry,
+    schema_exports: &BTreeMap<String, serde_json::Value>,
     exported_types: &BTreeMap<String, String>,
     imports: &mut BTreeSet<String>,
 ) -> String {
@@ -2131,7 +2739,13 @@ fn route_response_type(
         .iter()
         .filter(|response| (200..300).contains(&response.status))
         .map(|response| {
-            schema_type_reference(Some(response.schema), exported_types, imports, "unknown")
+            response_type_reference(
+                response.schema,
+                &response.schema_json,
+                schema_exports,
+                exported_types,
+                imports,
+            )
         })
         .collect::<Vec<_>>();
     responses.sort();
@@ -2146,6 +2760,7 @@ fn route_response_type(
 
 fn action_response_type(
     action: &ContractAction,
+    schema_exports: &BTreeMap<String, serde_json::Value>,
     exported_types: &BTreeMap<String, String>,
     imports: &mut BTreeSet<String>,
 ) -> String {
@@ -2154,7 +2769,13 @@ fn action_response_type(
         .iter()
         .filter(|response| (200..300).contains(&response.status))
         .map(|response| {
-            schema_type_reference(Some(&response.schema), exported_types, imports, "unknown")
+            response_type_reference(
+                &response.schema,
+                &response.schema_json,
+                schema_exports,
+                exported_types,
+                imports,
+            )
         })
         .collect::<Vec<_>>();
     responses.sort();
@@ -2205,8 +2826,8 @@ fn action_body_kind(action: &ContractAction) -> ContractHttpBody {
     }
 }
 
-fn action_accepts_request_body(action: &ContractAction) -> bool {
-    action.request.is_some() && action_body_kind(action) != ContractHttpBody::None
+fn action_accepts_request_payload(action: &ContractAction) -> bool {
+    action.request.is_some()
 }
 
 fn action_method(action: &ContractAction) -> &str {
@@ -2244,6 +2865,7 @@ fn sdk_body_kind_literal(kind: ContractHttpBody) -> &'static str {
 
 fn render_route_helper(
     helper: &PlannedRouteHelper<'_>,
+    schema_exports: &BTreeMap<String, serde_json::Value>,
     exported_types: &BTreeMap<String, String>,
     validations: &BTreeMap<&'static str, TsValidationSchema>,
 ) -> Result<String> {
@@ -2264,7 +2886,7 @@ fn render_route_helper(
         &mut imports,
         "Record<string, never>",
     );
-    let response_type = route_response_type(route, exported_types, &mut imports);
+    let response_type = route_response_type(route, schema_exports, exported_types, &mut imports);
     let params_type = render_route_params_type(route);
 
     let import_lines = imports
@@ -2283,6 +2905,30 @@ fn render_route_helper(
         &request_alias,
     );
     let method = option_string_literal(route.method.as_deref());
+    let has_params = !route.params.is_empty();
+    let has_request = route.request.is_some();
+    let factory = match (has_params, has_request) {
+        (true, true) => format!(
+            "export function {name}(client: FoundryHttpClient, params: {params_alias}, data: {request_alias}): {endpoint_name} {{\n\
+               return new {endpoint_name}(client, data as {request_alias} & Record<string, unknown>, params);\n\
+             }}\n"
+        ),
+        (true, false) => format!(
+            "export function {name}(client: FoundryHttpClient, params: {params_alias}, data: {request_alias} = {{}} as {request_alias}): {endpoint_name} {{\n\
+               return new {endpoint_name}(client, data as {request_alias} & Record<string, unknown>, params);\n\
+             }}\n"
+        ),
+        (false, true) => format!(
+            "export function {name}(client: FoundryHttpClient, data: {request_alias}): {endpoint_name} {{\n\
+               return new {endpoint_name}(client, data as {request_alias} & Record<string, unknown>);\n\
+             }}\n"
+        ),
+        (false, false) => format!(
+            "export function {name}(client: FoundryHttpClient, data: {request_alias} = {{}} as {request_alias}): {endpoint_name} {{\n\
+               return new {endpoint_name}(client, data as {request_alias} & Record<string, unknown>);\n\
+             }}\n"
+        ),
+    };
 
     Ok(format!(
         "// Auto-generated from Foundry route `{}`. Do not edit.\n\n\
@@ -2301,19 +2947,19 @@ fn render_route_helper(
            readonly method = {method_const};\n\
            readonly validation = {validation_const};\n\
          }}\n\n\
-         export function {name}(client: FoundryHttpClient, data: {request_alias}): {endpoint_name} {{\n\
-           return new {endpoint_name}(client, data as {request_alias} & Record<string, unknown>);\n\
-         }}\n",
+         {factory}",
         route.id.as_str(),
         import_lines.join("\n"),
         json_string(&route.path),
         method,
         json_string(route.id.as_str()),
+        factory = factory,
     ))
 }
 
 fn render_sdk_action(
     action: &PlannedSdkAction<'_>,
+    schema_exports: &BTreeMap<String, serde_json::Value>,
     exported_types: &BTreeMap<String, String>,
 ) -> Result<String> {
     let name = &action.name;
@@ -2335,7 +2981,8 @@ fn render_sdk_action(
         &mut imports,
         "Record<string, never>",
     );
-    let response_type = action_response_type(action.action, exported_types, &mut imports);
+    let response_type =
+        action_response_type(action.action, schema_exports, exported_types, &mut imports);
     let params_type = action_params_type(action.action);
     let import_lines = imports
         .iter()
@@ -2352,9 +2999,9 @@ fn render_sdk_action(
     let method = action_method(action.action);
     let route_id = &action.action.id;
 
-    let accepts_request_body = action_accepts_request_body(action.action);
+    let accepts_request_payload = action_accepts_request_payload(action.action);
 
-    let action_signature = if accepts_request_body {
+    let action_signature = if accepts_request_payload {
         format!(
             "(request: {request_alias}, options?: FoundryActionOptions<{params_alias}>) => Promise<{response_alias}>"
         )
@@ -2362,19 +3009,19 @@ fn render_sdk_action(
         format!("(options?: FoundryActionOptions<{params_alias}>) => Promise<{response_alias}>")
     };
 
-    let action_body = if accepts_request_body {
+    let action_body = if accepts_request_payload {
         format!(
-            "  return (request, options = {{}}) => sendFoundryAction<{request_alias}, {response_alias}, {params_alias}>(transport, {definition_const}, request, options);\n"
+            "  return (request, options = {{}}) => sendFoundryAction<{request_alias}, {response_alias}, {params_alias}>(transport, {definition_const}, request, mergeFoundryActionOptions(defaults, options));\n"
         )
     } else {
         format!(
-            "  return (options = {{}}) => sendFoundryAction<{request_alias}, {response_alias}, {params_alias}>(transport, {definition_const}, undefined, options);\n"
+            "  return (options = {{}}) => sendFoundryAction<{request_alias}, {response_alias}, {params_alias}>(transport, {definition_const}, undefined, mergeFoundryActionOptions(defaults, options));\n"
         )
     };
 
     Ok(format!(
         "// Auto-generated from Foundry contract action `{}`. Do not edit.\n\n\
-         import {{ sendFoundryAction, type FoundryActionDefinition, type FoundryActionOptions, type FoundrySdkTransport }} from \"../FoundrySdk\";\n\
+         import {{ mergeFoundryActionOptions, sendFoundryAction, type FoundryActionDefinition, type FoundryActionOptions, type FoundryClientOptions, type FoundrySdkTransport }} from \"../FoundrySdk\";\n\
          import type {{ RouteName, RouteParamValue }} from \"../RouteManifest\";\n\
          {}\n\
          export type {request_alias} = {request_type};\n\
@@ -2386,7 +3033,7 @@ fn render_sdk_action(
            method: {},\n\
            body: {},\n\
          }} as const satisfies FoundryActionDefinition<{params_alias}>;\n\n\
-         export function {factory_name}(transport: FoundrySdkTransport): {action_name} {{\n\
+         export function {factory_name}(transport: FoundrySdkTransport, defaults?: FoundryClientOptions): {action_name} {{\n\
          {action_body}\
          }}\n",
         route_id,
@@ -2398,8 +3045,10 @@ fn render_sdk_action(
 }
 
 fn render_sdk_client(actions: &[PlannedSdkAction<'_>]) -> Result<String> {
-    let mut imports =
-        vec!["import type { FoundrySdkTransport } from \"./FoundrySdk\";".to_string()];
+    let mut imports = vec![
+        "import type { FoundryClientOptions, FoundrySdkTransport } from \"./FoundrySdk\";"
+            .to_string(),
+    ];
     for action in actions {
         let module = sdk_action_module_specifier(&action.file)?;
         imports.push(format!(
@@ -2413,7 +3062,7 @@ fn render_sdk_client(actions: &[PlannedSdkAction<'_>]) -> Result<String> {
         .iter()
         .map(|action| {
             format!(
-                "    {}: create{}Action(transport)",
+                "    {}: create{}Action(transport, defaults)",
                 action.function_name, action.name
             )
         })
@@ -2427,7 +3076,7 @@ fn render_sdk_client(actions: &[PlannedSdkAction<'_>]) -> Result<String> {
     Ok(format!(
         "// Auto-generated Foundry SDK client. Do not edit.\n\n\
          {}\n\n\
-         export function createFoundryClient(transport: FoundrySdkTransport) {{\n\
+         export function createFoundryClient(transport: FoundrySdkTransport, defaults?: FoundryClientOptions) {{\n\
            return {{\n{}\
            }} as const;\n\
          }}\n\n\
@@ -2444,13 +3093,27 @@ pub fn export_all(dir: &Path) -> Result<()> {
 
 /// Export all registered TypeScript types and HTTP route metadata to a directory.
 pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Result<()> {
+    export_all_with_context(dir, routes, TypeScriptExportContext::default())
+}
+
+/// Export all registered TypeScript types plus HTTP, realtime, and config metadata.
+pub fn export_all_with_context(
+    dir: &Path,
+    routes: &[RouteManifestEntry],
+    context: TypeScriptExportContext,
+) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(Error::other)?;
 
     let ts_types: Vec<&TsType> = inventory::iter::<TsType>.into_iter().collect();
     let app_enums: Vec<&TsAppEnum> = inventory::iter::<TsAppEnum>.into_iter().collect();
     let ts_type_files = planned_ts_type_files(&ts_types)?;
     let validations = validation_schemas();
-    let contract = contract_manifest(routes, &validations)?;
+    let contract = contract_manifest(routes, &validations, context.realtime_channels.clone())?;
+    let schema_exports = contract
+        .schemas
+        .iter()
+        .map(|schema| (schema.name.clone(), schema.schema.clone()))
+        .collect::<BTreeMap<_, _>>();
     let route_helpers = planned_route_helpers(routes)?;
     let sdk_actions = planned_sdk_actions(&contract)?;
     let output_files =
@@ -2507,6 +3170,18 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
     write_generated_file(&dir.join(ERROR_RUNTIME_FILE), render_error_runtime())?;
     write_generated_file(&dir.join(SDK_RUNTIME_FILE), render_sdk_runtime())?;
     write_generated_file(
+        &dir.join(I18N_MANIFEST_FILE),
+        render_i18n_manifest(context.i18n.as_ref())?,
+    )?;
+    write_generated_file(
+        &dir.join(WEBSOCKET_MANIFEST_FILE),
+        render_websocket_manifest(&contract.realtime_channels, &exported_types)?,
+    )?;
+    write_generated_file(
+        &dir.join(DATATABLE_MANIFEST_FILE),
+        render_datatable_manifest(&context.datatable_ids)?,
+    )?;
+    write_generated_file(
         &dir.join(CONTRACT_MANIFEST_FILE),
         serde_json::to_string_pretty(&contract).map_err(Error::other)?,
     )?;
@@ -2517,7 +3192,7 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
     for helper in &route_helpers {
         write_generated_file(
             &dir.join(&helper.file),
-            render_route_helper(helper, &exported_types, &validations)?,
+            render_route_helper(helper, &schema_exports, &exported_types, &validations)?,
         )?;
     }
     if !sdk_actions.is_empty() {
@@ -2526,7 +3201,7 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
     for action in &sdk_actions {
         write_generated_file(
             &dir.join(&action.file),
-            render_sdk_action(action, &exported_types)?,
+            render_sdk_action(action, &schema_exports, &exported_types)?,
         )?;
     }
     write_generated_file(&dir.join(SDK_CLIENT_FILE), render_sdk_client(&sdk_actions)?)?;
@@ -2540,7 +3215,7 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
                 String::new()
             };
             barrel.push_str(&format!(
-                "export {{ type {name}, {name}Values, {name}Options, {name}Meta{groups_export} }} from \"./{name}\";\n"
+                "export {{ type {name}, {name}Keys, {name}Values, {name}Options, {name}Meta{groups_export} }} from \"./{name}\";\n"
             ));
         } else {
             let file = type_exports
@@ -2551,10 +3226,10 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
         }
     }
     barrel.push_str(
-        "export { RouteManifest, RouteIds, createRouteUrlBuilder, routeUrl, type RouteName, type RouteParams, type RouteParamValue, type RouteUrlOptions } from \"./RouteManifest\";\n",
+        "export { RouteManifest, RouteIds, createRouteUrlBuilder, routeUrl, type EmptyRouteParams, type RouteName, type RouteParams, type RouteParamValue, type RouteUrlOptions } from \"./RouteManifest\";\n",
     );
     barrel.push_str(
-        "export { FoundryEndpoint, FoundryValidationClientError, type FoundryContractValueKind, type FoundryFieldErrors, type FoundryHttpClient, type FoundryHttpHeaders, type FoundryHttpMethod, type FoundryHttpRequestConfig, type FoundryHttpResponse, type FoundrySubmitOptions, type FoundryValidationAttribute, type FoundryValidationField, type FoundryValidationMessage, type FoundryValidationRule, type FoundryValidationSchema } from \"./FoundryEndpoint\";\n",
+        "export { FoundryEndpoint, FoundryValidationClientError, setFoundryValidationTranslator, type FoundryContractValueKind, type FoundryFieldErrors, type FoundryHttpClient, type FoundryHttpHeaders, type FoundryHttpMethod, type FoundryHttpRequestConfig, type FoundryHttpResponse, type FoundrySubmitOptions, type FoundryValidationAttribute, type FoundryValidationField, type FoundryValidationMessage, type FoundryValidationRule, type FoundryValidationSchema, type JsonValue } from \"./FoundryEndpoint\";\n",
     );
     barrel.push_str(
         "export { FoundrySdkError, type FoundryErrorCode, type FoundryErrorResponse, type FoundryFieldError, type FoundryValidationErrors } from \"./FoundryErrors\";\n",
@@ -2562,8 +3237,11 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
     barrel
         .push_str("export { createFoundryClient, type FoundryClient } from \"./FoundryClient\";\n");
     barrel.push_str(
-        "export { sendFoundryAction, type FoundryActionDefinition, type FoundryActionOptions, type FoundrySdkBodyKind, type FoundrySdkHeaders, type FoundrySdkHttpMethod, type FoundrySdkRequestConfig, type FoundrySdkResponse, type FoundrySdkTransport } from \"./FoundrySdk\";\n",
+        "export { mergeFoundryActionOptions, sendFoundryAction, type FoundryActionDefinition, type FoundryActionOptions, type FoundryClientOptions, type FoundrySdkBodyKind, type FoundrySdkHeaders, type FoundrySdkHttpMethod, type FoundrySdkRequestConfig, type FoundrySdkResponse, type FoundrySdkTransport } from \"./FoundrySdk\";\n",
     );
+    barrel.push_str("export * from \"./I18nManifest\";\n");
+    barrel.push_str("export * from \"./WebSocketChannelManifest\";\n");
+    barrel.push_str("export * from \"./DatatableManifest\";\n");
     for helper in &route_helpers {
         let module = ts_module_specifier(&helper.file)?;
         barrel.push_str(&format!("export * from \"{module}\";\n"));
@@ -2615,6 +3293,9 @@ fn planned_output_files(
     files.insert(ERROR_RUNTIME_FILE.to_string());
     files.insert(SDK_RUNTIME_FILE.to_string());
     files.insert(SDK_CLIENT_FILE.to_string());
+    files.insert(I18N_MANIFEST_FILE.to_string());
+    files.insert(WEBSOCKET_MANIFEST_FILE.to_string());
+    files.insert(DATATABLE_MANIFEST_FILE.to_string());
     for helper in route_helpers {
         files.insert(helper.file.clone());
     }
@@ -2691,9 +3372,13 @@ fn collect_route_manifest(routes: &[RouteRegistrar]) -> Result<Vec<RouteManifest
 }
 
 /// CLI registrar for the `types:export` command.
-pub fn builtin_cli_registrar(routes: Vec<RouteRegistrar>) -> CommandRegistrar {
+pub fn builtin_cli_registrar(
+    routes: Vec<RouteRegistrar>,
+    websocket_routes: Vec<WebSocketRouteRegistrar>,
+) -> CommandRegistrar {
     Arc::new(move |registry| {
         let routes = routes.clone();
+        let websocket_routes = websocket_routes.clone();
         registry.command(
             TYPES_EXPORT_COMMAND,
             clap::Command::new("types:export")
@@ -2706,6 +3391,7 @@ pub fn builtin_cli_registrar(routes: Vec<RouteRegistrar>) -> CommandRegistrar {
                 ),
             move |invocation| {
                 let routes = routes.clone();
+                let websocket_routes = websocket_routes.clone();
                 async move {
                     let output = if let Some(dir) = invocation.matches().get_one::<String>("output")
                     {
@@ -2716,7 +3402,55 @@ pub fn builtin_cli_registrar(routes: Vec<RouteRegistrar>) -> CommandRegistrar {
                     };
 
                     let route_manifest = collect_route_manifest(&routes)?;
-                    export_all_with_routes(&output, &route_manifest)
+                    let ws_registrar = crate::websocket::build_registrar(&websocket_routes)?;
+                    let ws_registry =
+                        crate::websocket::WebSocketChannelRegistry::from_registrar(ws_registrar);
+                    let realtime_channels = ws_registry
+                        .descriptors()
+                        .iter()
+                        .map(ContractRealtimeChannel::from)
+                        .collect::<Vec<_>>();
+                    let i18n_config = invocation.app().config().i18n().unwrap_or_default();
+                    let locales = invocation
+                        .app()
+                        .i18n()
+                        .map(|manager| {
+                            manager
+                                .locale_list()
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|_| {
+                            vec![
+                                i18n_config.default_locale.clone(),
+                                i18n_config.fallback_locale.clone(),
+                            ]
+                        });
+                    let datatable_ids = invocation
+                        .app()
+                        .datatables()
+                        .map(|registry| {
+                            registry
+                                .ids()
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    export_all_with_context(
+                        &output,
+                        &route_manifest,
+                        TypeScriptExportContext {
+                            realtime_channels,
+                            i18n: Some(I18nTypeScriptManifest {
+                                default_locale: i18n_config.default_locale,
+                                fallback_locale: i18n_config.fallback_locale,
+                                locales,
+                            }),
+                            datatable_ids,
+                        },
+                    )
                 }
             },
         )?;
@@ -2732,6 +3466,7 @@ mod tests {
 
     use crate::app_enum::{EnumKey, EnumKeyKind, EnumMeta, EnumOption};
     use crate::http::{RouteManifestEntry, RouteManifestResponse};
+    use crate::openapi::ApiSchema;
     use crate::support::{Collection, GuardId, PermissionId, RouteId};
 
     use super::export_all;
@@ -2825,6 +3560,7 @@ mod tests {
             responses: vec![RouteManifestResponse {
                 status: 200,
                 schema: "ShowUserResponse",
+                schema_json: serde_json::json!({"type": "object"}),
             }],
         }
     }
@@ -2843,6 +3579,7 @@ mod tests {
             responses: vec![RouteManifestResponse {
                 status: 200,
                 schema: "MinimalLoginResponse",
+                schema_json: MinimalLoginResponse::schema(),
             }],
         }
     }
@@ -3007,6 +3744,10 @@ mod tests {
             "expected MinimalExportStatus.ts to export Values:\n{minimal_status}"
         );
         assert!(
+            minimal_status.contains("export const MinimalExportStatusKeys = {"),
+            "expected MinimalExportStatus.ts to export Keys:\n{minimal_status}"
+        );
+        assert!(
             minimal_status.contains(
                 "{ value: \"pending\", labelKey: \"enum.minimal_export_status.pending\" }"
             ),
@@ -3095,13 +3836,13 @@ mod tests {
         );
         assert!(
             index.contains(
-                "export { type MinimalExportStatus, MinimalExportStatusValues, MinimalExportStatusOptions, MinimalExportStatusMeta } from \"./MinimalExportStatus\";"
+                "export { type MinimalExportStatus, MinimalExportStatusKeys, MinimalExportStatusValues, MinimalExportStatusOptions, MinimalExportStatusMeta } from \"./MinimalExportStatus\";"
             ),
             "expected index.ts to re-export AppEnum metadata:\n{index}"
         );
         assert!(
             index.contains(
-                "export { type MinimalExportPermission, MinimalExportPermissionValues, MinimalExportPermissionOptions, MinimalExportPermissionMeta, MinimalExportPermissionGroups } from \"./MinimalExportPermission\";"
+                "export { type MinimalExportPermission, MinimalExportPermissionKeys, MinimalExportPermissionValues, MinimalExportPermissionOptions, MinimalExportPermissionMeta, MinimalExportPermissionGroups } from \"./MinimalExportPermission\";"
             ),
             "expected index.ts to re-export AppEnum groups only for grouped enums:\n{index}"
         );
@@ -3317,15 +4058,15 @@ mod tests {
         );
         assert!(
             sdk_action.contains(
-                "export type AdminUsersShowAction = (options?: FoundryActionOptions<AdminUsersShowSdkParams>) => Promise<AdminUsersShowSdkResponse>"
+                "export type AdminUsersShowAction = (request: AdminUsersShowSdkRequest, options?: FoundryActionOptions<AdminUsersShowSdkParams>) => Promise<AdminUsersShowSdkResponse>"
             ),
-            "expected bodyless SDK action to omit dropped request argument:\n{sdk_action}"
+            "expected GET SDK action with a request schema to accept query payload:\n{sdk_action}"
         );
         assert!(
             sdk_action.contains(
-                "sendFoundryAction<AdminUsersShowSdkRequest, AdminUsersShowSdkResponse, AdminUsersShowSdkParams>(transport, AdminUsersShowActionDefinition, undefined, options)"
+                "sendFoundryAction<AdminUsersShowSdkRequest, AdminUsersShowSdkResponse, AdminUsersShowSdkParams>(transport, AdminUsersShowActionDefinition, request, mergeFoundryActionOptions(defaults, options))"
             ),
-            "expected bodyless SDK action to pass undefined data:\n{sdk_action}"
+            "expected GET SDK action to pass query payload to runtime:\n{sdk_action}"
         );
     }
 
@@ -3434,7 +4175,7 @@ mod tests {
 
         let sdk_client = fs::read_to_string(dir.path().join("FoundryClient.ts")).unwrap();
         assert!(
-            sdk_client.contains("userPortalLogin: createUserPortalLoginAction(transport)"),
+            sdk_client.contains("userPortalLogin: createUserPortalLoginAction(transport, defaults)"),
             "expected SDK client business action:\n{sdk_client}"
         );
 

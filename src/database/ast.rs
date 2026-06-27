@@ -27,6 +27,40 @@ impl fmt::Display for Numeric {
     }
 }
 
+impl ts_rs::TS for Numeric {
+    type WithoutGenerics = Self;
+
+    fn name() -> String {
+        "string".to_string()
+    }
+
+    fn inline() -> String {
+        "string".to_string()
+    }
+
+    fn inline_flattened() -> String {
+        panic!("{} cannot be flattened", Self::name())
+    }
+
+    fn decl() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+
+    fn decl_concrete() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+}
+
+impl crate::openapi::ApiSchema for Numeric {
+    fn schema() -> serde_json::Value {
+        serde_json::json!({"type": "string", "format": "decimal"})
+    }
+
+    fn schema_name() -> &'static str {
+        "Numeric"
+    }
+}
+
 impl From<i64> for Numeric {
     fn from(value: i64) -> Self {
         Self(value.to_string())

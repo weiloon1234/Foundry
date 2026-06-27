@@ -117,7 +117,8 @@ pub use crate::logging::{
 pub use crate::metadata::{HasMetadata, ModelMeta};
 pub use crate::notifications::{
     BroadcastNotificationChannel, DatabaseNotificationChannel, EmailNotificationChannel,
-    Notifiable, Notification, NotificationChannel, NotificationChannelRegistry, NOTIFY_BROADCAST,
+    Notifiable, Notification, NotificationChannel, NotificationChannelRegistry,
+    NOTIFICATION_BROADCAST_CHANNEL, NOTIFICATION_BROADCAST_EVENT, NOTIFY_BROADCAST,
     NOTIFY_DATABASE, NOTIFY_EMAIL,
 };
 pub use crate::openapi::spec::{

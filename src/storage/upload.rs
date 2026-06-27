@@ -36,6 +36,40 @@ pub struct UploadedFile {
     pub temp_path: PathBuf,
 }
 
+impl ts_rs::TS for UploadedFile {
+    type WithoutGenerics = Self;
+
+    fn name() -> String {
+        "File".to_string()
+    }
+
+    fn inline() -> String {
+        "File".to_string()
+    }
+
+    fn inline_flattened() -> String {
+        panic!("{} cannot be flattened", Self::name())
+    }
+
+    fn decl() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+
+    fn decl_concrete() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+}
+
+impl crate::openapi::ApiSchema for UploadedFile {
+    fn schema() -> serde_json::Value {
+        serde_json::json!({"type": "string", "format": "binary"})
+    }
+
+    fn schema_name() -> &'static str {
+        "UploadedFile"
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UploadLimits {
     pub max_upload_size_bytes: u64,

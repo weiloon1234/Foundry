@@ -110,6 +110,49 @@ impl fmt::Display for DateTime {
     }
 }
 
+macro_rules! impl_string_contract_type {
+    ($type:ty, $schema_name:literal, $format:literal) => {
+        impl ts_rs::TS for $type {
+            type WithoutGenerics = Self;
+
+            fn name() -> String {
+                "string".to_string()
+            }
+
+            fn inline() -> String {
+                "string".to_string()
+            }
+
+            fn inline_flattened() -> String {
+                panic!("{} cannot be flattened", Self::name())
+            }
+
+            fn decl() -> String {
+                panic!("{} cannot be declared", Self::name())
+            }
+
+            fn decl_concrete() -> String {
+                panic!("{} cannot be declared", Self::name())
+            }
+        }
+
+        impl crate::openapi::ApiSchema for $type {
+            fn schema() -> serde_json::Value {
+                serde_json::json!({"type": "string", "format": $format})
+            }
+
+            fn schema_name() -> &'static str {
+                $schema_name
+            }
+        }
+    };
+}
+
+impl_string_contract_type!(DateTime, "DateTime", "date-time");
+impl_string_contract_type!(LocalDateTime, "LocalDateTime", "date-time");
+impl_string_contract_type!(Date, "Date", "date");
+impl_string_contract_type!(Time, "Time", "time");
+
 impl FromStr for DateTime {
     type Err = Error;
 

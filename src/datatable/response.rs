@@ -21,6 +21,61 @@ pub struct DatatableJsonResponse {
     pub sorts: Vec<DatatableSortInput>,
 }
 
+impl crate::openapi::ApiSchema for DatatableJsonResponse {
+    fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": true,
+                    },
+                },
+                "columns": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "label": {"type": "string"},
+                            "sortable": {"type": "boolean"},
+                            "filterable": {"type": "boolean"},
+                        },
+                        "required": ["name", "label", "sortable", "filterable"],
+                    },
+                },
+                "filters": {"type": "array", "items": {"type": "object"}},
+                "pagination": {
+                    "type": "object",
+                    "properties": {
+                        "page": {"type": "integer", "format": "uint64"},
+                        "per_page": {"type": "integer", "format": "uint64"},
+                        "total": {"type": "integer", "format": "uint64"},
+                        "total_pages": {"type": "integer", "format": "uint64"},
+                    },
+                    "required": ["page", "per_page", "total", "total_pages"],
+                },
+                "applied_filters": {"type": "array", "items": {"type": "object"}},
+                "sorts": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["rows", "columns", "filters", "pagination", "applied_filters", "sorts"],
+        })
+    }
+
+    fn schema_name() -> &'static str {
+        "DatatableJsonResponse"
+    }
+}
+
+inventory::submit! {
+    crate::openapi::ApiSchemaDefinition {
+        name: "DatatableJsonResponse",
+        schema_fn: <DatatableJsonResponse as crate::openapi::ApiSchema>::schema,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Column metadata (sent to frontend)
 // ---------------------------------------------------------------------------

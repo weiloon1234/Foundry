@@ -344,10 +344,20 @@ pub(crate) struct WebSocketChannelEventContract {
     pub payload: Option<SchemaRef>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct WebSocketChannelEventDescriptor {
     pub event: ChannelEventId,
-    pub payload: Option<&'static str>,
+    pub payload: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -640,7 +650,15 @@ pub(crate) struct RegisteredChannel {
 ///
 /// Emitted by the `/_foundry/ws/channels` dashboard endpoint and returned
 /// from [`AppContext::websocket_channels`](crate::foundation::AppContext::websocket_channels).
-#[derive(Debug, Clone, Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct WebSocketChannelDescriptor {
     pub id: ChannelId,
     pub presence: bool,
@@ -658,7 +676,7 @@ impl From<&RegisteredChannel> for WebSocketChannelDescriptor {
         let event_descriptor =
             |contract: &WebSocketChannelEventContract| WebSocketChannelEventDescriptor {
                 event: contract.event.clone(),
-                payload: contract.payload.as_ref().map(|schema| schema.name),
+                payload: contract.payload.as_ref().map(|schema| schema.name.to_string()),
             };
 
         Self {
@@ -898,12 +916,12 @@ mod tests {
         assert_eq!(descriptor.permissions, vec![PermissionId::new("chat:read")]);
         assert_eq!(descriptor.incoming.len(), 2);
         assert_eq!(descriptor.incoming[0].event, ChannelEventId::new("send"));
-        assert_eq!(descriptor.incoming[0].payload, Some("String"));
+        assert_eq!(descriptor.incoming[0].payload, Some("String".to_string()));
         assert_eq!(descriptor.incoming[1].event, ChannelEventId::new("typing"));
         assert_eq!(descriptor.incoming[1].payload, None);
         assert_eq!(descriptor.outgoing.len(), 2);
         assert_eq!(descriptor.outgoing[0].event, ChannelEventId::new("message"));
-        assert_eq!(descriptor.outgoing[0].payload, Some("String"));
+        assert_eq!(descriptor.outgoing[0].payload, Some("String".to_string()));
         assert_eq!(descriptor.outgoing[1].event, ChannelEventId::new("pong"));
         assert_eq!(descriptor.outgoing[1].payload, None);
 

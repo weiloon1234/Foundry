@@ -7,8 +7,8 @@ use crate::jobs::{Job, JobContext};
 use crate::support::{JobId, NotificationChannelId};
 
 use super::{
-    callback, store_database_notification, NotificationChannelRegistry, NOTIFY_BROADCAST,
-    NOTIFY_DATABASE, NOTIFY_EMAIL,
+    callback, store_database_notification, NotificationChannelRegistry, NOTIFICATION_BROADCAST_CHANNEL,
+    NOTIFICATION_BROADCAST_EVENT, NOTIFY_BROADCAST, NOTIFY_DATABASE, NOTIFY_EMAIL,
 };
 
 /// Job payload that carries pre-rendered notification data for async dispatch.
@@ -67,12 +67,14 @@ impl Job for SendNotificationJob {
             } else if *channel_id == NOTIFY_BROADCAST {
                 if let Some(ref payload) = self.broadcast_payload {
                     if let Ok(ws) = app.websocket() {
-                        let ch = crate::support::ChannelId::owned(format!(
-                            "notifications:{}",
-                            self.notifiable_id
-                        ));
-                        let event = crate::support::ChannelEventId::new("notification");
-                        let _ = ws.publish(ch, event, None::<&str>, payload.clone()).await;
+                        let _ = ws
+                            .publish(
+                                NOTIFICATION_BROADCAST_CHANNEL,
+                                NOTIFICATION_BROADCAST_EVENT,
+                                Some(self.notifiable_id.as_str()),
+                                payload.clone(),
+                            )
+                            .await;
                     }
                 }
             } else {
