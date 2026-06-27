@@ -80,6 +80,23 @@ same process only run one cold callback per key. Set
 `remember_distributed_lock = true` when multiple worker/server processes should
 coordinate cold-cache recomputation through Foundry's runtime backend.
 
+`types:export` emits `CacheManifest.ts` from the resolved cache and Redis
+configuration. The manifest includes the cache driver, error mode, prefix,
+TTL/key limits, remember-lock settings, Redis configured status, and resolved
+namespace, but never includes the Redis URL. Admin dashboards and dev tools can
+import `CacheManifest`, `CacheUsesRedis`, `CacheRedisNamespace`,
+`CacheDrivers`, `CacheErrorModes`, `isCacheDriver()`, `isCacheErrorMode()`,
+`cacheDriverOrNull()`, `cacheErrorModeOrNull()`, `cacheUsesRedis()`,
+`cacheUsesMemory()`, `cacheRedisConfigured()`, `cacheHasRedisNamespace()`,
+`cacheKeyPrefix()`, `cacheIsFailOpen()`, and `cacheRememberLockTiming()`
+instead of copying cache config into frontend code.
+Runtime manifest export keeps `key_max_length = 0` as the documented no-cap
+sentinel and keeps disabled distributed-lock timing values as configured. When
+distributed remember locks are enabled, the exported lock TTL and poll interval
+use the same positive clamp as the backend. Export rejects memory cache
+`max_entries = 0` and numeric values above JavaScript's safe integer range
+before frontend cache helpers are generated.
+
 ### Cache-Aside Pattern
 
 The most common pattern — avoid repeated expensive queries:

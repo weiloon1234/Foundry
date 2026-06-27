@@ -7,16 +7,21 @@ use axum::routing::get;
 use axum::Json;
 use serde::Serialize;
 
+use super::diagnostics::RuntimeSnapshot;
 use super::metrics;
+use super::probes::{LivenessReport, ReadinessReport};
+use crate::app_enum::FoundryAppEnum;
 use crate::auth::AccessScope;
 use crate::config::ObservabilityConfig;
 use crate::database::{DbValue, Expr, OrderBy, Query, Sql};
-use crate::foundation::{AppContext, Error, Result};
+use crate::foundation::{AppContext, Error, ErrorResponse, Result};
 use crate::http::{
     wrap_http_authorize_callback, HttpAuthorizeContext, HttpRegistrar, HttpRouteOptions,
 };
-use crate::openapi::spec::{generate_openapi_spec, DocumentedRoute};
+use crate::jobs::JobHistoryStatus;
+use crate::openapi::spec::{try_generate_openapi_spec_with_validation_rules, DocumentedRoute};
 use crate::support::{GuardId, PermissionId};
+use crate::validation::ValidationRuleDescriptor;
 
 #[derive(Default)]
 pub struct ObservabilityOptions {
@@ -112,97 +117,228 @@ impl ObservabilityOptions {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 struct JobsStatsResponse {
     stats: Vec<JobStatusCountResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 struct JobStatusCountResponse {
-    status: String,
+    status: JobHistoryStatus,
+    #[ts(type = "number")]
     count: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 struct JobsFailedResponse {
     failed_jobs: Vec<FailedJobResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS, foundry_macros::TS)]
 struct FailedJobResponse {
     job_id: String,
     queue: String,
-    status: String,
+    status: JobHistoryStatus,
+    #[ts(type = "number | null")]
     attempt: Option<i64>,
     error: Option<String>,
     started_at: Option<String>,
     completed_at: Option<String>,
+    #[ts(type = "number | null")]
     duration_ms: Option<i64>,
     created_at: Option<String>,
     request_id: Option<String>,
     trace_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+impl crate::openapi::ApiSchema for FailedJobResponse {
+    fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string" },
+                "queue": { "type": "string" },
+                "status": <JobHistoryStatus as crate::openapi::ApiSchema>::schema(),
+                "attempt": { "type": "integer", "format": "int64", "nullable": true },
+                "error": { "type": "string", "nullable": true },
+                "started_at": { "type": "string", "nullable": true },
+                "completed_at": { "type": "string", "nullable": true },
+                "duration_ms": { "type": "integer", "format": "int64", "nullable": true },
+                "created_at": { "type": "string", "nullable": true },
+                "request_id": { "type": "string", "nullable": true },
+                "trace_id": { "type": "string", "nullable": true },
+            },
+            "required": [
+                "job_id",
+                "queue",
+                "status",
+                "attempt",
+                "error",
+                "started_at",
+                "completed_at",
+                "duration_ms",
+                "created_at",
+                "request_id",
+                "trace_id",
+            ],
+        })
+    }
+
+    fn schema_name() -> &'static str {
+        "FailedJobResponse"
+    }
+}
+
+#[derive(Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 struct WebSocketChannelsResponse {
     channels: Vec<crate::websocket::WebSocketChannelDescriptor>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 struct WebSocketPresenceResponse {
     channel: String,
+    #[ts(type = "number")]
     count: usize,
     members: Vec<WebSocketPresenceMemberResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 struct WebSocketPresenceMemberResponse {
     actor_id: String,
+    #[ts(type = "number")]
     joined_at: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 struct WebSocketHistoryResponse {
     channel: String,
     messages: Vec<WebSocketHistoryMessageResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, foundry_macros::TS)]
 struct WebSocketHistoryMessageResponse {
     channel: String,
     event: String,
     room: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     payload: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     payload_size_bytes: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+impl ts_rs::TS for WebSocketHistoryMessageResponse {
+    type WithoutGenerics = Self;
+
+    fn name() -> String {
+        "WebSocketHistoryMessageResponse".to_string()
+    }
+
+    fn decl() -> String {
+        concat!(
+            "type WebSocketHistoryMessageResponse = { ",
+            "channel: string, ",
+            "event: string, ",
+            "room: string | null, ",
+            "payload?: JsonValue, ",
+            "payload_size_bytes?: number, ",
+            "};",
+        )
+        .to_string()
+    }
+
+    fn decl_concrete() -> String {
+        Self::decl()
+    }
+
+    fn inline() -> String {
+        concat!(
+            "{ ",
+            "channel: string, ",
+            "event: string, ",
+            "room: string | null, ",
+            "payload?: JsonValue, ",
+            "payload_size_bytes?: number, ",
+            "}",
+        )
+        .to_string()
+    }
+
+    fn inline_flattened() -> String {
+        Self::inline()
+    }
+
+    fn output_path() -> Option<&'static std::path::Path> {
+        Some(std::path::Path::new("WebSocketHistoryMessageResponse.ts"))
+    }
+
+    fn visit_dependencies(v: &mut impl ts_rs::TypeVisitor)
+    where
+        Self: 'static,
+    {
+        v.visit::<serde_json::Value>();
+    }
+}
+
+impl crate::openapi::ApiSchema for WebSocketHistoryMessageResponse {
+    fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "channel": { "type": "string" },
+                "event": { "type": "string" },
+                "room": { "type": "string", "nullable": true },
+                "payload": {},
+                "payload_size_bytes": { "type": "integer" },
+            },
+            "required": ["channel", "event", "room"],
+        })
+    }
+
+    fn schema_name() -> &'static str {
+        "WebSocketHistoryMessageResponse"
+    }
+}
+
+#[derive(Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 struct WebSocketStatsResponse {
     global: WebSocketGlobalStatsResponse,
     channels: Vec<WebSocketChannelStatsResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 struct WebSocketGlobalStatsResponse {
+    #[ts(type = "number")]
     active_connections: u64,
+    #[ts(type = "number")]
     active_subscriptions: u64,
+    #[ts(type = "number")]
     subscriptions_total: u64,
+    #[ts(type = "number")]
     unsubscribes_total: u64,
+    #[ts(type = "number")]
     inbound_messages_total: u64,
+    #[ts(type = "number")]
     outbound_messages_total: u64,
+    #[ts(type = "number")]
     opened_total: u64,
+    #[ts(type = "number")]
     closed_total: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 struct WebSocketChannelStatsResponse {
     id: String,
+    #[ts(type = "number")]
     subscriptions_total: u64,
+    #[ts(type = "number")]
     unsubscribes_total: u64,
+    #[ts(type = "number")]
     active_subscriptions: u64,
+    #[ts(type = "number")]
     inbound_messages_total: u64,
+    #[ts(type = "number")]
     outbound_messages_total: u64,
 }
 
@@ -215,17 +351,29 @@ pub(crate) fn register_observability_routes(
     registrar.route_with_options(
         &join_route(&config.base_path, "health"),
         get(observability_liveness),
-        route_options.clone(),
+        observability_json_route::<LivenessReport>(
+            &route_options,
+            "foundryHealth",
+            "Get Foundry liveness",
+        ),
     );
     registrar.route_with_options(
         &join_route(&config.base_path, "ready"),
         get(observability_readiness),
-        route_options.clone(),
+        observability_json_route::<ReadinessReport>(
+            &route_options,
+            "foundryReadiness",
+            "Get Foundry readiness",
+        ),
     );
     registrar.route_with_options(
         &join_route(&config.base_path, "runtime"),
         get(observability_runtime),
-        route_options.clone(),
+        observability_json_route::<RuntimeSnapshot>(
+            &route_options,
+            "foundryRuntime",
+            "Get Foundry runtime diagnostics",
+        ),
     );
     registrar.route_with_options(
         &join_route(&config.base_path, "http/stats"),
@@ -240,39 +388,81 @@ pub(crate) fn register_observability_routes(
     registrar.route_with_options(
         &join_route(&config.base_path, "jobs/stats"),
         get(jobs_stats),
-        route_options.clone(),
+        observability_json_route::<JobsStatsResponse>(
+            &route_options,
+            "foundryJobsStats",
+            "Get Foundry job status counts",
+        ),
     );
     registrar.route_with_options(
         &join_route(&config.base_path, "jobs/failed"),
         get(jobs_failed),
-        route_options.clone(),
+        observability_json_route::<JobsFailedResponse>(
+            &route_options,
+            "foundryJobsFailed",
+            "List recent failed or retried jobs",
+        ),
     );
     registrar.route_with_options(
         &join_route(&config.base_path, "sql"),
         get(slow_queries),
-        route_options.clone(),
+        observability_json_route::<crate::database::SqlObservabilitySnapshot>(
+            &route_options,
+            "foundrySqlObservability",
+            "Get SQL observability snapshot",
+        ),
     );
     registrar.route_with_options(
         &join_route(&config.base_path, "ws/presence/{channel}"),
         get(ws_presence),
-        route_options.clone(),
+        observability_json_route::<WebSocketPresenceResponse>(
+            &route_options,
+            "foundryWebSocketPresence",
+            "Get WebSocket presence members",
+        )
+        .response::<ErrorResponse>(404),
     );
     registrar.route_with_options(
         &join_route(&config.base_path, "ws/channels"),
         get(ws_channels),
-        route_options.clone(),
+        observability_json_route::<WebSocketChannelsResponse>(
+            &route_options,
+            "foundryWebSocketChannels",
+            "List registered WebSocket channels",
+        ),
     );
     registrar.route_with_options(
         &join_route(&config.base_path, "ws/history/{channel}"),
         get(ws_history),
-        route_options.clone(),
+        observability_json_route::<WebSocketHistoryResponse>(
+            &route_options,
+            "foundryWebSocketHistory",
+            "Get WebSocket channel history",
+        )
+        .response::<ErrorResponse>(404),
     );
     registrar.route_with_options(
         &join_route(&config.base_path, "ws/stats"),
         get(ws_stats),
-        route_options,
+        observability_json_route::<WebSocketStatsResponse>(
+            &route_options,
+            "foundryWebSocketStats",
+            "Get WebSocket runtime stats",
+        ),
     );
     Ok(())
+}
+
+fn observability_json_route<T: crate::openapi::ApiSchema>(
+    base: &HttpRouteOptions,
+    operation_id: &str,
+    summary: &str,
+) -> HttpRouteOptions {
+    base.clone()
+        .tag("Observability")
+        .operation_id(operation_id)
+        .summary(summary)
+        .response::<T>(200)
 }
 
 async fn observability_liveness(State(app): State<AppContext>) -> Response {
@@ -349,9 +539,12 @@ async fn jobs_stats(State(app): State<AppContext>) -> Response {
         Ok(rows) => {
             let stats = rows
                 .iter()
-                .map(|row| JobStatusCountResponse {
-                    status: db_string(row.get("status")).unwrap_or_else(|| "unknown".into()),
-                    count: db_i64(row.get("count")).unwrap_or(0),
+                .filter_map(|row| {
+                    let status = db_job_history_status(row.get("status"))?;
+                    Some(JobStatusCountResponse {
+                        status,
+                        count: db_i64(row.get("count")).unwrap_or(0),
+                    })
                 })
                 .collect();
             (StatusCode::OK, Json(JobsStatsResponse { stats })).into_response()
@@ -403,18 +596,21 @@ async fn jobs_failed(State(app): State<AppContext>) -> Response {
         Ok(rows) => {
             let failed_jobs = rows
                 .iter()
-                .map(|row| FailedJobResponse {
-                    job_id: db_string(row.get("job_id")).unwrap_or_else(|| "unknown".into()),
-                    queue: db_string(row.get("queue")).unwrap_or_else(|| "unknown".into()),
-                    status: db_string(row.get("status")).unwrap_or_else(|| "unknown".into()),
-                    attempt: db_i64(row.get("attempt")),
-                    error: db_string(row.get("error")),
-                    started_at: db_string(row.get("started_at")),
-                    completed_at: db_string(row.get("completed_at")),
-                    duration_ms: db_i64(row.get("duration_ms")),
-                    created_at: db_string(row.get("created_at")),
-                    request_id: db_string(row.get("request_id")),
-                    trace_id: db_string(row.get("trace_id")),
+                .filter_map(|row| {
+                    let status = db_job_history_status(row.get("status"))?;
+                    Some(FailedJobResponse {
+                        job_id: db_string(row.get("job_id")).unwrap_or_else(|| "unknown".into()),
+                        queue: db_string(row.get("queue")).unwrap_or_else(|| "unknown".into()),
+                        status,
+                        attempt: db_i64(row.get("attempt")),
+                        error: db_string(row.get("error")),
+                        started_at: db_string(row.get("started_at")),
+                        completed_at: db_string(row.get("completed_at")),
+                        duration_ms: db_i64(row.get("duration_ms")),
+                        created_at: db_string(row.get("created_at")),
+                        request_id: db_string(row.get("request_id")),
+                        trace_id: db_string(row.get("trace_id")),
+                    })
                 })
                 .collect();
             (StatusCode::OK, Json(JobsFailedResponse { failed_jobs })).into_response()
@@ -460,19 +656,11 @@ async fn ws_presence(
     let descriptor = match registry.find(&channel) {
         Some(d) => d,
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "channel not registered" })),
-            )
-                .into_response();
+            return error_response(StatusCode::NOT_FOUND, "channel not registered");
         }
     };
     if !descriptor.presence {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "presence not enabled for channel" })),
-        )
-            .into_response();
+        return error_response(StatusCode::NOT_FOUND, "presence not enabled for channel");
     }
 
     let backend = match crate::support::runtime::RuntimeBackend::from_config(app.config()) {
@@ -530,14 +718,20 @@ fn db_i64(value: Option<&DbValue>) -> Option<i64> {
     }
 }
 
+fn db_job_history_status(value: Option<&DbValue>) -> Option<JobHistoryStatus> {
+    let status = db_string(value)?;
+    JobHistoryStatus::parse_key(&status)
+}
+
 fn internal_error_response(error: Error) -> Response {
     let error_text = error.to_string();
     let chain = error.source_chain();
     let mut response = (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({
-            "message": Error::internal_server_error_message(),
-        })),
+        Json(ErrorResponse::new(
+            Error::internal_server_error_message(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
     )
         .into_response();
     crate::logging::mark_handler_error_response(
@@ -549,14 +743,30 @@ fn internal_error_response(error: Error) -> Response {
     response
 }
 
+fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(ErrorResponse::new(message, status))).into_response()
+}
+
 /// Cached OpenAPI spec shared across requests.
 static OPENAPI_SPEC: OnceLock<serde_json::Value> = OnceLock::new();
 
 /// Store the OpenAPI spec for serving. Call this at bootstrap with
 /// the collected documented routes.
-pub(crate) fn set_openapi_spec(title: &str, version: &str, routes: &[DocumentedRoute]) {
-    let spec = generate_openapi_spec(title, version, routes);
+pub(crate) fn set_openapi_spec(
+    title: &str,
+    version: &str,
+    routes: &[DocumentedRoute],
+    validation_rules: &[ValidationRuleDescriptor],
+) -> Result<()> {
+    let spec = try_generate_openapi_spec_with_validation_rules(
+        title,
+        version,
+        routes,
+        validation_rules,
+        true,
+    )?;
     let _ = OPENAPI_SPEC.set(spec);
+    Ok(())
 }
 
 pub(crate) fn register_openapi_route(
@@ -580,11 +790,7 @@ async fn openapi_spec_handler() -> Response {
             Json(spec.clone()),
         )
             .into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"message": "OpenAPI spec not available"})),
-        )
-            .into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "OpenAPI spec not available"),
     }
 }
 
@@ -603,11 +809,7 @@ async fn ws_history(
         Err(error) => return internal_error_response(error),
     };
     if registry.find(&channel).is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "channel not registered" })),
-        )
-            .into_response();
+        return error_response(StatusCode::NOT_FOUND, "channel not registered");
     }
 
     let websocket_config = match app.config().websocket() {
@@ -707,12 +909,21 @@ async fn ws_stats(State(app): State<AppContext>) -> Response {
         .into_response()
 }
 
-fn join_route(base_path: &str, suffix: &str) -> String {
+pub(crate) fn normalized_observability_base_path(base_path: &str) -> String {
     let trimmed = base_path.trim_end_matches('/');
-    if trimmed.is_empty() || trimmed == "/" {
+    match trimmed {
+        "" | "/" => "/".to_string(),
+        value if value.starts_with('/') => value.to_string(),
+        value => format!("/{value}"),
+    }
+}
+
+fn join_route(base_path: &str, suffix: &str) -> String {
+    let normalized = normalized_observability_base_path(base_path);
+    if normalized == "/" {
         format!("/{suffix}")
     } else {
-        format!("{trimmed}/{suffix}")
+        format!("{normalized}/{suffix}")
     }
 }
 
@@ -736,5 +947,232 @@ mod tests {
         assert_eq!(payload["message"], Error::internal_server_error_message());
         assert!(!payload["message"].as_str().unwrap().contains("secret"));
         assert!(!payload["message"].as_str().unwrap().contains("postgres://"));
+    }
+
+    #[test]
+    fn observability_route_join_normalizes_configured_base_path() {
+        assert_eq!(join_route("/_foundry/", "health"), "/_foundry/health");
+        assert_eq!(join_route("_ops", "runtime"), "/_ops/runtime");
+        assert_eq!(join_route("/", "metrics"), "/metrics");
+        assert_eq!(join_route("", "ready"), "/ready");
+    }
+
+    #[test]
+    fn observability_json_routes_are_documented_for_openapi() {
+        let mut registrar = HttpRegistrar::new();
+        register_observability_routes(
+            &mut registrar,
+            &ObservabilityConfig::default(),
+            &ObservabilityOptions::new(),
+        )
+        .unwrap();
+
+        let docs = registrar.collect_documented_routes();
+        let spec = crate::openapi::spec::generate_openapi_spec("Foundry", "1.0.0", &docs);
+
+        let health = &spec["paths"]["/_foundry/health"]["get"];
+        assert_eq!(health["operationId"], serde_json::json!("foundryHealth"));
+        assert_eq!(health["tags"], serde_json::json!(["Observability"]));
+        assert_eq!(
+            health["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            serde_json::json!("#/components/schemas/LivenessReport")
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["LivenessReport"]["properties"]["state"]["enum"],
+            serde_json::json!(["healthy", "unhealthy"])
+        );
+
+        let readiness = &spec["paths"]["/_foundry/ready"]["get"];
+        assert_eq!(
+            readiness["operationId"],
+            serde_json::json!("foundryReadiness")
+        );
+        assert_eq!(
+            readiness["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            serde_json::json!("#/components/schemas/ReadinessReport")
+        );
+        let probe =
+            &spec["components"]["schemas"]["ReadinessReport"]["properties"]["probes"]["items"];
+        assert_eq!(
+            probe["properties"]["id"],
+            serde_json::json!({ "type": "string" })
+        );
+        assert_eq!(
+            probe["properties"]["state"]["enum"],
+            serde_json::json!(["healthy", "unhealthy"])
+        );
+        assert!(probe["required"].as_array().is_none_or(|required| !required
+            .iter()
+            .any(|field| field.as_str() == Some("message"))));
+
+        let runtime = &spec["paths"]["/_foundry/runtime"]["get"];
+        assert_eq!(runtime["operationId"], serde_json::json!("foundryRuntime"));
+        assert_eq!(
+            runtime["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            serde_json::json!("#/components/schemas/RuntimeSnapshot")
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["RuntimeSnapshot"]["properties"]["backend"]["enum"],
+            serde_json::json!(["redis", "memory"])
+        );
+
+        let sql = &spec["paths"]["/_foundry/sql"]["get"];
+        assert_eq!(
+            sql["operationId"],
+            serde_json::json!("foundrySqlObservability")
+        );
+        assert_eq!(sql["tags"], serde_json::json!(["Observability"]));
+        assert_eq!(
+            sql["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            serde_json::json!("#/components/schemas/SqlObservabilitySnapshot")
+        );
+        let sql_snapshot = &spec["components"]["schemas"]["SqlObservabilitySnapshot"];
+        let top_slowest_item = &sql_snapshot["properties"]["top_slowest"]["items"];
+        assert_eq!(
+            top_slowest_item["properties"]["request_id"],
+            serde_json::json!({ "type": "string", "nullable": true })
+        );
+        assert!(top_slowest_item["required"]
+            .as_array()
+            .is_some_and(|required| required
+                .iter()
+                .any(|field| field.as_str() == Some("duration_ms"))));
+        let n_plus_one_item = &sql_snapshot["properties"]["n_plus_one_suspects"]["items"];
+        assert_eq!(
+            n_plus_one_item["properties"]["labels"]["x-foundry-item-schema"],
+            serde_json::json!("String")
+        );
+        assert_eq!(
+            sql_snapshot["properties"]["stats"]["properties"]["max_duration_ms"],
+            serde_json::json!({ "type": "integer", "nullable": true })
+        );
+
+        let jobs_stats = &spec["paths"]["/_foundry/jobs/stats"]["get"];
+        assert_eq!(
+            jobs_stats["operationId"],
+            serde_json::json!("foundryJobsStats")
+        );
+        assert_eq!(
+            jobs_stats["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            serde_json::json!("#/components/schemas/JobsStatsResponse")
+        );
+        let job_status_count =
+            &spec["components"]["schemas"]["JobsStatsResponse"]["properties"]["stats"]["items"];
+        assert_eq!(
+            job_status_count["properties"]["status"]["enum"],
+            serde_json::json!(["succeeded", "retried", "dead_lettered"])
+        );
+        assert_eq!(
+            job_status_count["properties"]["count"],
+            serde_json::json!({ "type": "integer", "format": "int64" })
+        );
+
+        let jobs_failed = &spec["paths"]["/_foundry/jobs/failed"]["get"];
+        assert_eq!(
+            jobs_failed["operationId"],
+            serde_json::json!("foundryJobsFailed")
+        );
+        assert_eq!(
+            jobs_failed["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            serde_json::json!("#/components/schemas/JobsFailedResponse")
+        );
+        let failed_job = &spec["components"]["schemas"]["JobsFailedResponse"]["properties"]
+            ["failed_jobs"]["items"];
+        assert_eq!(
+            failed_job["properties"]["status"]["enum"],
+            serde_json::json!(["succeeded", "retried", "dead_lettered"])
+        );
+        assert_eq!(
+            failed_job["properties"]["attempt"],
+            serde_json::json!({ "type": "integer", "format": "int64", "nullable": true })
+        );
+        assert_eq!(
+            failed_job["properties"]["request_id"],
+            serde_json::json!({ "type": "string", "nullable": true })
+        );
+        assert!(failed_job["required"]
+            .as_array()
+            .is_some_and(|required| required
+                .iter()
+                .any(|field| field.as_str() == Some("request_id"))));
+
+        let channels = &spec["paths"]["/_foundry/ws/channels"]["get"];
+        assert_eq!(
+            channels["operationId"],
+            serde_json::json!("foundryWebSocketChannels")
+        );
+        assert_eq!(channels["tags"], serde_json::json!(["Observability"]));
+        assert_eq!(
+            channels["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            serde_json::json!("#/components/schemas/WebSocketChannelsResponse")
+        );
+
+        let channel_descriptor = &spec["components"]["schemas"]["WebSocketChannelsResponse"]
+            ["properties"]["channels"]["items"];
+        assert_eq!(
+            channel_descriptor["properties"]["guard"],
+            serde_json::json!({ "type": "string", "nullable": true })
+        );
+        assert!(channel_descriptor["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|field| field.as_str() == Some("guard"))));
+
+        let presence = &spec["paths"]["/_foundry/ws/presence/{channel}"]["get"];
+        assert_eq!(
+            presence["operationId"],
+            serde_json::json!("foundryWebSocketPresence")
+        );
+        assert!(presence["parameters"]
+            .as_array()
+            .is_some_and(|parameters| parameters.iter().any(|parameter| parameter
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                == Some("channel"))));
+        assert_eq!(
+            presence["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            serde_json::json!("#/components/schemas/WebSocketPresenceResponse")
+        );
+        assert_eq!(
+            presence["responses"]["404"]["content"]["application/json"]["schema"]["$ref"],
+            serde_json::json!("#/components/schemas/ErrorResponse")
+        );
+
+        let history = &spec["paths"]["/_foundry/ws/history/{channel}"]["get"];
+        assert_eq!(
+            history["operationId"],
+            serde_json::json!("foundryWebSocketHistory")
+        );
+        assert_eq!(
+            history["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            serde_json::json!("#/components/schemas/WebSocketHistoryResponse")
+        );
+        assert_eq!(
+            history["responses"]["404"]["content"]["application/json"]["schema"]["$ref"],
+            serde_json::json!("#/components/schemas/ErrorResponse")
+        );
+        let history_message = &spec["components"]["schemas"]["WebSocketHistoryResponse"]
+            ["properties"]["messages"]["items"];
+        assert_eq!(
+            history_message["properties"]["room"],
+            serde_json::json!({ "type": "string", "nullable": true })
+        );
+        assert!(history_message["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|field| field.as_str() == Some("room"))));
+        assert!(history_message["required"]
+            .as_array()
+            .is_none_or(|required| !required
+                .iter()
+                .any(|field| field.as_str() == Some("payload"))));
+
+        let stats = &spec["paths"]["/_foundry/ws/stats"]["get"];
+        assert_eq!(
+            stats["operationId"],
+            serde_json::json!("foundryWebSocketStats")
+        );
+        assert_eq!(
+            stats["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            serde_json::json!("#/components/schemas/WebSocketStatsResponse")
+        );
     }
 }

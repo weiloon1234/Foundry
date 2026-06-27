@@ -39,6 +39,7 @@ struct PanicReport
 struct ProbeResult
   fn healthy<I>(id: I) -> Self
   fn unhealthy<I>(id: I, message: impl Into<String>) -> Self
+struct ReadinessProbeDescriptor
 struct ReadinessReport
 struct RequestId
   fn new(value: impl Into<String>) -> Self
@@ -49,6 +50,7 @@ struct RuntimeDiagnostics
   fn bootstrap_complete(&self) -> bool
   fn liveness(&self) -> LivenessReport
   fn snapshot(&self) -> RuntimeSnapshot
+  fn readiness_descriptors(&self) -> Vec<ReadinessProbeDescriptor>
   async fn run_readiness_checks( &self, app: &AppContext, ) -> Result<ReadinessReport>
   fn record_http_response(&self, status: StatusCode)
   fn record_http_response_with_duration( &self, status: StatusCode, duration_ms: u64, )
@@ -86,4 +88,5 @@ fn init(config: &ConfigRepository) -> Result<()>
 - `ObservabilityConfig.enabled` controls `/_foundry/*` route registration; `capture_enabled` controls passive runtime capture while preserving route availability.
 - Runtime counters, HTTP samples, SQL slow queries, N+1 suspects, and WebSocket channel counters are bounded process memory and reset on restart.
 - `/_foundry/sql` returns slow-query stats, top-slowest ranking, and potential HTTP N+1 suspects while preserving the existing `slow_queries` key; SQL literals and comments are redacted by default.
-
+- `types:export` emits `LoggingManifest.ts` with the browser-safe log level, output format, log directory, retention days, and helpers such as `loggingUsesJson()` / `loggingRetentionDisabled()`.
+- `types:export` emits `ObservabilityManifest.ts` with the browser-safe observability base path, enable/capture flags, retention settings, tracing flag, service name, and WebSocket payload visibility; it does not export the OTLP endpoint.

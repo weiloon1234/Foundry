@@ -1,0 +1,5 @@
+error: validation attribute references unknown field `emali`; add a field-level validation rule, target an after-hook contract field, or remove the custom attribute
+ --> tests/ui/derive/fail_validate_unknown_struct_attribute_field.rs:2:23
+  |
+2 | #[validate(attributes(emali = "email address"))]
+  |                       ^^^^^

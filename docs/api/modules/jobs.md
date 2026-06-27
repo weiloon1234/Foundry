@@ -56,5 +56,5 @@ fn spawn_worker(app: AppContext) -> Result<JoinHandle<()>>
 - Shutdown-aborted jobs are left unacked so lease expiry and the existing requeue flow make them runnable again.
 - Job handler panics are handled as normal job failures and use the existing retry/dead-letter flow.
 - `job_history` is pruned by workers with a distributed lock; consumer apps do not need to register a cleanup scheduler.
+- `types:export` mirrors frontend-safe `JobsConfig` fields into `JobRuntimeManifest` for admin/tooling clients while omitting worker polling, lease, requeue, shutdown, and prune scheduling internals.
 - `spawn_worker(app)` is managed by the app lifecycle and remains capped by `app.background_shutdown_timeout_ms`.
-

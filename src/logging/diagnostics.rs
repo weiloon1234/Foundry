@@ -42,7 +42,17 @@ impl Default for RuntimeDiagnosticsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct RuntimeSnapshot {
     pub backend: RuntimeBackendKind,
     pub bootstrap_complete: bool,
@@ -53,41 +63,106 @@ pub struct RuntimeSnapshot {
     pub jobs: JobRuntimeSnapshot,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct HttpRuntimeSnapshot {
+    #[ts(type = "number")]
     pub requests_total: u64,
+    #[ts(type = "number")]
     pub informational_total: u64,
+    #[ts(type = "number")]
     pub success_total: u64,
+    #[ts(type = "number")]
     pub redirection_total: u64,
+    #[ts(type = "number")]
     pub client_error_total: u64,
+    #[ts(type = "number")]
     pub server_error_total: u64,
     pub edge_rejections: HttpEdgeRejectionSnapshot,
     pub duration_ms: HttpDurationHistogramSnapshot,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct HttpEdgeRejectionSnapshot {
+    #[ts(type = "number")]
     pub rate_limited_total: u64,
+    #[ts(type = "number")]
     pub payload_too_large_total: u64,
+    #[ts(type = "number")]
     pub timeout_total: u64,
+    #[ts(type = "number")]
     pub cors_rejected_total: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct HttpDurationHistogramSnapshot {
+    #[ts(type = "number")]
     pub count: u64,
+    #[ts(type = "number")]
     pub sum_ms: u64,
     pub buckets: Vec<HttpDurationBucketSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct HttpDurationBucketSnapshot {
+    #[ts(type = "number")]
     pub le_ms: u64,
+    #[ts(type = "number")]
     pub cumulative_count: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct HttpObservabilitySnapshot {
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
+pub struct HttpObservabilitySnapshot {
     pub stats: HttpObservabilityStats,
     pub top_slowest_routes: Vec<HttpRouteRankingSnapshot>,
     pub top_error_routes: Vec<HttpRouteRankingSnapshot>,
@@ -95,39 +170,88 @@ pub(crate) struct HttpObservabilitySnapshot {
     pub recent_error_requests: Vec<HttpRequestSampleSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct HttpObservabilityStats {
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
+pub struct HttpObservabilityStats {
+    #[ts(type = "number")]
     pub requests_total: u64,
+    #[ts(type = "number")]
     pub retained_request_count: usize,
+    #[ts(type = "number")]
     pub retention_capacity: usize,
+    #[ts(type = "number")]
     pub slow_request_threshold_ms: u64,
+    #[ts(type = "number")]
     pub route_count: usize,
+    #[ts(type = "number")]
     pub slow_request_count: usize,
+    #[ts(type = "number")]
     pub error_request_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct HttpRouteRankingSnapshot {
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
+pub struct HttpRouteRankingSnapshot {
     pub method: String,
     pub path: String,
+    #[ts(type = "number")]
     pub requests_total: u64,
+    #[ts(type = "number")]
     pub informational_total: u64,
+    #[ts(type = "number")]
     pub success_total: u64,
+    #[ts(type = "number")]
     pub redirection_total: u64,
+    #[ts(type = "number")]
     pub client_error_total: u64,
+    #[ts(type = "number")]
     pub server_error_total: u64,
+    #[ts(type = "number")]
     pub avg_duration_ms: u64,
+    #[ts(type = "number")]
     pub max_duration_ms: u64,
+    #[ts(type = "number")]
     pub p95_duration_ms: u64,
+    #[ts(type = "number")]
     pub p99_duration_ms: u64,
     pub latest_recorded_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct HttpRequestSampleSnapshot {
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
+pub struct HttpRequestSampleSnapshot {
     pub method: String,
     pub path: String,
+    #[ts(type = "number")]
     pub status: u16,
+    #[ts(type = "number")]
     pub duration_ms: u64,
     pub request_id: Option<String>,
     pub trace_id: Option<String>,
@@ -144,54 +268,132 @@ pub(crate) struct HttpRequestRecord {
     pub trace_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct AuthRuntimeSnapshot {
+    #[ts(type = "number")]
     pub success_total: u64,
+    #[ts(type = "number")]
     pub unauthorized_total: u64,
+    #[ts(type = "number")]
     pub forbidden_total: u64,
+    #[ts(type = "number")]
     pub error_total: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct WebSocketRuntimeSnapshot {
+    #[ts(type = "number")]
     pub opened_total: u64,
+    #[ts(type = "number")]
     pub closed_total: u64,
+    #[ts(type = "number")]
     pub active_connections: u64,
+    #[ts(type = "number")]
     pub subscriptions_total: u64,
+    #[ts(type = "number")]
     pub unsubscribes_total: u64,
+    #[ts(type = "number")]
     pub active_subscriptions: u64,
+    #[ts(type = "number")]
     pub inbound_messages_total: u64,
+    #[ts(type = "number")]
     pub outbound_messages_total: u64,
     pub channels: Vec<WebSocketChannelSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct WebSocketChannelSnapshot {
     pub id: ChannelId,
+    #[ts(type = "number")]
     pub subscriptions_total: u64,
+    #[ts(type = "number")]
     pub unsubscribes_total: u64,
+    #[ts(type = "number")]
     pub active_subscriptions: u64,
+    #[ts(type = "number")]
     pub inbound_messages_total: u64,
+    #[ts(type = "number")]
     pub outbound_messages_total: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct SchedulerRuntimeSnapshot {
+    #[ts(type = "number")]
     pub ticks_total: u64,
+    #[ts(type = "number")]
     pub executed_schedules_total: u64,
+    #[ts(type = "number")]
     pub leadership_acquired_total: u64,
+    #[ts(type = "number")]
     pub leadership_lost_total: u64,
     pub leader_active: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct JobRuntimeSnapshot {
+    #[ts(type = "number")]
     pub enqueued_total: u64,
+    #[ts(type = "number")]
     pub leased_total: u64,
+    #[ts(type = "number")]
     pub started_total: u64,
+    #[ts(type = "number")]
     pub succeeded_total: u64,
+    #[ts(type = "number")]
     pub retried_total: u64,
+    #[ts(type = "number")]
     pub expired_requeues_total: u64,
+    #[ts(type = "number")]
     pub dead_lettered_total: u64,
 }
 
@@ -773,6 +975,10 @@ impl RuntimeDiagnostics {
             scheduler: self.scheduler.snapshot(),
             jobs: self.jobs.snapshot(),
         }
+    }
+
+    pub fn readiness_descriptors(&self) -> Vec<super::probes::ReadinessProbeDescriptor> {
+        self.readiness.descriptors()
     }
 
     pub(crate) fn http_observability_snapshot(&self) -> HttpObservabilitySnapshot {

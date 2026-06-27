@@ -52,6 +52,8 @@ enum TicketStatus {
 // TicketStatus::Open.label_key()     → "admin.tickets.statuses.open"
 ```
 
+Aliases are compatibility inputs, not stored values. `key()`, serialization, database writes, typed AppEnum OpenAPI schemas, and the generated TypeScript union use the canonical key; `parse_key(...)`, deserialization, `FoundryAppEnum::accepted_keys()`, `.app_enum::<TicketStatus>()` validation, and generated `parseTicketStatusOrNull(...)` accept aliases and normalize them back to that canonical value. Generated TypeScript also exports alias metadata and `getTicketStatusCanonicalValue(...)` so frontend code can normalize legacy input without duplicating backend alias maps.
+
 ### What `#[derive(AppEnum)]` Gives You
 
 | Feature | Automatic |
@@ -91,7 +93,7 @@ let pending = Order::model_query()
 ```rust
 #[derive(Deserialize, ApiSchema, Validate)]
 struct UpdateOrderRequest {
-    #[validate(required, app_enum)]
+    #[validate(required, app_enum(OrderStatus))]
     status: OrderStatus,     // validates "pending" ✓, "invalid" ✗
 }
 ```
@@ -114,6 +116,7 @@ OrderStatus::parse_key("shipped")  // Some(OrderStatus::Shipped)
 ## HasAttachments — File Attachments on Models
 
 Attach files to any model with collection organization and image processing.
+`types:export` emits the `Attachment` TypeScript type automatically; `custom_properties` is generated as `JsonValue`, so application code can narrow collection-specific metadata without duplicating the core attachment record.
 
 ### Setup
 
@@ -334,6 +337,7 @@ product.attach(&app, "gallery", photo2).await?;
 ## HasMetadata — Key-Value Store on Models
 
 Attach arbitrary key-value data to any model without schema changes.
+`types:export` emits the `ModelMeta` TypeScript type automatically; `value` is generated as `JsonValue | null`, so application code can narrow app-specific metadata values without duplicating the core metadata record.
 
 ### Setup
 
@@ -390,6 +394,7 @@ for meta in &all {
 ## HasTranslations — Multi-Locale Field Values
 
 Store translated field values for any model across multiple locales.
+`types:export` emits `ModelTranslation` and `TranslatedFields` automatically, so translated model responses can reuse backend-owned locale and field contracts.
 
 > For app-level translation catalogs (UI strings, validation messages), see [i18n Guide](i18n.md). This module is for **per-model field translations** — e.g., product name in English, Malay, and Chinese.
 
@@ -485,6 +490,7 @@ product.delete_translations(&app, "zh").await?;
 ## Countries — Reference Data
 
 250 built-in countries with currencies, timezones, calling codes, and more.
+`types:export` emits `Country`, `CountryCurrency`, and `CountryStatus` automatically, so country pickers and locale/phone forms can import the backend-owned record shape directly.
 
 ### Seeding
 
@@ -548,9 +554,11 @@ if Country::exists(&app, "US").await? {
 | `region` | Option | `"Asia"` |
 | `subregion` | Option | `"South-Eastern Asia"` |
 | `primary_currency_code` | Option | `"MYR"` |
-| `currencies` | JSON array | `[{"code":"MYR","name":"Malaysian ringgit","symbol":"RM"}]` |
+| `currencies` | Vec\<CountryCurrency\> | `[{"code":"MYR","name":"Malaysian ringgit","symbol":"RM"}]` |
 | `calling_code` | Option | `"+60"` |
-| `timezones` | JSON array | `["Asia/Kuala_Lumpur"]` |
+| `calling_suffixes` | Vec\<String\> | `["60"]` |
+| `tlds` | Vec\<String\> | `[".my"]` |
+| `timezones` | Vec\<String\> | `["Asia/Kuala_Lumpur"]` |
 | `latitude` / `longitude` | Option\<f64\> | `2.5` / `112.5` |
 | `flag_emoji` | Option | `"🇲🇾"` |
 | `status` | `CountryStatus` | `CountryStatus::Enabled` or `CountryStatus::Disabled` |
@@ -588,8 +596,45 @@ validator
 ## Settings — Admin-Ready Key-Value Store
 
 A typed key-value store with form metadata, designed for admin panel CRUD. Each setting carries its input type, validation parameters, grouping, and display information so the frontend can dynamically render forms.
+`types:export` emits the `Setting` and `SettingType` TypeScript types automatically; `value` is generated as `JsonValue | null` and `parameters` as `JsonValue`, so application code can narrow those JSON shapes from backend-owned metadata instead of maintaining a duplicated setting interface. Static `SettingDefinition` registrations also generate `SettingManifest.ts`, which exports setting keys, groups, form metadata, public/private status, `settingNameOrNull()`, `settingGroupNameOrNull()`, `settingsInGroup()`, `publicSettings()`, `privateSettings()`, `settingsByType()`, `settingLabel()`, `settingDescription()`, `settingParameters()`, `settingOptions()`, `settingOptionForValue()`, `settingOptionLabelForValue()`, `settingHasOptionValue()`, `settingSortOrder()`, and `SettingValueFor<...>` helpers without exporting current setting values. Generated setting constants are frozen at runtime, while setting selector helpers return cloned entries and deep-cloned JSON parameter metadata for local form state, draft values, or layout annotations.
+Select and multiselect definitions must provide `parameters.options` as non-empty `{ value, label }` objects with trimmed labels and unique values before `SettingManifest.ts` is generated.
 
 ### Creating Settings (Seeder / Setup)
+
+Prefer `SettingDefinition` when a setting should be available to frontend or
+admin tooling through `types:export`. The same definition can be submitted to
+the exporter and converted into a database seed record:
+
+```rust
+use foundry::prelude::*;
+use serde_json::{json, Value};
+
+fn theme_parameters() -> Value {
+    json!({"options": [
+        {"value": "light", "label": "Light"},
+        {"value": "dark", "label": "Dark"},
+        {"value": "auto", "label": "System"}
+    ]})
+}
+
+pub const fn app_theme_setting() -> SettingDefinition {
+    SettingDefinition::select("app.theme", "Theme")
+        .parameters(theme_parameters)
+        .group("appearance")
+        .description("Default frontend theme")
+        .sort_order(1)
+        .public()
+}
+
+foundry::inventory::submit! {
+    app_theme_setting()
+}
+
+Setting::create(
+    &app,
+    app_theme_setting().to_new_setting().value(json!("light")),
+).await?;
+```
 
 Use `NewSetting` builder to define settings with full metadata:
 
@@ -752,8 +797,6 @@ let app_settings = Setting::by_prefix(&app, "app.").await?;
 | `description` | Option\<String\> | Help text shown below the input |
 | `sort_order` | i32 | Ordering within a group |
 | `is_public` | bool | Whether exposed to unauthenticated API |
-| `created_at` | Timestamp | Creation time |
-| `updated_at` | Option\<Timestamp\> | Last update time |
 
 ### Common Patterns
 

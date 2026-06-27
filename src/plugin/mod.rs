@@ -728,7 +728,7 @@ impl PluginRegistrar {
 }
 
 /// Summary of what a single plugin contributed during registration.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PluginContributions {
     pub route_count: usize,
     pub command_count: usize,
@@ -740,6 +740,46 @@ pub struct PluginContributions {
     pub registrar_action_count: usize,
     pub asset_count: usize,
     pub scaffold_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginDependencyDescriptor {
+    pub id: PluginId,
+    pub version_req: VersionReq,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginAssetDescriptor {
+    pub id: PluginAssetId,
+    pub kind: PluginAssetKind,
+    pub target_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginScaffoldVarDescriptor {
+    pub name: String,
+    pub description: Option<String>,
+    pub default: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginScaffoldDescriptor {
+    pub id: PluginScaffoldId,
+    pub description: Option<String>,
+    pub variables: Vec<PluginScaffoldVarDescriptor>,
+    pub files: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginDescriptor {
+    pub id: PluginId,
+    pub version: Version,
+    pub foundry_version: VersionReq,
+    pub description: Option<String>,
+    pub dependencies: Vec<PluginDependencyDescriptor>,
+    pub assets: Vec<PluginAssetDescriptor>,
+    pub scaffolds: Vec<PluginScaffoldDescriptor>,
+    pub contributions: PluginContributions,
 }
 
 pub struct PluginRegistry {
@@ -764,6 +804,54 @@ impl PluginRegistry {
 
     pub fn plugin(&self, id: &PluginId) -> Option<&PluginManifest> {
         self.plugins.iter().find(|plugin| plugin.id() == id)
+    }
+
+    pub fn descriptors(&self) -> Vec<PluginDescriptor> {
+        self.plugins
+            .iter()
+            .map(|plugin| PluginDescriptor {
+                id: plugin.id().clone(),
+                version: plugin.version().clone(),
+                foundry_version: plugin.foundry_version().clone(),
+                description: plugin.description_text().map(ToOwned::to_owned),
+                dependencies: plugin
+                    .dependencies()
+                    .iter()
+                    .map(|dependency| PluginDependencyDescriptor {
+                        id: dependency.id().clone(),
+                        version_req: dependency.version_req().clone(),
+                    })
+                    .collect(),
+                assets: plugin
+                    .assets()
+                    .iter()
+                    .map(|asset| PluginAssetDescriptor {
+                        id: asset.id().clone(),
+                        kind: asset.kind().clone(),
+                        target_path: asset.target_path().to_path_buf(),
+                    })
+                    .collect(),
+                scaffolds: plugin
+                    .scaffolds()
+                    .iter()
+                    .map(|scaffold| PluginScaffoldDescriptor {
+                        id: scaffold.id().clone(),
+                        description: scaffold.description_text().map(ToOwned::to_owned),
+                        variables: scaffold
+                            .variables()
+                            .iter()
+                            .map(|variable| PluginScaffoldVarDescriptor {
+                                name: variable.name().to_string(),
+                                description: variable.description_text().map(ToOwned::to_owned),
+                                default: variable.default_value().map(ToOwned::to_owned),
+                            })
+                            .collect(),
+                        files: scaffold.files(),
+                    })
+                    .collect(),
+                contributions: self.contributions(plugin.id()).cloned().unwrap_or_default(),
+            })
+            .collect()
     }
 
     pub fn install_assets(&self, options: &PluginInstallOptions) -> Result<Vec<PathBuf>> {
@@ -1481,6 +1569,7 @@ mod tests {
     use tempfile::tempdir;
 
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     use super::{
         prepare_plugins, run_plugin_lifecycle_callback, Plugin, PluginAsset, PluginAssetKind,
@@ -2036,6 +2125,86 @@ mod tests {
         let prepared = prepare_plugins(&plugins).unwrap();
         assert_eq!(prepared.providers.len(), 1);
         assert_eq!(prepared.instances.len(), 1);
+    }
+
+    #[test]
+    fn plugin_registry_descriptors_expose_manifest_and_contribution_metadata() {
+        let manifest = PluginManifest::new(
+            PluginId::new("foundry.example"),
+            Version::parse("1.2.3").unwrap(),
+            VersionReq::parse("^0.1").unwrap(),
+        )
+        .description("Example plugin")
+        .depends_on(
+            PluginId::new("foundry.base"),
+            VersionReq::parse("^1").unwrap(),
+        );
+        let asset = PluginAsset::text(
+            PluginAssetId::new("config"),
+            PluginAssetKind::Config,
+            "config/example.toml",
+            "enabled = true",
+        );
+        let scaffold = PluginScaffold::new(PluginScaffoldId::new("model"))
+            .description("Create a model")
+            .variable(
+                PluginScaffoldVar::new("name")
+                    .description("Model name")
+                    .default("User"),
+            )
+            .file("src/{{name}}.rs", "pub struct {{name}};");
+        let registry = PluginRegistry::new(
+            vec![manifest.with_assets_and_scaffolds(vec![asset], vec![scaffold])],
+            HashMap::from([(
+                PluginId::new("foundry.example"),
+                super::PluginContributions {
+                    route_count: 1,
+                    command_count: 2,
+                    schedule_count: 3,
+                    websocket_route_count: 4,
+                    validation_rule_count: 5,
+                    provider_count: 6,
+                    middleware_count: 7,
+                    registrar_action_count: 8,
+                    asset_count: 1,
+                    scaffold_count: 1,
+                },
+            )]),
+        );
+
+        let descriptors = registry.descriptors();
+
+        assert_eq!(descriptors.len(), 1);
+        let descriptor = &descriptors[0];
+        assert_eq!(descriptor.id, PluginId::new("foundry.example"));
+        assert_eq!(descriptor.version, Version::parse("1.2.3").unwrap());
+        assert_eq!(
+            descriptor.foundry_version,
+            VersionReq::parse("^0.1").unwrap()
+        );
+        assert_eq!(descriptor.description.as_deref(), Some("Example plugin"));
+        assert_eq!(descriptor.dependencies[0].id, PluginId::new("foundry.base"));
+        assert_eq!(
+            descriptor.dependencies[0].version_req,
+            VersionReq::parse("^1").unwrap()
+        );
+        assert_eq!(descriptor.assets[0].id, PluginAssetId::new("config"));
+        assert_eq!(descriptor.assets[0].kind, PluginAssetKind::Config);
+        assert_eq!(
+            descriptor.assets[0].target_path,
+            PathBuf::from("config/example.toml")
+        );
+        assert_eq!(descriptor.scaffolds[0].id, PluginScaffoldId::new("model"));
+        assert_eq!(
+            descriptor.scaffolds[0].variables[0].name,
+            "name".to_string()
+        );
+        assert_eq!(
+            descriptor.scaffolds[0].files,
+            vec![PathBuf::from("src/{{name}}.rs")]
+        );
+        assert_eq!(descriptor.contributions.command_count, 2);
+        assert_eq!(descriptor.contributions.validation_rule_count, 5);
     }
 
     #[test]

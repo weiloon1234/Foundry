@@ -34,8 +34,8 @@ pub(crate) use diagnostics::{HttpRequestRecord, RuntimeDiagnosticsConfig};
 pub use diagnostics::{RuntimeDiagnostics, RuntimeSnapshot};
 pub use observability::ObservabilityOptions;
 pub use probes::{
-    LivenessReport, ProbeResult, ReadinessCheck, ReadinessReport, FRAMEWORK_BOOTSTRAP_PROBE,
-    REDIS_PING_PROBE, RUNTIME_BACKEND_PROBE,
+    LivenessReport, ProbeResult, ReadinessCheck, ReadinessProbeDescriptor, ReadinessReport,
+    FRAMEWORK_BOOTSTRAP_PROBE, REDIS_PING_PROBE, RUNTIME_BACKEND_PROBE,
 };
 pub(crate) use probes::{ReadinessRegistryBuilder, ReadinessRegistryHandle};
 pub use reporter::{
@@ -54,6 +54,7 @@ pub(crate) use context::{
 };
 pub use context::{current_trace_id, CurrentRequest};
 pub(crate) use middleware::{request_context_middleware, request_origin_middleware};
+pub(crate) use observability::normalized_observability_base_path;
 pub(crate) use observability::register_observability_routes;
 pub(crate) use observability::{register_openapi_route, set_openapi_spec};
 pub(crate) use panic_boundary::{catch_async_panic, catch_future_panic, catch_sync_panic};
@@ -248,7 +249,7 @@ mod tests {
 
     use super::{
         ProbeResult, ProbeState, ReadinessCheck, ReadinessRegistryBuilder, RuntimeBackendKind,
-        RuntimeDiagnostics,
+        RuntimeDiagnostics, FRAMEWORK_BOOTSTRAP_PROBE,
     };
     use crate::config::ConfigRepository;
     use crate::foundation::{AppContext, Container, Error};
@@ -309,6 +310,29 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("already registered"));
+    }
+
+    #[test]
+    fn readiness_registry_descriptors_include_builtin_metadata() {
+        let mut builder = ReadinessRegistryBuilder::default();
+        builder
+            .register_arc(FRAMEWORK_BOOTSTRAP_PROBE, Arc::new(PassingProbe))
+            .unwrap();
+        builder
+            .register_arc(ProbeId::new("provider.pass"), Arc::new(PassingProbe))
+            .unwrap();
+
+        let diagnostics = RuntimeDiagnostics::new(
+            RuntimeBackendKind::Memory,
+            ReadinessRegistryBuilder::freeze_shared(Arc::new(Mutex::new(builder))),
+        );
+
+        let descriptors = diagnostics.readiness_descriptors();
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].id, FRAMEWORK_BOOTSTRAP_PROBE);
+        assert!(descriptors[0].built_in);
+        assert_eq!(descriptors[1].id, ProbeId::new("provider.pass"));
+        assert!(!descriptors[1].built_in);
     }
 
     #[tokio::test]

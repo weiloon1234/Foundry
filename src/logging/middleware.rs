@@ -8,8 +8,8 @@ use tracing::Instrument;
 use super::context::CurrentRequest;
 use super::request_id::{generate_request_id, RequestId, REQUEST_ID_HEADER};
 use super::{
-    catch_future_panic, panic_payload_message, scope_current_request, scope_current_trace,
-    HttpRequestRecord, TraceContext,
+    catch_future_panic, normalized_observability_base_path, panic_payload_message,
+    scope_current_request, scope_current_trace, HttpRequestRecord, TraceContext,
 };
 use crate::foundation::AppContext;
 
@@ -174,15 +174,6 @@ fn path_is_under_observability_base(path: &str, base_path: &str) -> bool {
         || path
             .strip_prefix(&base_path)
             .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
-fn normalized_observability_base_path(base_path: &str) -> String {
-    let trimmed = base_path.trim_end_matches('/');
-    match trimmed {
-        "" => "/".to_string(),
-        value if value.starts_with('/') => value.to_string(),
-        value => format!("/{value}"),
-    }
 }
 
 pub(crate) async fn request_origin_middleware(

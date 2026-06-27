@@ -376,6 +376,24 @@ cargo run -- admin:create
 Plugin asset and scaffold paths are always resolved inside the selected target directory. Foundry
 rejects absolute paths, `..` traversal, Windows-style separators, control characters, and symlinked
 output paths before writing files.
+`types:export` also emits `PluginManifest.ts` for registered plugins, including plugin ids,
+versions, dependencies, contribution counts, asset target paths, and scaffold metadata. Frontend
+admin screens can use `PluginManifest`, `PluginIds`, `pluginEntries()`,
+`pluginNames()`, `pluginsWithDependencies()`, `pluginNamesWithDependencies()`,
+`pluginNameOrNull()`, `pluginAssetKinds()`, `isPluginAssetKind()`,
+`pluginAssetKindOrNull()`, `pluginsWithAssets()`,
+`pluginNamesWithAssets()`, `pluginsWithScaffolds()`,
+`pluginNamesWithScaffolds()`, `pluginContributionNames()`,
+`isPluginContributionName()`, `pluginContributionNameOrNull()`,
+`pluginsWithContribution()`, and
+`pluginNamesWithContribution()` for plugin dashboards without copying plugin
+strings or exposing asset/scaffold file contents. Nullable first selectors such
+as `pluginFirstEntryOrNull()`, `pluginFirstPluginWithAssetsOrNull(...)`, and
+`pluginFirstPluginWithContributionOrNull(...)` keep empty dashboard groups
+explicit without local `... ?? null` wrappers. Generated plugin manifest
+constants are frozen at runtime, while plugin selector helpers return cloned
+entries, nested assets, scaffolds, variables, files, dependencies, and
+contribution counts for local dashboard annotations.
 
 ```
 GET /admin/dashboard     → Admin dashboard (requires admin guard)

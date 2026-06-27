@@ -20,6 +20,7 @@ Expected result:
 
 - `doctor --deploy --strict` exits `0`.
 - The text verdict ends with `Production readiness: ready - deploy checks passed.`
+- The migration check has no pending migrations and no missing applied migrations.
 - `make verify-release` passes formatting, tests, clippy, fixture checks, and package dry-run.
 
 Use `cargo run -- doctor --deploy --json --strict` in deploy tooling.
@@ -154,8 +155,8 @@ impl Datatable for UserDatatable {
 
     fn columns() -> Vec<DatatableColumn<Self::Row>> {
         vec![
-            DatatableColumn::field(User::EMAIL).label("Email").searchable().sortable(),
-            DatatableColumn::field(User::NAME).label("Name").searchable().sortable(),
+            DatatableColumn::field(User::EMAIL).label("Email").filterable().sortable(),
+            DatatableColumn::field(User::NAME).label("Name").filterable().sortable(),
         ]
     }
 }

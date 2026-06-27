@@ -1,0 +1,7 @@
+error: `#[serde(flatten)]` fields cannot carry `#[validate(...)]` rules because validation error paths and generated TypeScript metadata cannot safely represent flattened child fields; move validation to explicit parent fields or avoid flattening this DTO
+  --> tests/ui/derive/fail_flatten_validate_rules.rs:9:5
+   |
+ 9 | /     #[serde(flatten)]
+10 | |     #[validate(nested)]
+11 | |     child: FlattenedChild,
+   | |_________________________^

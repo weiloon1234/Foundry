@@ -51,4 +51,4 @@ struct ScheduledTask
 - Schedule handler panics are handled as schedule failures and route through `ScheduleOptions::on_failure`.
 - Scheduler hooks are isolated: hook panics are logged and do not crash the scheduler task.
 - `SchedulerConfig.shutdown_timeout_ms` defaults to `30000`; `0` aborts active schedules immediately on shutdown.
-
+- `types:export` mirrors `SchedulerConfig` into `SchedulerRuntimeManifest` so admin/tooling clients can display tick cadence, leadership lease TTL, and shutdown timeout without copied config.

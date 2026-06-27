@@ -54,11 +54,15 @@ impl MigrationStatusReport {
             .iter()
             .filter(|status| status.applied.is_some())
             .count();
+        let pending = registered.saturating_sub(applied);
+        let missing_applied = self.missing_applied.len();
         MigrationStatusSummary {
             registered,
             applied,
-            pending: registered.saturating_sub(applied),
-            missing_applied: self.missing_applied.len(),
+            pending,
+            missing_applied,
+            drifted: missing_applied > 0,
+            up_to_date: pending == 0 && missing_applied == 0,
             latest_batch: self.latest_batch,
         }
     }
@@ -86,6 +90,8 @@ pub(crate) struct MigrationStatusSummary {
     pub(crate) applied: usize,
     pub(crate) pending: usize,
     pub(crate) missing_applied: usize,
+    pub(crate) drifted: bool,
+    pub(crate) up_to_date: bool,
     pub(crate) latest_batch: Option<i64>,
 }
 
@@ -1139,6 +1145,21 @@ async fn ensure_ledger_table(config: &DatabaseConfig, executor: &dyn QueryExecut
             &[],
         )
         .await?;
+    adopt_legacy_migration_ledger(config, executor).await?;
+    Ok(())
+}
+
+async fn adopt_legacy_migration_ledger(
+    config: &DatabaseConfig,
+    executor: &dyn QueryExecutor,
+) -> Result<()> {
+    if config.migration_table != "foundry_migrations" {
+        return Ok(());
+    }
+
+    executor
+        .raw_execute(&legacy_migration_ledger_adoption_sql(config), &[])
+        .await?;
     Ok(())
 }
 
@@ -1239,8 +1260,44 @@ fn qualified_migration_table(config: &DatabaseConfig) -> String {
     )
 }
 
+fn qualified_legacy_migration_table(config: &DatabaseConfig) -> String {
+    format!(
+        "{}.{}",
+        quote_identifier(&config.schema),
+        quote_identifier("forge_migrations")
+    )
+}
+
 fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn legacy_migration_ledger_adoption_sql(config: &DatabaseConfig) -> String {
+    let legacy_table = qualified_legacy_migration_table(config);
+    let migration_table = qualified_migration_table(config);
+    let copy_sql = format!(
+        "INSERT INTO {migration_table} (id, batch, applied_at) \
+         SELECT id, batch, applied_at FROM {legacy_table} \
+         ON CONFLICT (id) DO NOTHING"
+    );
+
+    format!(
+        r#"
+        DO $foundry$
+        BEGIN
+            IF to_regclass({legacy_table_literal}) IS NOT NULL THEN
+                EXECUTE {copy_sql_literal};
+            END IF;
+        END
+        $foundry$;
+        "#,
+        legacy_table_literal = quote_literal(&legacy_table),
+        copy_sql_literal = quote_literal(&copy_sql),
+    )
 }
 
 fn advisory_lock_key(config: &DatabaseConfig) -> i64 {
@@ -1261,12 +1318,12 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{
-        acquire_migration_lock, advisory_lock_key, migration_lock_timeout_error,
-        migration_run_in_transaction, missing_applied_migrations, run_database_lifecycle_callback,
-        seeder_run_in_transaction, AppliedMigration, GeneratedDatabasePaths, MigrationContext,
-        MigrationFile, MigrationFileAdapter, MigrationId, MigrationLockClient,
-        MigrationRegistryBuilder, MigrationStatus, MigrationStatusReport, SeederContext,
-        SeederFile, SeederFileAdapter, SeederId, SeederRegistryBuilder,
+        acquire_migration_lock, advisory_lock_key, legacy_migration_ledger_adoption_sql,
+        migration_lock_timeout_error, migration_run_in_transaction, missing_applied_migrations,
+        run_database_lifecycle_callback, seeder_run_in_transaction, AppliedMigration,
+        GeneratedDatabasePaths, MigrationContext, MigrationFile, MigrationFileAdapter, MigrationId,
+        MigrationLockClient, MigrationRegistryBuilder, MigrationStatus, MigrationStatusReport,
+        SeederContext, SeederFile, SeederFileAdapter, SeederId, SeederRegistryBuilder,
     };
     use crate::config::DatabaseConfig;
     use crate::foundation::{Error, Result};
@@ -1524,9 +1581,36 @@ mod tests {
         assert_eq!(json["summary"]["applied"], 1);
         assert_eq!(json["summary"]["pending"], 1);
         assert_eq!(json["summary"]["missing_applied"], 1);
+        assert_eq!(json["summary"]["drifted"], true);
+        assert_eq!(json["summary"]["up_to_date"], false);
         assert_eq!(json["migrations"][0]["state"], "applied");
         assert_eq!(json["migrations"][1]["state"], "pending");
         assert_eq!(json["missing_applied"][0]["state"], "missing_applied");
+    }
+
+    #[test]
+    fn migration_status_json_marks_clean_fully_applied_reports_up_to_date() {
+        let applied = AppliedMigration {
+            id: MigrationId::new("202604090900_init"),
+            batch: 1,
+            applied_at: "2026-04-09 09:00:00+00".to_string(),
+        };
+        let report = MigrationStatusReport {
+            statuses: vec![MigrationStatus {
+                id: applied.id.clone(),
+                applied: Some(applied),
+            }],
+            missing_applied: Vec::new(),
+            latest_batch: Some(1),
+        };
+
+        let json = serde_json::to_value(report.to_json()).unwrap();
+        assert_eq!(json["summary"]["registered"], 1);
+        assert_eq!(json["summary"]["applied"], 1);
+        assert_eq!(json["summary"]["pending"], 0);
+        assert_eq!(json["summary"]["missing_applied"], 0);
+        assert_eq!(json["summary"]["drifted"], false);
+        assert_eq!(json["summary"]["up_to_date"], true);
     }
 
     #[test]
@@ -1632,5 +1716,21 @@ mod tests {
         };
 
         assert_ne!(advisory_lock_key(&public), advisory_lock_key(&custom));
+    }
+
+    #[test]
+    fn legacy_migration_ledger_adoption_copies_forge_rows_into_foundry_table() {
+        let config = DatabaseConfig {
+            schema: "public".to_string(),
+            migration_table: "foundry_migrations".to_string(),
+            ..DatabaseConfig::default()
+        };
+
+        let sql = legacy_migration_ledger_adoption_sql(&config);
+
+        assert!(sql.contains("to_regclass('\"public\".\"forge_migrations\"')"));
+        assert!(sql.contains("INSERT INTO \"public\".\"foundry_migrations\""));
+        assert!(sql.contains("FROM \"public\".\"forge_migrations\""));
+        assert!(sql.contains("ON CONFLICT (id) DO NOTHING"));
     }
 }

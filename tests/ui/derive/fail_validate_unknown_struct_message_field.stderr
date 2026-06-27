@@ -1,0 +1,5 @@
+error: validation message references unknown field `emali`; add a field-level validation rule, target an after-hook contract field, or remove the custom message
+ --> tests/ui/derive/fail_validate_unknown_struct_message_field.rs:2:21
+  |
+2 | #[validate(messages(emali(required = "Email is required.")))]
+  |                     ^^^^^

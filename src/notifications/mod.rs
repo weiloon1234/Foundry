@@ -5,11 +5,14 @@ pub(crate) mod job;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::database::{DbValue, Query};
 use crate::email::EmailMessage;
 use crate::foundation::{AppContext, Error, Result};
 use crate::support::sync::lock_unpoisoned;
-use crate::support::NotificationChannelId;
+use crate::support::{ChannelEventId, ChannelId, NotificationChannelId};
+use crate::websocket::ServerMessage;
 
 pub use channel::{
     BroadcastNotificationChannel, DatabaseNotificationChannel, EmailNotificationChannel,
@@ -48,7 +51,7 @@ pub(crate) async fn store_database_notification(
 /// ```ignore
 /// impl Notification for OrderShipped {
 ///     fn notification_type(&self) -> &str { "order_shipped" }
-///     fn via(&self) -> Vec<String> { vec!["email".into(), "database".into()] }
+///     fn via(&self) -> Vec<NotificationChannelId> { vec![NOTIFY_EMAIL, NOTIFY_DATABASE] }
 ///     fn to_email(&self, notifiable: &dyn Notifiable) -> Option<EmailMessage> {
 ///         let email = notifiable.route_notification_for("email")?;
 ///         Some(EmailMessage::new("Order shipped!").to(&email).text("Your order is on its way."))
@@ -172,6 +175,49 @@ impl NotificationChannelRegistry {
 pub const NOTIFY_EMAIL: NotificationChannelId = NotificationChannelId::new("email");
 pub const NOTIFY_DATABASE: NotificationChannelId = NotificationChannelId::new("database");
 pub const NOTIFY_BROADCAST: NotificationChannelId = NotificationChannelId::new("broadcast");
+
+/// Canonical WebSocket channel used by the built-in broadcast notification channel.
+pub const NOTIFICATION_BROADCAST_CHANNEL: ChannelId = ChannelId::new("notifications");
+
+/// Canonical WebSocket event used by the built-in broadcast notification channel.
+pub const NOTIFICATION_BROADCAST_EVENT: ChannelEventId = ChannelEventId::new("notification");
+
+/// Framework-owned payload envelope for built-in broadcast notifications.
+///
+/// `data` is the raw JSON returned by `Notification::to_broadcast()`. The
+/// stable `notification_type` field comes from `Notification::notification_type()`
+/// so frontend clients can dispatch by type without duplicating that metadata
+/// inside every notification payload.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
+pub struct NotificationBroadcastPayload {
+    pub notification_type: String,
+    pub data: serde_json::Value,
+}
+
+pub(crate) fn broadcast_notification_message(
+    notifiable_id: String,
+    notification_type: String,
+    payload: serde_json::Value,
+) -> ServerMessage {
+    ServerMessage {
+        channel: NOTIFICATION_BROADCAST_CHANNEL,
+        event: NOTIFICATION_BROADCAST_EVENT,
+        room: Some(notifiable_id),
+        payload: serde_json::json!(NotificationBroadcastPayload {
+            notification_type,
+            data: payload,
+        }),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Dispatch Functions
@@ -572,6 +618,21 @@ mod tests {
         notify(&app, &TestNotifiable, &notification).await.unwrap();
 
         assert_eq!(log.lock().unwrap().as_slice(), ["sent"]);
+    }
+
+    #[test]
+    fn broadcast_notification_message_wraps_type_and_data() {
+        let message = broadcast_notification_message(
+            "user-1".to_string(),
+            "test.notification".to_string(),
+            json!({ "message": "hello" }),
+        );
+
+        assert_eq!(message.channel, NOTIFICATION_BROADCAST_CHANNEL);
+        assert_eq!(message.event, NOTIFICATION_BROADCAST_EVENT);
+        assert_eq!(message.room.as_deref(), Some("user-1"));
+        assert_eq!(message.payload["notification_type"], "test.notification");
+        assert_eq!(message.payload["data"]["message"], "hello");
     }
 
     #[tokio::test]

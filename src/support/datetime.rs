@@ -8,8 +8,10 @@ use chrono::{
 };
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use ts_rs::TS;
 
 use crate::foundation::{Error, Result};
+use crate::openapi::ApiSchema;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DateTime(ChronoDateTime<ChronoUtc>);
@@ -109,6 +111,64 @@ impl fmt::Display for DateTime {
         formatter.write_str(&self.format())
     }
 }
+
+macro_rules! impl_ts_string {
+    ($ty:ty) => {
+        impl TS for $ty {
+            type WithoutGenerics = Self;
+
+            fn ident() -> String {
+                "string".to_string()
+            }
+
+            fn name() -> String {
+                "string".to_string()
+            }
+
+            fn inline() -> String {
+                "string".to_string()
+            }
+
+            fn inline_flattened() -> String {
+                panic!("{} cannot be flattened", Self::name())
+            }
+
+            fn decl() -> String {
+                panic!("{} cannot be declared", Self::name())
+            }
+
+            fn decl_concrete() -> String {
+                panic!("{} cannot be declared", Self::name())
+            }
+        }
+    };
+}
+
+macro_rules! impl_string_schema {
+    ($ty:ty, $schema_name:literal, $format:literal) => {
+        impl ApiSchema for $ty {
+            fn schema() -> serde_json::Value {
+                serde_json::json!({"type": "string", "format": $format})
+            }
+
+            fn schema_name() -> &'static str {
+                $schema_name
+            }
+        }
+    };
+}
+
+impl_ts_string!(DateTime);
+impl_ts_string!(LocalDateTime);
+impl_ts_string!(Date);
+impl_ts_string!(Time);
+impl_ts_string!(Timezone);
+
+impl_string_schema!(DateTime, "DateTime", "date-time");
+impl_string_schema!(LocalDateTime, "LocalDateTime", "date-time");
+impl_string_schema!(Date, "Date", "date");
+impl_string_schema!(Time, "Time", "time");
+impl_string_schema!(Timezone, "Timezone", "timezone");
 
 impl FromStr for DateTime {
     type Err = Error;
@@ -508,9 +568,31 @@ mod tests {
     }
 
     #[test]
+    fn date_accepts_signed_expanded_years() {
+        assert!(Date::parse("+2026-01-01").is_ok());
+        assert!(Date::parse("+10000-01-01").is_ok());
+        assert!(Date::parse("-0001-01-01").is_ok());
+    }
+
+    #[test]
+    fn date_rejects_unsigned_expanded_years() {
+        assert!(Date::parse("10000-01-01").is_err());
+    }
+
+    #[test]
     fn time_round_trips() {
         let value = Time::parse("13:15:00").unwrap();
         assert_eq!(value.format(), "13:15:00");
+    }
+
+    #[test]
+    fn temporal_values_accept_extended_fraction_precision() {
+        assert!(Time::parse("13:15:00.123456789").is_ok());
+        assert!(Time::parse("13:15:00.1234567890").is_ok());
+        assert!(LocalDateTime::parse("2026-04-11T13:15:00.123456789").is_ok());
+        assert!(LocalDateTime::parse("2026-04-11T13:15:00.1234567890").is_ok());
+        assert!(DateTime::parse("2026-04-11T13:15:00.123456789Z").is_ok());
+        assert!(DateTime::parse("2026-04-11T13:15:00.1234567890Z").is_ok());
     }
 
     #[test]

@@ -1705,6 +1705,7 @@ fn default_mailer(&self) -> Result<EmailMailer>
 fn default_mailer_name(&self) -> &str
 fn from_address(&self) -> &EmailFromConfig
 fn configured_mailers(&self) -> Vec<String>
+fn descriptors(&self) -> Vec<EmailMailerDescriptor>
 ```
 
 ### EmailMailer — methods
@@ -2016,6 +2017,8 @@ Multi-channel async notifications.
 ### Constants
 
 ```rust
+const NOTIFICATION_BROADCAST_CHANNEL: ChannelId;
+const NOTIFICATION_BROADCAST_EVENT: ChannelEventId;
 const NOTIFY_EMAIL: NotificationChannelId;
 const NOTIFY_DATABASE: NotificationChannelId;
 const NOTIFY_BROADCAST: NotificationChannelId;
@@ -2217,6 +2220,7 @@ fn mark_bootstrap_complete(&self)
 fn bootstrap_complete(&self) -> bool
 fn liveness(&self) -> LivenessReport
 fn snapshot(&self) -> RuntimeSnapshot
+fn readiness_descriptors(&self) -> Vec<ReadinessProbeDescriptor>
 async fn run_readiness_checks(&self, app: &AppContext) -> Result<ReadinessReport>
 
 // Recording
@@ -2239,6 +2243,8 @@ fn record_job_outcome(&self, outcome: JobOutcome)
 bounded HTTP route rankings, recent slow requests, and recent error samples for admin dashboards.
 `/_foundry/metrics` exposes runtime counter families in Prometheus text format. Foundry does not store
 Prometheus samples; scrape retention belongs to Prometheus or your metrics backend.
+Generated OpenAPI documents the core JSON observability endpoints (`/_foundry/health`,
+`/_foundry/ready`, `/_foundry/runtime`) with backend-owned response schemas.
 
 HTTP runtime counters include observability endpoint traffic, while `/_foundry/http/stats` rankings
 retain application routes only so dashboard polling does not crowd out useful samples.
@@ -2422,6 +2428,8 @@ trait DatatableExportDelivery: Send + Sync + 'static {
 | `DatatableColumn<M>` | Column descriptor: name, label, sortable, filterable, exportable |
 | `DatatableRelationFilter<M, Q>` | Typed relation-backed auto-filter declaration |
 | `DatatableRelationColumn<M>` | Relation target column descriptor |
+| `DatatableDescriptor` | Static registry descriptor used by generated frontend datatable manifests |
+| `DatatableRelationFilterMeta` | Static relation-filter metadata: field, relation, and aliases |
 | `DatatableSort<M>` | Default sort: column + direction |
 | `DatatableMapping<M>` | Computed output field |
 | `DatatableRequest` | Client request: page, per_page, sort, filters, search |
@@ -2429,7 +2437,7 @@ trait DatatableExportDelivery: Send + Sync + 'static {
 | `DatatableSortInput` | Sort: field, direction |
 | `DatatableContext<'a>` | Execution context: app, actor, request, locale, timezone |
 | `DatatableJsonResponse` | JSON response: rows, columns, filters, pagination |
-| `DatatableColumnMeta` | Column metadata for response |
+| `DatatableColumnMeta` | Column metadata for response, including sortable/filterable/exportable/relation flags |
 | `DatatablePaginationMeta` | page, per_page, total, total_pages |
 | `DatatableFilterField` | Filter metadata: name, kind, label, binding, options |
 | `DatatableFilterBinding` | Backend filter contract: field, op, value_kind |
@@ -2439,7 +2447,7 @@ trait DatatableExportDelivery: Send + Sync + 'static {
 | `DatatableActorSnapshot` | Serializable actor for jobs |
 | `GeneratedDatatableExport` | Generated XLSX export data |
 | `DatatableExportJob` | Background export job |
-| `DatatableRegistry` | Registry of all datatables |
+| `DatatableRegistry` | Registry of all datatables; `descriptors()` returns static manifest metadata |
 | `NoopExportDelivery` | No-op delivery |
 
 Relation filters are declared on the server with `Datatable::relation_filters()` and use the
@@ -2476,8 +2484,10 @@ fn load(config: &I18nConfig) -> Result<Self>
 fn translate(&self, locale: &str, key: &str, values: &[(&str, &str)]) -> String
 fn resolve_locale(&self, accept_language: &str) -> String
 fn default_locale(&self) -> &str
+fn fallback_locale(&self) -> &str
 fn has_locale(&self, locale: &str) -> bool
 fn locale_list(&self) -> Vec<&str>
+fn descriptor(&self) -> I18nManifestDescriptor
 ```
 
 ### I18n (extractor) — methods
@@ -2723,6 +2733,7 @@ fn deprecated(self) -> Self
 
 ```rust
 fn generate_openapi_spec(title: &str, version: &str, routes: &[DocumentedRoute]) -> Value
+fn try_generate_openapi_spec(title: &str, version: &str, routes: &[DocumentedRoute]) -> Result<Value>
 ```
 
 ---

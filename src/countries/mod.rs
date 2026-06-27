@@ -43,7 +43,9 @@ impl std::fmt::Display for CountryStatus {
 /// A country record from the `countries` table.
 ///
 /// Primary key is `iso2` (2-letter ISO 3166-1 alpha-2 code), not a UUID.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct Country {
     pub iso2: String,
     pub iso3: String,
@@ -53,13 +55,13 @@ pub struct Country {
     pub capital: Option<String>,
     pub region: Option<String>,
     pub subregion: Option<String>,
-    pub currencies: serde_json::Value,
+    pub currencies: Vec<CountryCurrency>,
     pub primary_currency_code: Option<String>,
     pub calling_code: Option<String>,
     pub calling_root: Option<String>,
-    pub calling_suffixes: serde_json::Value,
-    pub tlds: serde_json::Value,
-    pub timezones: serde_json::Value,
+    pub calling_suffixes: Vec<String>,
+    pub tlds: Vec<String>,
+    pub timezones: Vec<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub independent: Option<bool>,
@@ -180,14 +182,13 @@ pub struct CountrySeed {
     pub capitals: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct CountryCurrency {
     pub code: String,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub symbol: Option<String>,
-    #[serde(default)]
     pub minor_units: Option<i16>,
 }
 
@@ -243,6 +244,18 @@ fn opt_bool(value: Option<bool>) -> DbValue {
     match value {
         Some(v) => DbValue::Bool(v),
         None => DbValue::Null(DbType::Bool),
+    }
+}
+
+fn json_vec<T>(row: &crate::database::DbRecord, column: &str) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    match row.get(column) {
+        Some(DbValue::Json(value)) => serde_json::from_value(value.clone()).map_err(|error| {
+            Error::message(format!("failed to decode countries.{column}: {error}"))
+        }),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -334,25 +347,13 @@ fn row_to_country(row: &crate::database::DbRecord) -> Result<Country> {
         capital: row.optional_text("capital"),
         region: row.optional_text("region"),
         subregion: row.optional_text("subregion"),
-        currencies: match row.get("currencies") {
-            Some(DbValue::Json(v)) => v.clone(),
-            _ => serde_json::json!([]),
-        },
+        currencies: json_vec(row, "currencies")?,
         primary_currency_code: row.optional_text("primary_currency_code"),
         calling_code: row.optional_text("calling_code"),
         calling_root: row.optional_text("calling_root"),
-        calling_suffixes: match row.get("calling_suffixes") {
-            Some(DbValue::Json(v)) => v.clone(),
-            _ => serde_json::json!([]),
-        },
-        tlds: match row.get("tlds") {
-            Some(DbValue::Json(v)) => v.clone(),
-            _ => serde_json::json!([]),
-        },
-        timezones: match row.get("timezones") {
-            Some(DbValue::Json(v)) => v.clone(),
-            _ => serde_json::json!([]),
-        },
+        calling_suffixes: json_vec(row, "calling_suffixes")?,
+        tlds: json_vec(row, "tlds")?,
+        timezones: json_vec(row, "timezones")?,
         latitude: match row.get("latitude") {
             Some(DbValue::Float64(v)) => Some(*v),
             _ => None,

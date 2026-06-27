@@ -12,6 +12,7 @@ use super::stored_file::{StorageObject, StoredFile};
 #[derive(Clone)]
 pub struct StorageDisk {
     name: String,
+    driver: String,
     visibility: StorageVisibility,
     adapter: Arc<dyn StorageAdapter>,
 }
@@ -20,6 +21,7 @@ impl std::fmt::Debug for StorageDisk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StorageDisk")
             .field("name", &self.name)
+            .field("driver", &self.driver)
             .field("visibility", &self.visibility)
             .finish()
     }
@@ -28,11 +30,13 @@ impl std::fmt::Debug for StorageDisk {
 impl StorageDisk {
     pub(crate) fn new(
         name: String,
+        driver: String,
         visibility: StorageVisibility,
         adapter: Arc<dyn StorageAdapter>,
     ) -> Self {
         Self {
             name,
+            driver,
             visibility,
             adapter,
         }
@@ -40,6 +44,10 @@ impl StorageDisk {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn driver(&self) -> &str {
+        &self.driver
     }
 
     pub fn visibility(&self) -> StorageVisibility {
@@ -256,6 +264,7 @@ mod tests {
 
     fn disk(adapter: impl StorageAdapter) -> StorageDisk {
         StorageDisk::new(
+            "panic".to_string(),
             "panic".to_string(),
             StorageVisibility::Private,
             Arc::new(adapter),

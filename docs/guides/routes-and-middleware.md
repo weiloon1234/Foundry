@@ -69,6 +69,15 @@ r.route_with_options("/auth/mfa/verify", post(foundry::auth::mfa::routes::verify
         .allow_mfa_pending_token());
 ```
 
+Generated `RouteManifest.ts` exposes this exception as `allowsMfaPendingToken`,
+with helpers such as `routeAllowsMfaPendingToken(name)`,
+`routesAllowingMfaPendingToken()`, and `routesRejectingMfaPendingToken()`.
+MFA flows and route guards can read the backend-owned exception instead of
+duplicating the verification-route list.
+Scoped MFA route groups can set the same default with
+`scope.allow_mfa_pending_token()` and still override individual child routes
+through the route builder.
+
 Built-in audit logging is activated the same way: opt an admin route tree into an audit area once,
 then let child routes inherit it.
 
@@ -172,6 +181,11 @@ r.scope("/admin", |admin| {
 Use `audit_disabled()` for exceptions inside an audited parent scope, or override with a different
 area such as `support.audit_area("support")`.
 
+Generated `RouteManifest.ts` exposes the resolved area as `auditArea`, with helpers such as
+`routeAuditArea(name)`, `routesWithAuditArea("admin")`, `routesWithAnyAuditArea()`, and
+`routesWithoutAuditArea()`. This keeps route audit dashboards, admin navigation, and generated docs
+on the backend-owned audit policy instead of a duplicated frontend map.
+
 Handlers can also read the resolved area through the public `CurrentRequest` extractor:
 
 ```rust
@@ -233,7 +247,15 @@ r.group_with_options(
 
 Per-route options inside the group are merged with the group defaults.
 
-Use `group()` and `group_with_options()` when you want the low-level API directly. Use `scope()` when you also want relative route names and the higher-level route builder.
+Use `group()` and `group_with_options()` when you want the low-level API directly.
+Use `scope()` when you also want relative route names and the higher-level route
+builder. Scope defaults cover access, authorization callbacks, middleware,
+middleware groups, audit areas, rate limits, documentation tags,
+request/response/validation-error documentation, MFA pending-token allowance,
+and endpoint helper export toggles such as `scope.client_export(false)` /
+`scope.without_client_export()`. Scope-level responses are inherited by every
+child route, so use them only for shared responses such as a common validation
+envelope or an intentionally uniform route group response.
 
 ### API Versioning
 
@@ -307,13 +329,25 @@ enum Route {
     PostsCreate,
 }
 
-r.route_named(Route::PostsList, "/posts", get(list_posts));
-r.route_named(Route::PostsShow, "/posts/:id", get(show_post));
-r.route_named(Route::PasswordReset, "/reset/:token", get(reset_form));
+r.get(Route::PostsList, "/posts", list_posts, |_| {});
+r.get(Route::PostsShow, "/posts/:id", show_post, |_| {});
+r.get(Route::PasswordReset, "/reset/:token", reset_form, |_| {});
 
 // Named + options
-r.route_named_with_options(Route::PostsCreate, "/posts", post(create_post),
-    HttpRouteOptions::new().guard(Guard::User));
+r.post(Route::PostsCreate, "/posts", create_post, |route| {
+    route.guard(Guard::User);
+});
+
+// Lower-level escape hatch when you need to pass a pre-built MethodRouter.
+// Add method docs if the route should generate a submittable frontend helper.
+r.route_named_with_options(
+    Route::PostsCreate,
+    "/posts",
+    post(create_post),
+    HttpRouteOptions::new()
+        .guard(Guard::User)
+        .document(RouteDoc::new().post()),
+);
 ```
 
 ### Resource Routes
@@ -369,10 +403,246 @@ api.get(adminRouteUrl(RouteIds.admin.users.show, { id: userId }));
 
 `RouteManifest.ts` is generated from registered named routes. It supports Axum
 `{id}` / `{*path}` params and legacy `:id` params, URL-encodes substituted
-values, and fails fast for duplicate route ids during export.
+values with the same RFC3986 path-param encoding as Rust `RouteRegistry::url`,
+including escaping `!'()*`, preserves `/` separators for catch-all `{*path}`
+params, and fails fast for duplicate route ids during export. Routes without
+path params use an exact empty params type in TypeScript, so accidental param
+objects are rejected and route options can be passed directly as the second
+argument. Extra Rust params that are not used by the path become query params,
+matching Laravel-style route helpers, and generated TypeScript route helpers use
+`RouteUrlOptions.query` for the same purpose. `createRouteUrlBuilder(...)`
+preserves builder-level query defaults and merges per-call query values over
+them, so shared filters or tenant hints stay attached unless the route call
+overrides them. Rust route URL generation rejects duplicate path parameter keys
+instead of letting one value silently replace another; repeated non-path query
+keys remain supported for repeated query strings such as `tag=rust&tag=dx`.
+`routeMatch(...)`, `routeMatches(...)`, and `routeMatchAny(...)`
+use the same generated path templates for frontend active-route checks and
+decoded path-param extraction, including base-path stripping through
+`RouteMatchOptions.basePath`. Legacy `:id` params are recognized only when the
+whole path segment starts with `:`, matching Rust route parsing, so literal text
+such as `v1:beta` stays literal in both generated URL builders and route
+matching. `routeNameOrNull(...)` safely normalizes runtime route strings into
+the generated `RouteName` union for menus, guards, and route audits that receive
+backend-owned route metadata.
+
+Generated endpoint helpers under `routes/` use the same path-param metadata:
+helpers for parameterized routes require params when the endpoint is created, for
+example `AdminUsersShow(api, { id: userId })`, and then reuse those params on
+`submitForm()` unless a submit call overrides them.
+
+OpenAPI output uses the same path-parameter source, but renders standard
+OpenAPI templates: `{*path}` and `:id` become `{path}` and `{id}` and each path
+parameter is emitted as a required `in: path` parameter. Catch-all params carry
+an `x-foundry-catch-all` marker for tooling that wants to preserve that
+framework-specific meaning. GET and HEAD routes with plain object-shaped request
+DTOs whose fields are scalar values or scalar arrays emit those DTO fields as
+`in: query` parameters instead of a request body, with array fields marked
+`style: form` and `explode: true` to document repeated query keys such as
+`tag=rust&tag=dx`, matching generated TypeScript helper submission behavior.
+Wrapper request schemas such as `Collection<T>`, nested object DTOs, and DTOs
+containing `UploadedFile` stay body/multipart requests. Operations with a
+typed request also include `x-foundry-request-transport` (`body` or `query`),
+and the generated `RouteManifest` exposes the same decision as
+`requestTransport`, so frontend tooling can tell whether a route helper submits
+its typed request as body or query params. Generated endpoint helpers use the
+same repeated-key route query encoder for query-transport DTOs that `routeUrl`
+uses for `RouteUrlOptions.query`, so custom clients receive a fully encoded URL
+instead of adapter-specific array params. Extra URL query values should use
+generated submit `query` options or `route.query`; query-transport helpers reject
+`options.request.params` so custom adapter params cannot override the typed DTO
+query payload. Body-bearing routes also expose `requestMediaType`
+(`application/json` or `multipart/form-data`), matching the OpenAPI request body
+content type, the `x-foundry-request-media-type` operation extension, and
+generated TypeScript submit defaults. Frontend schema explorers and client
+adapters can read these through generated helpers such as
+`routeRequestSchema()`, `routeRequestTransport()`, `routeRequestMediaType()`,
+`routeResponseSchemas()`, `routeResponseByStatus()`,
+`routeResponsesWithSchema()`, `routeResponsesWithMediaType()`, and
+`routeResponsesWithBody()`. Route-specific TypeScript modules also export
+static request metadata predicates such as `{RouteName}HasRequestSchema`,
+`{RouteName}HasRequestTransport`, `{RouteName}HasRequestMediaType`, and
+`{RouteName}HasRequestMetadata` for docs panels and custom clients that already
+import the generated route helper module.
+Direct `Vec<T>`, `BTreeSet<T>`, and `HashSet<T>` route roots are documented as
+arrays, while string-keyed `BTreeMap<String, T>` and `HashMap<String, T>` roots
+are documented as object maps.
+Direct `UploadedFile` and `Vec<UploadedFile>` request roots are documented as a
+multipart object with the same repeated `file` field used by generated endpoint
+helpers. Nullable direct file roots document that `file` field as optional.
+Named routes also default OpenAPI `operationId` to the route id so generated
+clients use stable names from the same route SSOT.
+Override it with `RouteDoc::operation_id(...)` or
+`HttpRouteOptions::operation_id(...)` only when client tooling needs a different
+method name. OpenAPI operations for named routes also include
+`x-foundry-route-id`, so docs, audits, and generated clients can still map an
+operation back to the canonical Foundry route id when `operationId` is
+overridden.
+Documented route methods must be one of Foundry's typed HTTP method set:
+`get`, `post`, `put`, `patch`, `delete`, `head`, or `options`. OpenAPI and
+TypeScript route manifest generation reject unsupported method strings instead
+of emitting invalid client contracts.
+OpenAPI generation rejects blank, padded, relative, or malformed route paths
+with empty parameter tokens such as `{}`, `{*}`, or `:`, duplicate normalized
+method/path docs, duplicate `operationId` values, and route ids that would
+collide in generated `RouteIds` after dotted camelCase normalization instead of
+letting later registrations overwrite earlier client contracts.
+Direct route-doc metadata must also keep `operationId`, `x-foundry-route-id`,
+`summary`, `description`, and tags non-empty and trimmed when present, with
+unique tags per route. Route ids must use non-empty dotted segments and cannot
+mix parent route ids with child route-id groups.
+It also rejects conflicting component schemas with the same `ApiSchema::schema_name()`;
+types that intentionally have different JSON shapes should expose distinct schema
+names. Component schema names must be non-empty and contain only ASCII letters,
+digits, dots, hyphens, or underscores, matching OpenAPI component-key
+requirements.
+Each route included in OpenAPI should document at least one response with
+`response::<T>(status)` or `validation_errors()`. Each route should document at
+most one response schema per status; duplicate response statuses are rejected
+instead of allowing OpenAPI or TypeScript status maps to overwrite one contract
+with another. Documented response statuses must also be valid HTTP status codes
+in the `100` through `599` range. Client-exported endpoint helpers additionally
+need at least one documented `2xx` response, such as `response::<()>(204)` for a
+bodyless success route; otherwise disable client export for that route.
+Use `make:response` for new backend-owned response DTOs; it scaffolds
+`serde::Serialize`, `foundry::ts_rs::TS`, and `ApiSchema` so the DTO can be used
+directly in `route.response::<T>(status)`, generated TypeScript, and OpenAPI.
+
+Guarded routes also emit Foundry auth metadata under `x-foundry-auth`, including
+whether auth is required, the selected guard and permissions,
+`allowsMfaPendingToken`, and `hasAuthorizeCallback`. Use this extension for
+generated clients, docs, or test tooling that needs to understand Foundry route
+auth without maintaining a second copy of those rules. OpenAPI generation rejects
+blank, padded, or duplicate guard/permission metadata and rejects guard,
+permission, or authorize-callback metadata when auth is not required, matching
+the generated route manifest contract.
+Routes with policy metadata also emit `x-foundry-route-policy`, including the
+resolved `middlewareGroup`, resolved `auditArea`, and route-level `rateLimits`
+rows with `maxRequests`, `windowSeconds`, and `by`. Backend-only rate-limit key
+prefixes are not exported. OpenAPI generation rejects blank or padded
+`middlewareGroup` / `auditArea` values, route policy limiter rows with zero
+max/window values or `windowSeconds` values above JavaScript's safe integer
+range, unknown `by` values, and actor-only limiter rows on routes that do not
+require authentication, matching the generated route manifest contract.
+Guarded routes with a typed request or response contract also include
+framework-owned `401` and `403` `ErrorResponse` entries in the generated route
+manifest, and guarded OpenAPI operations document the same responses
+automatically.
+The generated TypeScript `RouteManifest` exposes the same auth-required signal as
+`requiresAuth`, including dynamic `authorize(...)` routes that do not name a
+guard or permission, and `hasAuthorizeCallback` for routes with dynamic backend
+authorization callbacks. It also exports `RouteManifestEntry` and
+`RouteManifestResponse`, plus `RouteHttpMethod`, `RouteHttpMethods`,
+`RouteRequestTransports`, `RouteRequestMediaTypes`, `RouteResponseMediaTypes`,
+and the matching `isRoute...(...)` / `route...OrNull(...)` helpers for route
+method, request transport, request media type, and response media type strings.
+Frontend route guards, menus, and route-audit tools can use generated selectors
+such as `routeManifestEntry()`, `routeEntries()`, `routeNames()`, `routePath()`,
+`routeMethod()`, `routeParamNames()`, `routeGuard()`, `routeMiddlewareGroup()`,
+`routeHasAuthorizeCallback()`, `routeHasAuthorizeCallbackOrNull()`,
+`routesRequiringAuth()`, `routeNamesRequiringAuth()`, `publicRoutes()`,
+`routeHasAuthRequiredRoutes()`, `routesWithAuthorizeCallback()`,
+`routesWithoutAuthorizeCallback()`, `firstAuthRequiredRoute()`,
+`firstAuthRequiredRouteOrNull()`, `publicRouteNames()`,
+`routeHasPublicRoutes()`, `firstPublicRoute()`, `firstPublicRouteOrNull()`,
+`clientExportedRoutes()`, `clientExportedRouteNames()`,
+`routeHasClientExportedRoutes()`, `firstClientExportedRoute()`,
+`firstClientExportedRouteOrNull()`,
+`routesByMethod()`, `routeNamesByMethod()`, `routesWithGuard()`,
+`routeNamesWithGuard()`, `routesWithMiddlewareGroup()`,
+`routeNamesWithMiddlewareGroup()`, `routesWithPermission()`,
+`routeNamesWithPermission()`, `routesWithTag()`, and `routeNamesWithTag()`
+instead of hand-scanning the manifest object. Route docs and deprecation
+tooling can also use `routeOperationId()`, `routeSummary()`,
+`routeDescription()`, `routeIsDeprecated()`, `deprecatedRoutes()`,
+`deprecatedRouteNames()`, `routeHasDeprecatedRoutes()`,
+`firstDeprecatedRoute()`, `firstDeprecatedRouteOrNull()`,
+`routesWithOperationId()`, and
+`routeNamesWithOperationId()`, plus document/guard group summaries such as
+`routeCountWithDocumentMetadata()`, `routeHasRoutesWithGuard(...)`,
+`firstRouteWithoutGuard()`, `routeHasRoutesWithMiddlewareGroup(...)`,
+`firstRouteNameWithPermission(...)`, and `routeHasRoutesWithTag(...)` from the
+same generated manifest. Schema-aware
+tooling can filter with `routesWithRequestSchema()`,
+`routeNamesWithRequestSchema()`, `routesWithRequestTransport()`,
+`routesWithRequestMediaType()`, `routesWithResponseSchema()`,
+request group summaries such as `routeCountWithRequestSchema(...)`,
+`routeHasRoutesWithRequestTransport(...)`,
+`firstRouteWithRequestMediaType(...)`, `routesWithResponseStatus()`,
+`routeNamesWithResponseStatus()`, and response
+group summaries such as `routeCountWithResponseStatus(...)`,
+`routeHasRoutesWithResponseSchema(...)`, `firstRouteWithResponseBody(...)`, and
+`firstRouteNameWithResponses()`. Generic route detail screens can also filter
+one route's backend-owned response rows with `routeResponsesWithSchema()`,
+`routeResponsesWithMediaType()`, `routeResponsesWithBody()`, and their count,
+presence, first-response, and route-local `OrNull` first-response variants
+instead of local `routeResponses(name).filter(...)` or `... ?? null` wrappers.
+Core route group `OrNull` first selectors such as
+`firstRouteByMethodOrNull(...)`, `firstRouteWithParamsOrNull()`,
+`firstAuthRequiredRouteOrNull()`, `firstPublicRouteOrNull()`, and
+`firstDeprecatedRouteOrNull()` provide the same nullable contract for first
+matches from backend-owned route groups.
+Document metadata route group `OrNull` selectors such as
+`firstRouteWithDocumentMetadataOrNull()`, `firstRouteWithOperationIdOrNull(...)`,
+`firstRouteWithSummaryOrNull()`, and `firstRouteWithDescriptionOrNull()` give
+route docs and OpenAPI audits the same null-for-missing contract.
+Guard, permission, tag, and named-param route group `OrNull` selectors such as
+`firstRouteWithGuardOrNull(...)`, `firstRouteWithPermissionOrNull(...)`,
+`firstRouteWithParamOrNull(...)`, and `firstRouteWithTagOrNull(...)` keep
+navigation and policy tooling on the same generated nullable contract.
+Request and response route group `OrNull` selectors such as
+`firstRouteWithRequestSchemaOrNull(...)`,
+`firstRouteWithRequestTransportOrNull(...)`,
+`firstRouteWithResponseSchemaOrNull(...)`, and
+`firstRouteWithResponseStatusOrNull(...)` give schema explorers and generated
+client dashboards the same null-for-missing contract.
+Each `RouteManifestResponse` includes `hasBody` and `mediaType`, using the same
+no-content status and `Unit` response rule that OpenAPI uses when deciding
+whether to emit response content; OpenAPI response objects expose the same
+decision through `x-foundry-response-has-body` and
+`x-foundry-response-media-type`. `UploadedFile`, `Vec<UploadedFile>`, and
+nullable `Option<_>` wrappers around those response roots use
+`application/octet-stream` media metadata. Directly constructed route manifest
+entries must use non-empty,
+trimmed request and response schema names whose plain atoms contain only ASCII
+letters, digits, dots, hyphens, or underscores. Generic schema expressions must
+use Foundry's supported wrappers (`Array<T>`, `Map<T>`, `Nullable<T>`,
+`PaginatedResponse<T>`, `CursorPaginated<T>`, or `Collection<T>`) with a
+non-empty inner schema. Direct entries must also use a non-empty trimmed `path`
+that starts with `/`, and a `params` list that exactly matches the params
+declared by `path`. Guard or permission metadata requires `requires_auth: true`,
+and authorize callback metadata also requires `requires_auth: true`. Middleware
+group and audit area metadata must be non-empty and trimmed when present.
+Guard ids, permission ids, `operationId`, `summary`, `description`, and route
+tags must also be non-empty and trimmed when present. Direct permissions and
+tags must be unique per route, and `operationId` values must be unique across
+the generated manifest to match OpenAPI. Route ids must use non-empty dotted
+segments and avoid camelCase-normalized segment collisions so `RouteIds` and
+OpenAPI `x-foundry-route-id` metadata stay aligned.
+Request transport/media metadata must match the backend-collected shape: only
+routes with request schemas carry request transport metadata, query requests
+leave `requestMediaType` empty, and body requests include it. Direct
+`RouteManifestResponse` values must keep `has_body` and `media_type` aligned
+with Foundry's status/schema response metadata rules.
+OpenAPI-style route docs metadata (`operationId`, `description`, `tags`, and
+`deprecated`) is included alongside `summary`, so frontend route guards and
+navigation builders can be typed against the generated route metadata instead
+of maintaining their own manifest interfaces. Text metadata is trimmed before
+export, blank values are ignored, and repeated route tags are kept in first-seen
+order and emitted once in both OpenAPI and the generated route manifest when
+routes are collected through Foundry's registrar.
+Generated endpoint helpers require that method metadata when submitting; prefer
+the typed registrar or scoped helpers such as `routes.get(...)` /
+`routes.post(...)`, or provide a documented method on generic
+`route_named(...)` registrations before exporting a submittable frontend helper.
+URL-only named routes still export through `RouteManifest` and `RouteIds`, but
+they do not generate per-route endpoint helper files until the backend documents
+a request or response schema.
 
 This does not replace request validation. Handlers should keep accepting trusted
 input through Foundry extractors such as `JsonValidated<T>` and `Validated<T>`.
+Routes using those extractors can document the standard backend-owned `422`
+validation envelope with `validation_errors()`.
 
 ### Signed URLs
 
@@ -397,8 +667,11 @@ async fn reset_form(State(app): State<AppContext>, request: Request) -> Result<i
 }
 ```
 
-Signed URL verification rejects duplicate `expires` or `signature` parameters and rejects query
-parameters appended after `signature`, so only the originally signed URL shape is accepted.
+Signed URL generation reserves extra query parameters named `expires` or
+`signature`, because Foundry appends and signs those values internally. Signed
+URL verification rejects duplicate `expires` or `signature` parameters and
+rejects query parameters appended after `signature`, so only the originally
+signed URL shape is accepted.
 `app.signing_key` must be a base64 key that decodes to at least 32 bytes. Generate one with
 `key:generate`; `doctor --deploy` reports missing keys as warnings and invalid or weak configured
 keys as failures.
@@ -482,6 +755,13 @@ Compatibility defaults keep hard caps, CORS, and CSRF opt-in. Trusted proxy is e
 for Cloudflare CIDRs only, rate limiting is enabled by default with `actor_or_ip`, and security
 headers are enabled by default with HSTS off, so local HTTP and first deploys stay usable while
 still publishing the production hardening knobs.
+Runtime manifest export preserves the documented `0` sentinels for disabled
+global body-size caps and request timeouts. It also normalizes backend-effective
+security header fallbacks, CSRF header names, and CSRF SameSite values, and
+rejects invalid CSRF cookie/header settings, impossible wildcard-origin CORS
+credentials, duplicate CORS allow-list entries, enabled global rate-limit zero
+values, global `by = "actor"` rate limits, and numbers above JavaScript's safe
+integer range before frontend HTTP helpers are generated.
 
 ### Execution Order
 
@@ -587,12 +867,11 @@ and `/api/...`, but does not skip `/apiary`.
 **Frontend integration:**
 
 ```javascript
-const token = document.cookie.split('; ')
-    .find(row => row.startsWith('foundry_csrf='))?.split('=')[1];
+import { httpCsrfHeaders } from "@shared/types/generated";
 
 fetch('/form', {
     method: 'POST',
-    headers: { 'X-CSRF-Token': token },
+    headers: httpCsrfHeaders(document.cookie),
     body: formData,
 });
 ```
@@ -604,6 +883,18 @@ async fn form(CsrfToken(token): CsrfToken) -> impl IntoResponse {
     Html(format!(r#"<input type="hidden" name="_token" value="{token}">"#))
 }
 ```
+
+SPAs that expose a token helper endpoint can return the backend-owned
+`CsrfTokenResponse` payload, which generated TypeScript exports as `{ token }`.
+`types:export` also emits `HttpManifest.ts` with the configured CSRF cookie and
+header names plus `httpCsrfCookieName()`, `httpCsrfHeaderName()`,
+`httpCsrfCookieSecure()`, `httpCsrfCookiePath()`,
+`httpCsrfCookieSameSite()`, `httpCsrfTokenFromCookie()`, and
+`httpCsrfHeaders()`, so browser clients do not need to copy those constants,
+cookie attributes, or cookie parsing from TOML.
+The same generated file exposes safe CORS/security-header selectors such as
+`httpCorsAllowedMethods()`, `httpCorsAllowedHeaders()`, and
+`httpSecurityHeadersEnabled()` for client diagnostics and admin tooling.
 
 ### Rate Limiting
 
@@ -638,6 +929,24 @@ Foundry returns a JSON error body:
 ```json
 { "message": "Rate limit exceeded", "status": 429 }
 ```
+
+Config-derived body-limit, timeout, CSRF, maintenance-mode, and rate-limit
+rejections use the standard generated `ErrorResponse` contract.
+Generated `HttpManifest.ts` includes the global rate-limit shape through
+`HttpManifest.rateLimit`, `HttpRateLimitMaxRequests`,
+`HttpRateLimitWindowSeconds`, `httpRateLimitEnabled()`,
+`httpRateLimitMaxRequests()`, `httpRateLimitWindowSeconds()`, and
+`httpRateLimitBy()`. Runtime mode strings can be normalized with
+`httpRateLimitByOrNull()` while keeping backend-only key prefixes out of the
+frontend bundle.
+Generated `RouteManifest.ts` also exposes effective route-level limiter policy
+through `rateLimits`, with helpers such as `routeRateLimits(name)`,
+`routeHasRateLimitBy(name, "actor")`, `routesWithRateLimits()`,
+`routesWithoutRateLimits()`, and `routesWithRateLimitBy("actor_or_ip")`.
+Route manifests include max requests, window seconds, and key strategy; key
+prefixes stay backend-only. Route-level limiter windows must be positive and fit
+within JavaScript's safe integer range before OpenAPI or frontend route helpers
+are generated, and actor-only limiter metadata must stay on authenticated routes.
 
 Actor-only limits run only after an authenticated actor exists, so use route-level rate limits for
 strict per-actor limits. `actor_or_ip` uses the actor once authenticated and the client IP
@@ -880,10 +1189,10 @@ async fn show_user(State(app): State<AppContext>, Path(id): Path<String>) -> imp
 }
 
 // Paginated response with meta + links
-async fn paginated_users(State(app): State<AppContext>, Query(page): Query<Pagination>) -> impl IntoResponse {
+async fn paginated_users(State(app): State<AppContext>, pagination: Pagination) -> impl IntoResponse {
     let db = app.database()?;
     let paginated = User::model_query()
-        .paginate(page, &*db).await?;
+        .paginate(&*db, pagination).await?;
     Json(UserResource::paginated(&paginated, "/api/v1/users"))
 }
 ```
@@ -931,19 +1240,19 @@ fn routes(r: &mut HttpRegistrar) -> Result<()> {
 
     // API v1
     r.api_version(1, |r| {
-        r.route_named(Route::PostsList, "/posts", get(list_posts));
+        r.get(Route::PostsList, "/posts", list_posts, |_| {});
 
-        r.route_named_with_options(Route::PostsCreate, "/posts", post(create_post),
-            HttpRouteOptions::new()
-                .guard(Guard::User)
-                .permission(Permission::PostsWrite)
-                .middleware_group("api")
-                .rate_limit(RateLimit::new(30).per_minute().by_actor()));
+        r.post(Route::PostsCreate, "/posts", create_post, |route| {
+            route.guard(Guard::User);
+            route.permission(Permission::PostsWrite);
+            route.middleware_group("api");
+            route.rate_limit(RateLimit::new(30).per_minute().by_actor());
+        });
 
-        r.route_named_with_options(Route::PostsShow, "/posts/:id", get(show_post),
-            HttpRouteOptions::new()
-                .guard(Guard::User)
-                .middleware_group("api"));
+        r.get(Route::PostsShow, "/posts/:id", show_post, |route| {
+            route.guard(Guard::User);
+            route.middleware_group("api");
+        });
 
         Ok(())
     })?;

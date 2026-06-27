@@ -1,0 +1,5 @@
+error: unsupported validate struct attribute; expected messages(...), attributes(...), or after(...)
+ --> tests/ui/derive/fail_unknown_api_schema_struct_validate_attribute.rs:4:12
+  |
+4 | #[validate(afetr(validate_payload))]
+  |            ^^^^^

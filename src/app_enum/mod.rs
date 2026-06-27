@@ -126,6 +126,12 @@ mod tests {
     }
 
     #[test]
+    fn string_backed_from_str_uses_parse_key() {
+        assert_eq!("pending".parse::<OrderStatus>(), Ok(OrderStatus::Pending));
+        assert!("unknown".parse::<OrderStatus>().is_err());
+    }
+
+    #[test]
     fn string_backed_keys_returns_all() {
         let keys = OrderStatus::keys();
         assert_eq!(keys.len(), 3);
@@ -236,6 +242,12 @@ mod tests {
     #[test]
     fn int_backed_parse_key_invalid() {
         assert_eq!(UserStatus::parse_key("99"), None);
+    }
+
+    #[test]
+    fn int_backed_from_str_uses_parse_key() {
+        assert_eq!("1".parse::<UserStatus>(), Ok(UserStatus::Verified));
+        assert!("99".parse::<UserStatus>().is_err());
     }
 
     #[test]
@@ -422,6 +434,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aliases_are_exported_in_options_metadata() {
+        let options = AliasedEnum::options();
+        let opts: Vec<_> = options.into_iter().collect();
+
+        assert_eq!(opts[0].value, EnumKey::String("pending".into()));
+        assert_eq!(opts[0].aliases, vec!["awaiting", "queued"]);
+        assert!(opts[1].aliases.is_empty());
+    }
+
+    #[test]
+    fn accepted_keys_include_aliases() {
+        assert_eq!(
+            AliasedEnum::accepted_keys().into_vec(),
+            vec!["pending", "awaiting", "queued", "active"]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Validation tests
     // -----------------------------------------------------------------------
@@ -432,6 +462,18 @@ mod tests {
         let mut v = Validator::new(app);
         v.field("status", "pending")
             .app_enum::<OrderStatus>()
+            .apply()
+            .await
+            .unwrap();
+        assert!(v.finish().is_ok());
+    }
+
+    #[tokio::test]
+    async fn validation_accepts_alias_key() {
+        let app = test_app();
+        let mut v = Validator::new(app);
+        v.field("status", "awaiting")
+            .app_enum::<AliasedEnum>()
             .apply()
             .await
             .unwrap();

@@ -469,9 +469,11 @@ async fn make_migration_generates_a_rust_file_and_refuses_overwrite_without_forc
         .unwrap()
         .to_string_lossy()
         .ends_with("_create_widgets.rs"));
-    assert!(fs::read_to_string(&generated[0])
-        .unwrap()
-        .contains("impl MigrationFile for Entry"));
+    let generated_migration = fs::read_to_string(&generated[0]).unwrap();
+    assert!(generated_migration.contains("impl MigrationFile for Entry"));
+    assert!(generated_migration.contains("#[foundry::async_trait]"));
+    assert!(!generated_migration.contains("use async_trait::async_trait"));
+    assert!(generated_migration.contains("ctx.raw_execute"));
 
     let error = run_cli(
         App::builder().load_config_dir(dir.path()),
@@ -517,6 +519,8 @@ async fn make_seeder_generates_a_rust_file_and_refuses_overwrite_without_force()
     );
     let generated_seeder = fs::read_to_string(&generated[0]).unwrap();
     assert!(generated_seeder.contains("impl SeederFile for Entry"));
+    assert!(generated_seeder.contains("#[foundry::async_trait]"));
+    assert!(!generated_seeder.contains("use async_trait::async_trait"));
     assert!(generated_seeder.contains("Query::insert_into"));
     assert!(generated_seeder.contains("Sql::uuid_v7()"));
 
@@ -537,10 +541,28 @@ async fn make_seeder_generates_a_rust_file_and_refuses_overwrite_without_force()
 #[tokio::test]
 async fn make_app_scaffolds_can_target_custom_output_paths() {
     let dir = tempfile::tempdir().unwrap();
+    let ids_dir = dir.path().join("src/domain");
     let model_dir = dir.path().join("src/domain/models");
+    let request_dir = dir.path().join("src/http/requests");
+    let response_dir = dir.path().join("src/http/responses");
+    let guard_dir = dir.path().join("src/domain/guards");
+    let policy_dir = dir.path().join("src/domain/policies");
     let job_dir = dir.path().join("src/domain/jobs");
+    let event_dir = dir.path().join("src/domain/events");
+    let notification_dir = dir.path().join("src/domain/notifications");
     let command_dir = dir.path().join("src/commands");
 
+    run_cli(
+        App::builder(),
+        vec![
+            "foundry".into(),
+            "make:ids".into(),
+            "--path".into(),
+            ids_dir.display().to_string(),
+        ],
+    )
+    .await
+    .unwrap();
     run_cli(
         App::builder(),
         vec![
@@ -550,6 +572,58 @@ async fn make_app_scaffolds_can_target_custom_output_paths() {
             "AuditEvent".into(),
             "--path".into(),
             model_dir.display().to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    run_cli(
+        App::builder(),
+        vec![
+            "foundry".into(),
+            "make:guard".into(),
+            "--name".into(),
+            "ApiGuard".into(),
+            "--path".into(),
+            guard_dir.display().to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    run_cli(
+        App::builder(),
+        vec![
+            "foundry".into(),
+            "make:policy".into(),
+            "--name".into(),
+            "CanEditPost".into(),
+            "--path".into(),
+            policy_dir.display().to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    run_cli(
+        App::builder(),
+        vec![
+            "foundry".into(),
+            "make:request".into(),
+            "--name".into(),
+            "StorePostRequest".into(),
+            "--path".into(),
+            request_dir.display().to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    run_cli(
+        App::builder(),
+        vec![
+            "foundry".into(),
+            "make:response".into(),
+            "--name".into(),
+            "PostResponse".into(),
+            "--path".into(),
+            response_dir.display().to_string(),
         ],
     )
     .await
@@ -571,6 +645,32 @@ async fn make_app_scaffolds_can_target_custom_output_paths() {
         App::builder(),
         vec![
             "foundry".into(),
+            "make:event".into(),
+            "--name".into(),
+            "OrderPlaced".into(),
+            "--path".into(),
+            event_dir.display().to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    run_cli(
+        App::builder(),
+        vec![
+            "foundry".into(),
+            "make:notification".into(),
+            "--name".into(),
+            "OrderShipped".into(),
+            "--path".into(),
+            notification_dir.display().to_string(),
+        ],
+    )
+    .await
+    .unwrap();
+    run_cli(
+        App::builder(),
+        vec![
+            "foundry".into(),
             "make:command".into(),
             "--name".into(),
             "SyncInventory".into(),
@@ -581,15 +681,102 @@ async fn make_app_scaffolds_can_target_custom_output_paths() {
     .await
     .unwrap();
 
+    let ids = fs::read_to_string(ids_dir.join("ids.rs")).unwrap();
+    assert!(ids.contains("#[derive(Clone, Copy, FoundryId)]"));
+    assert!(ids.contains("#[foundry(id = GuardId, rename_all = \"snake_case\")]"));
+    assert!(ids.contains("pub enum AuthGuard"));
+    assert!(ids.contains("#[derive(Clone, Copy, Debug, PartialEq, Eq, AppEnum)]"));
+    assert!(ids.contains("#[foundry(id = \"ability\", id_type = PermissionId)]"));
+    assert!(ids.contains("#[foundry(key = \"dashboard:view\")]"));
+    assert!(ids.contains("pub enum Ability"));
+    assert!(ids.contains("#[foundry(id = RouteId)]"));
+    assert!(ids.contains("pub enum Route"));
+    assert!(!ids.contains("impl From<"));
+    assert!(!ids.contains("TODO"));
+
     let model = fs::read_to_string(model_dir.join("audit_event.rs")).unwrap();
     assert!(model.contains("pub struct AuditEvent"));
+    assert!(model.contains("foundry::ts_rs::TS"));
+    assert!(model.contains("foundry::ApiSchema"));
+    assert!(!model.contains("   Clone,"));
+
+    let request = fs::read_to_string(request_dir.join("store_post_request.rs")).unwrap();
+    assert!(request.contains("pub struct StorePostRequest"));
+    assert!(request.contains("serde::Deserialize"));
+    assert!(request.contains("foundry::ts_rs::TS"));
+    assert!(request.contains("foundry::ApiSchema"));
+    assert!(request.contains("foundry::Validate"));
+    assert!(request.contains("#[validate(required)]"));
+    assert!(!request.contains("use foundry::prelude::*"));
+    assert!(!request.contains("TODO"));
+
+    let response = fs::read_to_string(response_dir.join("post_response.rs")).unwrap();
+    assert!(response.contains("pub struct PostResponse"));
+    assert!(response.contains("serde::Serialize"));
+    assert!(response.contains("foundry::ts_rs::TS"));
+    assert!(response.contains("foundry::ApiSchema"));
+    assert!(response.contains("pub message: String"));
+    assert!(!response.contains("use foundry::prelude::*"));
+    assert!(!response.contains("TODO"));
+
+    let guard = fs::read_to_string(guard_dir.join("api_guard.rs")).unwrap();
+    assert!(guard.contains("pub const API_GUARD"));
+    assert!(guard.contains("GuardId::new(\"api\")"));
+    assert!(guard.contains("pub struct ApiGuard;"));
+    assert!(guard.contains("registrar.register_guard(API_GUARD, ApiGuard)"));
+    assert!(guard.contains("#[foundry::async_trait]"));
+    assert!(guard.contains("impl BearerAuthenticator for ApiGuard"));
+    assert!(guard.contains("Ok(None)"));
+    assert!(!guard.contains("use async_trait::async_trait"));
+    assert!(!guard.contains("TODO"));
+
+    let policy = fs::read_to_string(policy_dir.join("can_edit_post.rs")).unwrap();
+    assert!(policy.contains("pub const CAN_EDIT_POST_POLICY"));
+    assert!(policy.contains("PolicyId::new(\"can_edit_post\")"));
+    assert!(policy.contains("pub struct CanEditPost;"));
+    assert!(policy.contains("registrar.register_policy(CAN_EDIT_POST_POLICY, CanEditPost)"));
+    assert!(policy.contains("#[foundry::async_trait]"));
+    assert!(policy.contains("impl Policy for CanEditPost"));
+    assert!(!policy.contains("use async_trait::async_trait"));
+    assert!(!policy.contains("TODO"));
 
     let job = fs::read_to_string(job_dir.join("send_welcome_email.rs")).unwrap();
     assert!(job.contains("pub struct SendWelcomeEmail;"));
+    assert!(job.contains("serde::Serialize"));
+    assert!(job.contains("foundry::ts_rs::TS"));
+    assert!(job.contains("foundry::TS"));
+    assert!(job.contains("#[foundry::async_trait]"));
+    assert!(!job.contains("use async_trait::async_trait"));
     assert!(!job.contains("TODO"));
+
+    let event = fs::read_to_string(event_dir.join("order_placed.rs")).unwrap();
+    assert!(event.contains("pub const ORDER_PLACED_EVENT"));
+    assert!(event.contains("EventId::new(\"order.placed\")"));
+    assert!(event.contains("pub struct OrderPlaced {}"));
+    assert!(event.contains("foundry::ts_rs::TS"));
+    assert!(event.contains("foundry::TS"));
+    assert!(event.contains("foundry::ApiSchema"));
+    assert!(event.contains("TsEventPayload::new(ORDER_PLACED_EVENT, \"OrderPlaced\")"));
+    assert!(!event.contains("TODO"));
+
+    let notification = fs::read_to_string(notification_dir.join("order_shipped.rs")).unwrap();
+    assert!(notification.contains("pub const ORDER_SHIPPED_NOTIFICATION_TYPE"));
+    assert!(notification.contains("\"order.shipped\""));
+    assert!(notification.contains("pub struct OrderShipped {}"));
+    assert!(notification.contains("foundry::ts_rs::TS"));
+    assert!(notification.contains("foundry::TS"));
+    assert!(notification.contains("foundry::ApiSchema"));
+    assert!(notification.contains("impl Notification for OrderShipped"));
+    assert!(notification.contains("vec![NOTIFY_DATABASE, NOTIFY_BROADCAST]"));
+    assert!(notification.contains("foundry::serde_json::to_value(self).ok()"));
+    assert!(notification.contains("notification_type: ORDER_SHIPPED_NOTIFICATION_TYPE"));
+    assert!(notification.contains("payload: \"OrderShipped\""));
+    assert!(!notification.contains("TODO"));
 
     let command = fs::read_to_string(command_dir.join("sync_inventory.rs")).unwrap();
     assert!(command.contains("pub const SYNC_INVENTORY_COMMAND"));
+    assert!(command.contains("Command::new(\"sync_inventory\")"));
+    assert!(!command.contains("clap::Command"));
     assert!(!command.contains("TODO"));
 }
 

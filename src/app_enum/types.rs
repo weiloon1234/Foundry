@@ -33,6 +33,7 @@ pub enum EnumKeyKind {
 pub struct EnumOption {
     pub value: EnumKey,
     pub label_key: String,
+    pub aliases: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,10 +72,12 @@ mod tests {
                 EnumOption {
                     value: EnumKey::String("pending".into()),
                     label_key: "enum.status.pending".into(),
+                    aliases: vec!["queued".into()],
                 },
                 EnumOption {
                     value: EnumKey::String("active".into()),
                     label_key: "enum.status.active".into(),
+                    aliases: Vec::new(),
                 },
             ]),
         };

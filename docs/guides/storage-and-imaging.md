@@ -46,6 +46,10 @@ root = "storage/app"
 url = "/storage"                    # public URL prefix
 visibility = "private"              # "public" or "private"
 
+[storage.disks.memory]
+driver = "memory"
+visibility = "private"              # ephemeral in-memory disk for tests/fakes
+
 [storage.disks.s3]
 driver = "s3"
 bucket = "my-bucket"
@@ -57,6 +61,8 @@ secret = "..."
 # use_path_style = false
 visibility = "public"
 ```
+
+The built-in `memory` driver stores objects in process memory and supports the same `put` / `get` / `delete` / `copy` / `move_to` / `list_prefix` operations as other disks. It is intended for tests, local fakes, and ephemeral workflows. It does not generate public or temporary URLs.
 
 Upload caps are storage-level guardrails for `UploadedFile`, `MultipartForm`, and derive-generated multipart DTOs. Route-level validators and file rules still own product-specific limits such as avatar size, gallery count, and allowed MIME types.
 
@@ -138,10 +144,38 @@ for file in files {
 ### StoredFile Result
 
 Every store operation returns a `StoredFile`:
+`types:export` emits `StoredFile` and `StorageObject` automatically, so upload endpoints and storage browser screens can import backend-owned response shapes instead of maintaining local TypeScript interfaces.
+It also emits `StorageManifest.ts` with configured logical disk names, driver
+keys, visibility, the default disk flag, and `StorageRuntimeManifest` upload /
+image limits from `[storage]`, without exposing local roots, buckets,
+endpoints, or credentials. Frontend storage browsers and upload forms can
+import `StorageDiskIds`, `DefaultStorageDisk`, `ConfiguredDefaultStorageDisk`,
+`isStorageDiskName()`, `isStorageDiskDriverName()`, `isStorageDiskVisibility()`,
+`storageDiskNameOrNull()`, `storageDiskDriverNameOrNull()`,
+`storageDiskVisibilityOrNull()`, `storageDiskNames()`, `storageDisks()`, `storageDefaultDiskName()`,
+`storageConfiguredDefaultDiskName()`, `storageDefaultDiskManifestEntry()`,
+`storageDiskDriverNames()`,
+`storageDiskNamesByDriver()`, `storageDisksByDriver()`,
+`storageDiskVisibilityNames()`,
+`storageDiskNamesByVisibility()`, `storagePublicDiskNames()`,
+`storagePublicDisks()`, `storagePrivateDiskNames()`, `storagePrivateDisks()`,
+`storageMaxUploadSizeBytes()`, `storageMaxUploadFileSizeBytes()`,
+`storageMaxUploadFiles()`, `storageUploadLimits()`, `storageImageLimits()`, and
+`storageDiskVisibility()` instead of duplicating storage config, disk visibility
+filters, default disk lookups, driver filters, or upload caps. Generated storage
+constants are frozen at runtime, while storage selector helpers return cloned
+disk entries and runtime limit objects for local upload/browser annotations.
+Runtime manifest export requires a non-empty trimmed configured default disk,
+matching default disk metadata when disk descriptors are present, upload caps
+that stay within JavaScript's safe integer range, a per-file upload cap no
+larger than the total cap when both are enabled, positive prune intervals when
+temp/orphan maintenance is enabled, and a safe relative `attachment_orphan_prefix`.
+Documented `0` sentinels for upload caps, temp retention, and image decode caps
+remain valid.
 
 ```rust
 pub struct StoredFile {
-    pub disk: String,              // "local" or "s3"
+    pub disk: String,              // configured disk name
     pub path: String,              // "avatars/uuid.jpg"
     pub name: String,              // "uuid.jpg"
     pub size: u64,                 // bytes
@@ -363,6 +397,8 @@ registrar.register_storage_driver("gcs", Arc::new(|config, table| {
     })
 }));
 ```
+
+Built-in driver keys (`local`, `memory`, `s3`) are reserved for Foundry-owned adapters. Use a distinct custom driver key such as `gcs`, `r2`, or a company-prefixed name.
 
 Then configure:
 

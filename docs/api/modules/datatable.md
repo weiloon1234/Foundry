@@ -140,10 +140,14 @@ struct DatatableMapping
 ```rust
 struct DatatableAdapter
   fn new() -> Self
+struct DatatableDescriptor
+struct DatatableRelationFilterMeta
 struct DatatableRegistry
+  fn descriptors(&self) -> Result<Vec<DatatableDescriptor>>
   fn get(&self, id: &str) -> Option<Arc<dyn DynDatatable>>
   fn ids(&self) -> Vec<&str>
 trait DynDatatable
+  fn descriptor(&self) -> Result<DatatableDescriptor>
   fn id(&self) -> &str
   fn json<'life0, 'life1, 'life2, 'async_trait>(
   fn download<'life0, 'life1, 'life2, 'async_trait>(
@@ -178,6 +182,10 @@ struct DatatableRequest
   fn from_query_params(params: &HashMap<String, String>) -> Self
 struct DatatableSortInput
 ```
+
+`DatatableRequest` accepts structured JSON and legacy `sort` / `direction` query
+params plus `f-...` filter prefixes, normalizing them into structured
+sort/filter inputs through normal deserialization or `from_query_params()`.
 
 ## foundry::datatable::response
 
@@ -214,4 +222,4 @@ enum DatatableValue { Null, String, Number, Bool, Date, DateTime }
 
 - JSON responses clamp `DatatableRequest.per_page` to `datatable.max_per_page` unless the cap is `0`.
 - XLSX downloads and queued exports apply `datatable.max_export_rows` before loading rows into memory; `0` disables the cap.
-
+- `types:export` mirrors these caps into `DatatableRuntimeManifest`, plus `datatablePerPageCap()` and `datatableExportRowsCap()` helpers for frontend table builders.

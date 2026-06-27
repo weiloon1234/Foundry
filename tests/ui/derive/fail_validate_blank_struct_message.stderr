@@ -1,0 +1,5 @@
+error: validation message for field `email` rule `required` must not be blank
+ --> tests/ui/derive/fail_validate_blank_struct_message.rs:2:38
+  |
+2 | #[validate(messages(email(required = "  ")))]
+  |                                      ^^^^

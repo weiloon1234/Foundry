@@ -30,26 +30,58 @@ const AUTH_MFA_TOTP_FACTORS_TABLE: &str = "auth_mfa_totp_factors";
 #[cfg(feature = "webauthn")]
 pub mod webauthn {}
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EnrollChallenge {
+#[derive(
+    Clone, Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct MfaEnrollChallenge {
     pub secret: String,
     pub otpauth_url: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecoveryCodesResponse {
+pub use MfaEnrollChallenge as EnrollChallenge;
+
+#[derive(
+    Clone, Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
+pub struct MfaRecoveryCodesResponse {
     pub recovery_codes: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CodeRequest {
+pub use MfaRecoveryCodesResponse as RecoveryCodesResponse;
+
+#[derive(
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+    foundry_macros::Validate,
+)]
+pub struct MfaCodeRequest {
+    #[validate(required)]
     pub code: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecoveryCodesRequest {
+pub use MfaCodeRequest as CodeRequest;
+
+#[derive(
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+    foundry_macros::Validate,
+)]
+pub struct MfaRecoveryCodesRequest {
+    #[validate(required)]
     pub current_code: String,
 }
+
+pub use MfaRecoveryCodesRequest as RecoveryCodesRequest;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MfaEnrolledEvent {

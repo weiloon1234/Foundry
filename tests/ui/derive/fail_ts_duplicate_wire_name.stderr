@@ -1,0 +1,5 @@
+error: Foundry contract derive contains duplicate JSON field `email` from Rust fields `email_address` and `email`; use unique serde rename values or split the DTO
+ --> tests/ui/derive/fail_ts_duplicate_wire_name.rs:7:5
+  |
+7 |     email: String,
+  |     ^^^^^^^^^^^^^

@@ -7,6 +7,14 @@ Built-in audit logging with automatic model mutation tracking and redaction
 ## foundry::audit
 
 ```rust
+pub const AUDIT_EVENT_CREATED: &str;
+pub const AUDIT_EVENT_DELETED: &str;
+pub const AUDIT_EVENT_RESTORED: &str;
+pub const AUDIT_EVENT_SOFT_DELETED: &str;
+pub const AUDIT_EVENT_TYPES: &[&str];
+pub const AUDIT_EVENT_UPDATED: &str;
+pub const AUDIT_REDACTED_VALUE: &str;
+pub const AUDIT_SENSITIVE_FIELD_SEGMENTS: &[&str];
 struct AuditLog
   const ID: Column<Self, ModelId<AuditLog>>
   const EVENT_TYPE: Column<Self, String>
@@ -37,4 +45,4 @@ struct AuditLog
 - `#[foundry(audit_exclude)]` still removes a field entirely from audit payloads.
 - `audit.redact_sensitive_fields = true` masks common credential-like field names with `[redacted]` in before/after/changes JSON.
 - `audit.sensitive_fields` adds project-specific names; set `redact_sensitive_fields = false` to return to explicit model-only exclusions.
-
+- `types:export` emits `AuditManifest.ts` with canonical audit event types, the redacted marker, configured sensitive fields, sensitive-name segment heuristics, and generated helpers such as `auditFieldIsSensitive()`.

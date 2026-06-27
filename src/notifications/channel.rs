@@ -2,7 +2,9 @@ use async_trait::async_trait;
 
 use crate::foundation::{AppContext, Result};
 
-use super::{callback, store_database_notification, Notifiable, Notification};
+use super::{
+    broadcast_notification_message, callback, store_database_notification, Notifiable, Notification,
+};
 
 /// Adapter trait for notification delivery channels.
 ///
@@ -80,11 +82,11 @@ impl NotificationChannel for BroadcastNotificationChannel {
             return Ok(());
         };
         let ws = app.websocket()?;
-        let channel_id = crate::support::ChannelId::owned(format!(
-            "notifications:{}",
-            callback::notifiable_id(notifiable)?
-        ));
-        let event = crate::support::ChannelEventId::new("notification");
-        ws.publish(channel_id, event, None::<&str>, payload).await
+        let message = broadcast_notification_message(
+            callback::notifiable_id(notifiable)?,
+            callback::notification_type(notification)?,
+            payload,
+        );
+        ws.publish_message(message).await
     }
 }

@@ -1,6 +1,9 @@
 use crate::foundation::Result;
 
-use super::callback::{catch_datatable_callback, catch_datatable_future};
+use super::callback::{
+    catch_datatable_callback, catch_datatable_future, datatable_default_sort,
+    datatable_relation_filters,
+};
 use super::column::DatatableColumn;
 use super::context::DatatableContext;
 use super::datatable_trait::Datatable;
@@ -19,10 +22,7 @@ where
     D: Datatable + ?Sized,
 {
     let query = catch_datatable_callback(format!("`{}` query callback", D::ID), || D::query(ctx))?;
-    let relation_filters = catch_datatable_callback(
-        format!("`{}` relation_filters callback", D::ID),
-        D::relation_filters,
-    )?;
+    let relation_filters = datatable_relation_filters::<D>()?;
     let query = apply_auto_filters_with_relation_filters(
         query,
         &ctx.request.filters,
@@ -38,10 +38,7 @@ where
     .await?;
 
     if ctx.request.sort.is_empty() {
-        let default_sort = catch_datatable_callback(
-            format!("`{}` default_sort callback", D::ID),
-            D::default_sort,
-        )?;
+        let default_sort = datatable_default_sort::<D>()?;
         apply_default_sorts(query, &default_sort)
     } else {
         apply_sorts(query, &ctx.request.sort, columns)

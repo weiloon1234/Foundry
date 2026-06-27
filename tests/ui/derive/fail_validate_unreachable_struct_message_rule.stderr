@@ -1,0 +1,5 @@
+error: validation message for field `email` references rule `min` but no rule with that code is reachable from the field metadata
+ --> tests/ui/derive/fail_validate_unreachable_struct_message_rule.rs:2:27
+  |
+2 | #[validate(messages(email(min = "Email is too short.")))]
+  |                           ^^^

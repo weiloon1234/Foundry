@@ -8,24 +8,25 @@ Foundry provides dual-mode auth: **token-based** for APIs/mobile and **session-b
 
 ### Step 1: Define Your Guards
 
-Guards are named auth boundaries. Define them as an enum — the string in `GuardId::new()` links to your TOML config key:
+Guards are named auth boundaries. Define them as a `FoundryId` enum — the
+generated `GuardId` strings link to your TOML config keys:
 
 ```rust
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FoundryId)]
+#[foundry(id = GuardId, rename_all = "snake_case")]
 enum Guard {
     User,
     Admin,
 }
-
-impl From<Guard> for GuardId {
-    fn from(v: Guard) -> Self {
-        match v {
-            Guard::User => GuardId::new("user"),   // ← links to [auth.guards.user]
-            Guard::Admin => GuardId::new("admin"),  // ← links to [auth.guards.admin]
-        }
-    }
-}
 ```
+
+Use `make:ids` to generate a starter `ids.rs` module with typed guard,
+permission, and route IDs. Use `make:guard --name ApiGuard` to generate a
+backend-owned guard id constant, `register(...)` helper, and
+`BearerAuthenticator` implementation shell. The generated id removes a trailing
+`Guard` suffix, so `ApiGuard` registers `GuardId::new("api")`. It returns
+`Ok(None)` until you implement `authenticate(...)` and add the matching
+`[auth.guards.api]` config entry.
 
 ### Step 2: Configure the Auth Driver
 
@@ -175,6 +176,27 @@ impl ServiceProvider for AppServiceProvider {
 }
 ```
 
+Use `make:policy --name CanEditPost` to generate the policy id constant,
+`register(...)` helper, and `Policy` implementation shell from one backend-owned
+name. The generated policy denies by default until you implement
+`evaluate(...)`.
+
+`types:export` emits `AuthManifest.ts` from these guard, policy, and
+authenticatable registrations. Frontend auth-state code can import
+`AuthGuardIds`, `AuthPolicyIds`, `DefaultAuthGuard`, `authGuards()`,
+`authDefaultGuardName()`, `authConfiguredDefaultGuardName()`,
+`authDefaultGuardManifestEntry()`, `authGuardsByKind()`,
+`authAuthenticatableGuards()`, `authGuardKind()`, and
+`authGuardHasAuthenticatable()`. Runtime guard, policy, token-guard, and
+guard-kind strings can be normalized with `authGuardNameOrNull()`,
+`authPolicyNameOrNull()`, `authTokenGuardNameOrNull()`, and
+`authGuardKindOrNull()` instead of copying guard or policy names,
+default-guard lookups, or guard filters by hand. Regenerate frontend types after
+adding or renaming guards, policies, or authenticatable models.
+Generated auth selector helpers return cloned guard and policy metadata, so
+admin UIs can add local display state without mutating the backend-owned
+manifest.
+
 ### Step 6: Define Routes
 
 ```rust
@@ -221,6 +243,11 @@ async fn profile(Auth(user): Auth<User>) -> impl IntoResponse {
 Returns 401 if unauthenticated. Returns 404 if model not found in database.
 
 ### `CurrentActor` — Raw actor (when you don't need the model)
+
+`types:export` emits the `Actor` TypeScript type automatically for raw actor
+responses such as `/me` or auth-state endpoints. `roles`, `permissions`, and
+`claims` are optional in TypeScript because Actor deserialization accepts older
+payloads where those fields are omitted.
 
 ```rust
 async fn whoami(CurrentActor(actor): CurrentActor) -> impl IntoResponse {
@@ -440,7 +467,20 @@ Unauthorized and forbidden auth failures now return stable machine-friendly code
 }
 ```
 
-This keeps server responses consistent while giving clients a translation-friendly key for UI copy. The generic `Error` path now preserves both `error_code` and `message_key` for auth-originated failures too.
+This keeps server responses consistent while giving clients a translation-friendly key for UI copy.
+The generic `Error` path now preserves both `error_code` and `message_key` for
+auth-originated failures too.
+`AuthError::response_body()` returns the same backend-owned `ErrorResponse`
+contract for custom guards or WebSocket auth surfaces that need the typed body.
+`types:export` also emits `AuthErrorCode`, `AuthErrorCodeValues`,
+`AuthErrorCodeKeys`, `getAuthErrorCodeValues()`,
+`getAuthErrorCodeOptions()`, `getAuthErrorCodeMeta()`,
+`getAuthErrorCodeKeys()`, and `isAuthErrorCode()` so clients can safely
+narrow known auth failures while leaving app-specific
+`ErrorResponse.error_code` values as strings.
+Generated auth error-code values, options, metadata, and keys are frozen at
+runtime, while AppEnum selector helpers return fresh values for local display
+state.
 
 ---
 
@@ -511,10 +551,28 @@ sliding_expiry = true               # extend TTL on activity
 remember_ttl_days = 30              # "remember me" duration
 ```
 
+`types:export` emits these browser-relevant session settings through
+`AuthManifest.ts` as `AuthRuntimeManifest.sessions` plus helpers such as
+`AuthSessionCookieName` and `authSessionCookieName()`. It does not export the
+raw cookie domain value; use the generated metadata for frontend auth-state
+tooling instead of copying session constants from TOML.
+Runtime manifest export uses the same backend-effective values for trimmed
+bearer prefixes, normalized cookie SameSite values, lockout clamps, MFA pending
+token TTL clamps, recovery-code count clamps, and blank-MFA-issuer fallback to
+`app.name`. Direct auth runtime descriptors must keep exported strings trimmed,
+cookie settings valid, TTLs positive, and numeric values within JavaScript's
+safe integer range.
+Generated auth runtime selectors return cloned token/session/lockout/MFA
+metadata, including required-role arrays, so auth-state tooling can annotate
+those results locally.
+
 ## Multi-Factor Authentication (TOTP)
 
 Foundry ships a first-party TOTP baseline with built-in handlers for enroll, confirm, verify,
 disable, and recovery-code rotation. Publish the framework migrations before turning it on:
+`types:export` emits `MfaCodeRequest`, `MfaEnrollChallenge`, `MfaRecoveryCodesRequest`, and `MfaRecoveryCodesResponse` automatically, so MFA setup and verification screens can import the backend-owned request and response contracts. `AuthManifest.ts` also includes `AuthRuntimeManifest.mfa` and `AuthMfaPendingTokenTtlMinutes` for the configured issuer, pending-token TTL, recovery-code count, and required-role map.
+Generated MFA selector helpers clone required-role maps and role arrays before
+returning them.
 
 ```bash
 cargo run -- migrate:publish
@@ -584,6 +642,9 @@ async fn admin_login(
 Pending tokens carry the reserved `auth:mfa_pending` ability. Guarded routes reject them by
 default; only routes marked with `allow_mfa_pending_token()` can accept them. The `/auth/mfa/verify`
 handler exchanges a pending token for a normal full-access token pair.
+Generated route metadata exposes those exceptions as `allowsMfaPendingToken`,
+with helpers such as `routesAllowingMfaPendingToken()` for MFA route guards and
+flow diagnostics.
 
 ```toml
 [auth.mfa]
@@ -636,6 +697,8 @@ If the Actor lacks the required permission, the framework returns **403 Forbidde
 ## Policies (Business-Logic)
 
 Policies answer "can this actor do this specific thing?" — checked manually in handlers.
+Start one with `make:policy --name CanEditPost`, then replace the generated
+`Ok(false)` body with your business rule.
 
 ```rust
 struct CanEditPostPolicy;
@@ -852,3 +915,9 @@ driver = "token"
 [auth.guards.admin]
 driver = "session"
 ```
+
+The generated `AuthManifest.ts` mirrors the frontend-safe parts of this config:
+default guard, bearer prefix, token/session TTLs, password-reset and
+email-verification expiry, lockout policy, MFA settings, and per-guard token TTL
+overrides. It intentionally omits token length, pruning intervals, pruning batch
+sizes, and the raw session cookie domain.

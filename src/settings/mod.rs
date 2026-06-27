@@ -9,7 +9,7 @@ const SETTINGS_TABLE: &str = "settings";
 ///
 /// Each variant maps to a specific form widget. The `parameters` field
 /// on [`Setting`] provides additional constraints and options for the widget.
-#[derive(Clone, Debug, Default, PartialEq, Eq, foundry_macros::AppEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, foundry_macros::AppEnum)]
 pub enum SettingType {
     /// Single-line text input. Parameters: `max_length`, `placeholder`.
     #[default]
@@ -46,6 +46,115 @@ pub enum SettingType {
     Code,
 }
 
+pub type SettingParameters = fn() -> serde_json::Value;
+
+fn empty_setting_parameters() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+/// Backend-owned setting metadata used by seeders and generated frontend manifests.
+///
+/// Register definitions with `inventory::submit!` when settings should appear
+/// in `types:export`; call [`SettingDefinition::to_new_setting`] from setup
+/// code to create the matching database record without duplicating metadata.
+#[derive(Clone, Copy, Debug)]
+pub struct SettingDefinition {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub setting_type: SettingType,
+    pub parameters: SettingParameters,
+    pub group_name: &'static str,
+    pub description: Option<&'static str>,
+    pub sort_order: i32,
+    pub is_public: bool,
+}
+
+impl SettingDefinition {
+    pub const fn new(key: &'static str, label: &'static str, setting_type: SettingType) -> Self {
+        Self {
+            key,
+            label,
+            setting_type,
+            parameters: empty_setting_parameters,
+            group_name: "general",
+            description: None,
+            sort_order: 0,
+            is_public: false,
+        }
+    }
+
+    pub const fn text(key: &'static str, label: &'static str) -> Self {
+        Self::new(key, label, SettingType::Text)
+    }
+
+    pub const fn boolean(key: &'static str, label: &'static str) -> Self {
+        Self::new(key, label, SettingType::Boolean)
+    }
+
+    pub const fn number(key: &'static str, label: &'static str) -> Self {
+        Self::new(key, label, SettingType::Number)
+    }
+
+    pub const fn select(key: &'static str, label: &'static str) -> Self {
+        Self::new(key, label, SettingType::Select)
+    }
+
+    pub const fn multiselect(key: &'static str, label: &'static str) -> Self {
+        Self::new(key, label, SettingType::Multiselect)
+    }
+
+    pub const fn parameters(mut self, parameters: SettingParameters) -> Self {
+        self.parameters = parameters;
+        self
+    }
+
+    pub const fn group(mut self, group_name: &'static str) -> Self {
+        self.group_name = group_name;
+        self
+    }
+
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = Some(description);
+        self
+    }
+
+    pub const fn sort_order(mut self, sort_order: i32) -> Self {
+        self.sort_order = sort_order;
+        self
+    }
+
+    pub const fn public(mut self) -> Self {
+        self.is_public = true;
+        self
+    }
+
+    pub const fn private(mut self) -> Self {
+        self.is_public = false;
+        self
+    }
+
+    pub fn parameters_value(&self) -> serde_json::Value {
+        (self.parameters)()
+    }
+
+    pub fn to_new_setting(&self) -> NewSetting {
+        let mut setting = NewSetting::new(self.key, self.label)
+            .setting_type(self.setting_type)
+            .parameters(self.parameters_value())
+            .group(self.group_name)
+            .sort_order(self.sort_order)
+            .is_public(self.is_public);
+
+        if let Some(description) = self.description {
+            setting = setting.description(description);
+        }
+
+        setting
+    }
+}
+
+inventory::collect!(SettingDefinition);
+
 const SETTING_TYPE_VARIANTS: &[(&str, SettingType)] = &[
     ("text", SettingType::Text),
     ("textarea", SettingType::Textarea),
@@ -78,7 +187,7 @@ impl SettingType {
         SETTING_TYPE_VARIANTS
             .iter()
             .find(|(k, _)| *k == s)
-            .map(|(_, v)| v.clone())
+            .map(|(_, v)| *v)
     }
 
     /// All available setting types.
@@ -98,7 +207,9 @@ impl std::fmt::Display for SettingType {
 /// Settings are key-value pairs with type metadata for admin form rendering.
 /// The `setting_type` and `parameters` fields define how the admin panel
 /// should display and validate the input.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct Setting {
     pub id: String,
     pub key: String,
@@ -446,5 +557,35 @@ mod tests {
         assert_eq!(s.group_name, "general");
         assert_eq!(s.sort_order, 1);
         assert!(s.is_public);
+    }
+
+    fn theme_parameters() -> serde_json::Value {
+        serde_json::json!({
+            "options": [
+                { "value": "light", "label": "Light" },
+                { "value": "dark", "label": "Dark" }
+            ]
+        })
+    }
+
+    #[test]
+    fn setting_definition_builds_matching_new_setting() {
+        let definition = SettingDefinition::select("app.theme", "Theme")
+            .parameters(theme_parameters)
+            .group("appearance")
+            .description("Frontend theme")
+            .sort_order(2)
+            .public();
+
+        let setting = definition.to_new_setting();
+
+        assert_eq!(setting.key, "app.theme");
+        assert_eq!(setting.label, "Theme");
+        assert_eq!(setting.setting_type, SettingType::Select);
+        assert_eq!(setting.group_name, "appearance");
+        assert_eq!(setting.description.as_deref(), Some("Frontend theme"));
+        assert_eq!(setting.sort_order, 2);
+        assert!(setting.is_public);
+        assert_eq!(setting.parameters["options"][0]["value"], "light");
     }
 }

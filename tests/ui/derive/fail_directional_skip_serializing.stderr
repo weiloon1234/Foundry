@@ -1,0 +1,6 @@
+error: Foundry cannot represent `#[serde(skip_serializing)]` in a single TypeScript/OpenAPI contract; use separate request/response DTOs, or use `#[serde(skip)]` / `#[ts(skip)]` when the field is never public
+ --> tests/ui/derive/fail_directional_skip_serializing.rs:6:5
+  |
+6 | /     #[serde(skip_serializing)]
+7 | |     internal_token: String,
+  | |__________________________^

@@ -1,0 +1,5 @@
+error: `allowed_extensions` values must be non-empty and trimmed
+ --> tests/ui/derive/fail_validate_blank_file_rule_value.rs:3:42
+  |
+3 |     #[validate(allowed_extensions("jpg", " png "))]
+  |                                          ^^^^^^^

@@ -56,6 +56,36 @@ pub struct I18nManager {
     catalogs: HashMap<String, Catalog>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct I18nLocaleDescriptor {
+    pub locale: String,
+    pub default: bool,
+    pub fallback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct I18nManifestDescriptor {
+    pub default_locale: String,
+    pub fallback_locale: String,
+    pub locales: Vec<I18nLocaleDescriptor>,
+}
+
+impl Default for I18nManifestDescriptor {
+    fn default() -> Self {
+        Self::from_config(&I18nConfig::default())
+    }
+}
+
+impl I18nManifestDescriptor {
+    pub fn from_config(config: &I18nConfig) -> Self {
+        Self {
+            default_locale: config.default_locale.clone(),
+            fallback_locale: config.fallback_locale.clone(),
+            locales: Vec::new(),
+        }
+    }
+}
+
 impl I18nManager {
     /// Load all translation catalogs from the configured resource path.
     ///
@@ -183,6 +213,11 @@ impl I18nManager {
         &self.default_locale
     }
 
+    /// The configured fallback locale.
+    pub fn fallback_locale(&self) -> &str {
+        &self.fallback_locale
+    }
+
     /// Whether a catalog exists for the given locale.
     pub fn has_locale(&self, locale: &str) -> bool {
         self.catalogs.contains_key(locale)
@@ -206,7 +241,25 @@ impl I18nManager {
 
     /// List of all loaded locale names.
     pub fn locale_list(&self) -> Vec<&str> {
-        self.catalogs.keys().map(|s| s.as_str()).collect()
+        let mut locales = self.catalogs.keys().map(|s| s.as_str()).collect::<Vec<_>>();
+        locales.sort();
+        locales
+    }
+
+    pub fn descriptor(&self) -> I18nManifestDescriptor {
+        I18nManifestDescriptor {
+            default_locale: self.default_locale.clone(),
+            fallback_locale: self.fallback_locale.clone(),
+            locales: self
+                .locale_list()
+                .into_iter()
+                .map(|locale| I18nLocaleDescriptor {
+                    locale: locale.to_string(),
+                    default: locale == self.default_locale,
+                    fallback: locale == self.fallback_locale,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -401,6 +454,38 @@ mod tests {
 
         assert_eq!(manager.translate("en", "Hello", &[]), "Hello");
         assert_eq!(manager.translate("ms", "Hello", &[]), "Helo");
+    }
+
+    #[test]
+    fn descriptor_exposes_sorted_locale_metadata() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("ms")).unwrap();
+        fs::write(dir.path().join("ms/common.json"), r#"{ "Hello": "Helo" }"#).unwrap();
+        fs::create_dir(dir.path().join("en")).unwrap();
+        fs::write(dir.path().join("en/common.json"), r#"{ "Hello": "Hello" }"#).unwrap();
+
+        let manager = I18nManager::load(&make_config(&dir)).unwrap();
+
+        assert_eq!(manager.locale_list(), vec!["en", "ms"]);
+        assert_eq!(
+            manager.descriptor(),
+            I18nManifestDescriptor {
+                default_locale: "en".to_string(),
+                fallback_locale: "en".to_string(),
+                locales: vec![
+                    I18nLocaleDescriptor {
+                        locale: "en".to_string(),
+                        default: true,
+                        fallback: true,
+                    },
+                    I18nLocaleDescriptor {
+                        locale: "ms".to_string(),
+                        default: false,
+                        fallback: false,
+                    },
+                ],
+            }
+        );
     }
 
     #[test]

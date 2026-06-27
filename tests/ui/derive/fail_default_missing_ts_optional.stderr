@@ -1,0 +1,6 @@
+error: `#[serde(default)]` makes this field optional at runtime; add `#[ts(optional, as = "Option<_>")]` so generated TypeScript matches, or add `#[validate(required)]` if omission should fail validation
+ --> tests/ui/derive/fail_default_missing_ts_optional.rs:5:5
+  |
+5 | /     #[serde(default)]
+6 | |     page: u64,
+  | |_____________^

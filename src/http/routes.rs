@@ -37,20 +37,28 @@ impl RouteRegistry {
             .routes
             .get(&name)
             .ok_or_else(|| Error::message(format!("route '{}' not found", name.as_str())))?;
+        super::ensure_route_path_params_are_valid(pattern, &format!("route '{}'", name.as_str()))?;
 
-        let params_by_key = params.iter().copied().collect::<HashMap<_, _>>();
         let mut url = pattern.clone();
-        for param in super::route_path_params(pattern) {
+        let route_params = super::route_path_params(pattern);
+        ensure_unique_route_path_params(name.as_str(), params, &route_params)?;
+        let params_by_key = params.iter().copied().collect::<HashMap<_, _>>();
+        for param in &route_params {
             let value = params_by_key.get(param.as_str()).ok_or_else(|| {
                 Error::message(format!(
                     "route '{}' is missing required parameter `{param}`",
                     name.as_str()
                 ))
             })?;
-            let encoded = percent_encode(value);
-            url = replace_route_param(&url, &param, &encoded);
+            let encoded = if super::route_path_param_is_wildcard(pattern, param) {
+                percent_encode_path(value)
+            } else {
+                percent_encode(value)
+            };
+            url = replace_route_param(&url, param, &encoded);
         }
-        Ok(url)
+
+        Ok(append_query_params(url, params, &route_params))
     }
 
     /// Check if a named route exists.
@@ -74,6 +82,25 @@ impl RouteRegistry {
         signing_key: &[u8],
         expires_at: crate::support::DateTime,
     ) -> Result<String> {
+        let name = name.into();
+        let pattern = self
+            .routes
+            .get(&name)
+            .ok_or_else(|| Error::message(format!("route '{}' not found", name.as_str())))?;
+        super::ensure_route_path_params_are_valid(pattern, &format!("route '{}'", name.as_str()))?;
+        let route_params = super::route_path_params(pattern);
+        for (key, _) in params {
+            if route_params.iter().any(|param| param == key) {
+                continue;
+            }
+            if signed_url_query_param_is_reserved(key) {
+                return Err(Error::message(format!(
+                    "signed route '{}' cannot include reserved query parameter `{key}`; signed URLs append `expires` and `signature` internally",
+                    name.as_str()
+                )));
+            }
+        }
+
         let mut url = self.url(name, params)?;
         let expiry = expires_at.as_chrono().timestamp();
         let sep = if url.contains('?') { "&" } else { "?" };
@@ -104,9 +131,20 @@ impl RouteRegistry {
 }
 
 fn replace_route_param(url: &str, param: &str, value: &str) -> String {
-    url.replace(&format!("{{{param}}}"), value)
-        .replace(&format!("{{*{param}}}"), value)
-        .replace(&format!(":{param}"), value)
+    let axum_param = format!("{{{param}}}");
+    let axum_wildcard_param = format!("{{*{param}}}");
+    let legacy_param = format!(":{param}");
+
+    url.split('/')
+        .map(|segment| {
+            if segment == axum_param || segment == axum_wildcard_param || segment == legacy_param {
+                value
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn percent_encode(value: &str) -> String {
@@ -119,6 +157,60 @@ fn percent_encode(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn percent_encode_path(value: &str) -> String {
+    value
+        .split('/')
+        .map(percent_encode)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn append_query_params(
+    mut url: String,
+    params: &[(&str, &str)],
+    route_params: &[String],
+) -> String {
+    let query = params
+        .iter()
+        .filter(|(key, _)| !route_params.iter().any(|param| param == key))
+        .map(|(key, value)| format!("{}={}", percent_encode(key), percent_encode(value)))
+        .collect::<Vec<_>>();
+
+    if query.is_empty() {
+        return url;
+    }
+
+    let separator = if url.contains('?') { '&' } else { '?' };
+    url.push(separator);
+    url.push_str(&query.join("&"));
+    url
+}
+
+fn ensure_unique_route_path_params(
+    route_name: &str,
+    params: &[(&str, &str)],
+    route_params: &[String],
+) -> Result<()> {
+    for route_param in route_params {
+        let count = params
+            .iter()
+            .filter(|(key, _)| key == route_param)
+            .take(2)
+            .count();
+        if count > 1 {
+            return Err(Error::message(format!(
+                "route '{route_name}' contains duplicate path parameter `{route_param}`; provide each path parameter once"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn signed_url_query_param_is_reserved(key: &str) -> bool {
+    matches!(key, "expires" | "signature")
 }
 
 struct SignedUrlParts {
@@ -213,6 +305,128 @@ mod tests {
 
     fn error_message(error: Error) -> String {
         error.to_string()
+    }
+
+    #[test]
+    fn route_url_percent_encodes_like_generated_typescript_helpers() {
+        let url = registry()
+            .url(RouteId::new("reset"), &[("token", "AZaz09-_.~!'()* /")])
+            .unwrap();
+
+        assert_eq!(url, "/reset/AZaz09-_.~%21%27%28%29%2A%20%2F");
+    }
+
+    #[test]
+    fn route_url_appends_non_path_params_as_query_params() {
+        let url = registry()
+            .url(
+                RouteId::new("reset"),
+                &[
+                    ("token", "abc"),
+                    ("next", "/dashboard"),
+                    ("utm source", "email campaign"),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            url,
+            "/reset/abc?next=%2Fdashboard&utm%20source=email%20campaign"
+        );
+
+        let url = registry()
+            .url(
+                RouteId::new("reset"),
+                &[("token", "abc"), ("tag", "rust"), ("tag", "foundry")],
+            )
+            .unwrap();
+
+        assert_eq!(url, "/reset/abc?tag=rust&tag=foundry");
+    }
+
+    #[test]
+    fn route_url_rejects_duplicate_path_params() {
+        let error = registry()
+            .url(
+                RouteId::new("reset"),
+                &[("token", "abc"), ("token", "override")],
+            )
+            .expect_err("duplicate path params should fail");
+
+        assert!(
+            error_message(error).contains(
+                "route 'reset' contains duplicate path parameter `token`; provide each path parameter once"
+            ),
+            "unexpected error"
+        );
+    }
+
+    #[test]
+    fn route_url_rejects_malformed_path_param_tokens() {
+        let mut registry = RouteRegistry::new();
+        registry.register(RouteId::new("users.show"), "/users/{}");
+
+        let error = registry
+            .url(RouteId::new("users.show"), &[])
+            .expect_err("malformed route path params should fail");
+
+        assert!(
+            error_message(error)
+                .contains("route 'users.show' contains invalid route path parameter segment `{}`"),
+            "unexpected error"
+        );
+    }
+
+    #[test]
+    fn signed_url_signs_extra_query_params_before_signature() {
+        let url = registry()
+            .signed_url(
+                RouteId::new("reset"),
+                &[("token", "abc"), ("next", "/dashboard")],
+                signing_key(),
+                DateTime::now().add_days(1),
+            )
+            .unwrap();
+
+        assert!(url.starts_with("/reset/abc?next=%2Fdashboard&expires="));
+        RouteRegistry::verify_signature(&url, signing_key()).unwrap();
+    }
+
+    #[test]
+    fn signed_url_rejects_reserved_extra_query_params_before_signing() {
+        let registry = registry();
+
+        for reserved in ["expires", "signature"] {
+            let error = registry
+                .signed_url(
+                    RouteId::new("reset"),
+                    &[("token", "abc"), (reserved, "override")],
+                    signing_key(),
+                    DateTime::now().add_days(1),
+                )
+                .expect_err("reserved signed URL query params should fail before signing");
+
+            assert!(
+                error_message(error).contains(&format!(
+                    "cannot include reserved query parameter `{reserved}`"
+                )),
+                "unexpected error for {reserved}"
+            );
+        }
+
+        let mut registry = RouteRegistry::new();
+        registry.register(RouteId::new("token.expires"), "/tokens/{expires}");
+        let url = registry
+            .signed_url(
+                RouteId::new("token.expires"),
+                &[("expires", "abc")],
+                signing_key(),
+                DateTime::now().add_days(1),
+            )
+            .expect("path params named expires should not be treated as query params");
+
+        assert!(url.starts_with("/tokens/abc?expires="));
+        RouteRegistry::verify_signature(&url, signing_key()).unwrap();
     }
 
     #[test]

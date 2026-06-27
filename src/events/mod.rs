@@ -138,9 +138,16 @@ where
 
 pub(crate) type EventRegistryHandle = Arc<Mutex<EventRegistryBuilder>>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventDescriptor {
+    pub id: EventId,
+    pub listener_count: usize,
+}
+
 #[derive(Default)]
 pub(crate) struct EventRegistryBuilder {
     listeners: HashMap<TypeId, Vec<Arc<dyn DynEventListener>>>,
+    events: HashMap<TypeId, EventDescriptor>,
 }
 
 impl EventRegistryBuilder {
@@ -160,18 +167,27 @@ impl EventRegistryBuilder {
                 listener,
                 marker: PhantomData,
             }));
+        self.events
+            .entry(TypeId::of::<E>())
+            .and_modify(|event| event.listener_count += 1)
+            .or_insert_with(|| EventDescriptor {
+                id: E::ID,
+                listener_count: 1,
+            });
     }
 
     pub(crate) fn freeze_shared(handle: EventRegistryHandle) -> EventRegistrySnapshot {
         let mut builder = lock_unpoisoned(&handle, "event registry");
         EventRegistrySnapshot {
             listeners: std::mem::take(&mut builder.listeners),
+            events: std::mem::take(&mut builder.events),
         }
     }
 }
 
 pub(crate) struct EventRegistrySnapshot {
     listeners: HashMap<TypeId, Vec<Arc<dyn DynEventListener>>>,
+    events: HashMap<TypeId, EventDescriptor>,
 }
 
 #[derive(Clone)]
@@ -186,6 +202,12 @@ impl EventBus {
             app,
             registry: Arc::new(registry),
         }
+    }
+
+    pub(crate) fn descriptors(&self) -> Vec<EventDescriptor> {
+        let mut descriptors = self.registry.events.values().cloned().collect::<Vec<_>>();
+        descriptors.sort_by(|a, b| a.id.cmp(&b.id));
+        descriptors
     }
 
     /// Dispatch an event to its registered listeners, in registration order.

@@ -46,7 +46,13 @@ impl HttpKernel {
                 // Collect documented routes and publish OpenAPI spec
                 let documented = registrar.collect_documented_routes();
                 if !documented.is_empty() {
-                    crate::logging::set_openapi_spec("API", "1.0.0", &documented);
+                    let validation_rules = self.app.rules().descriptors();
+                    crate::logging::set_openapi_spec(
+                        "API",
+                        "1.0.0",
+                        &documented,
+                        &validation_rules,
+                    )?;
                 }
                 crate::logging::register_openapi_route(&mut registrar, &obs_config, options)?;
                 crate::logging::register_observability_routes(

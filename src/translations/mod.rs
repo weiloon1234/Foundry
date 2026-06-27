@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::database::extensions::{
@@ -29,7 +30,9 @@ pub fn current_locale(app: &AppContext) -> String {
 }
 
 /// A single translation record from the `model_translations` table.
-#[derive(Clone, Debug)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct ModelTranslation {
     pub id: String,
     pub translatable_type: String,
@@ -47,7 +50,9 @@ pub struct ModelTranslation {
 /// tf.values["zh"]          // "红色衬衫"
 /// tf.get("ms")             // Some("Baju Merah")
 /// ```
-#[derive(Clone, Debug)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct TranslatedFields {
     /// All locale values: `{"en": "Red Shirt", "zh": "红色衬衫"}`
     pub values: HashMap<String, String>,

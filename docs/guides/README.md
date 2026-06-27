@@ -10,7 +10,7 @@ Consumer-facing guides for building applications with Foundry. Each guide covers
 | [Database](database.md) | Models, queries, relations, projections, lifecycle hooks, migrations |
 | [Auth & Guards](auth.md) | Token/session auth, guards, permissions, policies, extractors, password reset |
 | [Routes & Middleware](routes-and-middleware.md) | Routing, groups, API versioning, middleware stack, CORS, CSRF, rate limiting, SPA |
-| [Validation](validation.md) | 38+ built-in rules, custom rules, derive-based validation, OpenAPI integration |
+| [Validation](validation.md) | 89 built-in field/collection validation features, custom rules, derive-based validation, OpenAPI integration |
 | [Datatable](datatable.md) | Server-side datatables: columns, filters, sorting, XLSX export, email delivery |
 | [Email & Notifications](email-and-notifications.md) | Multi-driver email, templates, attachments, multi-channel notifications |
 | [Caching & Redis](caching-and-redis.md) | Cache abstraction (get/put/remember), namespaced Redis client |

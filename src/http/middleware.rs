@@ -19,7 +19,7 @@ use crate::config::{
     HttpConfig, HttpCorsConfig, HttpCsrfConfig, HttpRateLimitByConfig, HttpRateLimitConfig,
     HttpSecurityHeadersConfig, HttpTrustedProxyConfig, CLOUDFLARE_TRUSTED_CIDRS,
 };
-use crate::foundation::{AppContext, Error, Result};
+use crate::foundation::{AppContext, Error, ErrorResponse, Result};
 use crate::logging::RuntimeBackendKind;
 use crate::support::runtime::RuntimeBackend;
 
@@ -250,14 +250,7 @@ fn edge_error_response(status: StatusCode, rejection: HttpEdgeRejection) -> Resp
         HttpEdgeRejection::Cors => "CORS request rejected",
     };
 
-    (
-        status,
-        axum::Json(serde_json::json!({
-            "message": message,
-            "status": status.as_u16(),
-        })),
-    )
-        .into_response()
+    (status, axum::Json(ErrorResponse::new(message, status))).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -973,10 +966,7 @@ fn build_csrf_cookie(name: &str, value: &str, state: &CsrfState) -> Result<Heade
 fn csrf_forbidden(message: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
-        axum::Json(serde_json::json!({
-            "message": message,
-            "status": 403
-        })),
+        axum::Json(ErrorResponse::new(message, StatusCode::FORBIDDEN)),
     )
         .into_response()
 }
@@ -1029,7 +1019,7 @@ impl RateLimitWindow {
 }
 
 /// Determines how rate-limit keys are derived.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RateLimitBy {
     /// Key by client IP address (default).
     #[default]
@@ -1038,6 +1028,27 @@ pub enum RateLimitBy {
     Actor,
     /// Key by actor ID when authenticated, falling back to IP.
     ActorOrIp,
+}
+
+impl RateLimitBy {
+    /// Return the stable policy name used by OpenAPI and generated TypeScript.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ip => "ip",
+            Self::Actor => "actor",
+            Self::ActorOrIp => "actor_or_ip",
+        }
+    }
+
+    /// Parse a stable policy name from OpenAPI or generated TypeScript metadata.
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "ip" => Some(Self::Ip),
+            "actor" => Some(Self::Actor),
+            "actor_or_ip" => Some(Self::ActorOrIp),
+            _ => None,
+        }
+    }
 }
 
 /// Rate-limit store backend.
@@ -1358,10 +1369,7 @@ pub(crate) async fn enforce_rate_limit_for_actor(
 }
 
 fn rate_limit_response(info: &RateLimitInfo) -> Response {
-    let body = serde_json::json!({
-        "message": "Rate limit exceeded",
-        "status": 429
-    });
+    let body = ErrorResponse::new("Rate limit exceeded", StatusCode::TOO_MANY_REQUESTS);
 
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
@@ -1664,10 +1672,10 @@ async fn maintenance_middleware(
     // Return 503 Service Unavailable
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        axum::Json(serde_json::json!({
-            "message": "Service is undergoing maintenance",
-            "status": 503,
-        })),
+        axum::Json(ErrorResponse::new(
+            "Service is undergoing maintenance",
+            StatusCode::SERVICE_UNAVAILABLE,
+        )),
     )
         .into_response()
 }
@@ -2092,6 +2100,7 @@ mod tests {
 
     use crate::config::ConfigRepository;
     use crate::foundation::Container;
+    use crate::http::response::CsrfTokenResponse;
     use crate::validation::RuleRegistry;
 
     async fn ok_handler() -> &'static str {
@@ -2126,8 +2135,8 @@ mod tests {
         StatusCode::OK
     }
 
-    async fn csrf_token_handler(CsrfToken(token): CsrfToken) -> axum::Json<serde_json::Value> {
-        axum::Json(serde_json::json!({ "token": token }))
+    async fn csrf_token_handler(CsrfToken(token): CsrfToken) -> axum::Json<CsrfTokenResponse> {
+        axum::Json(CsrfTokenResponse::new(token))
     }
 
     // ---- Csrf tests ----

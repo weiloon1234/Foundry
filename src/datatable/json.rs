@@ -40,12 +40,7 @@ where
 
     let column_meta: Vec<DatatableColumnMeta> = columns
         .iter()
-        .map(|c| DatatableColumnMeta {
-            name: c.name.clone(),
-            label: c.label.clone(),
-            sortable: c.sortable,
-            filterable: c.filterable,
-        })
+        .map(DatatableColumnMeta::from_column)
         .collect();
 
     let filters = datatable_available_filters::<D>(&ctx).await?;

@@ -21,6 +21,7 @@ mod app {
         pub const AUDIT_JOB: JobId = JobId::new("audit.job");
         pub const CHAT_CHANNEL: ChannelId = ChannelId::new("chat");
         pub const CLIENT_EVENTS_CHANNEL: ChannelId = ChannelId::new("client_events");
+        pub const OPEN_CLIENT_EVENTS_CHANNEL: ChannelId = ChannelId::new("open_client_events");
         pub const FAIL_CHANNEL: ChannelId = ChannelId::new("failures");
         pub const PRESENCE_CHANNEL: ChannelId = ChannelId::new("presence");
         pub const JOIN_PANIC_CHANNEL: ChannelId = ChannelId::new("join_panic");
@@ -149,14 +150,21 @@ mod app {
         use super::*;
 
         pub fn register(registrar: &mut WebSocketRegistrar) -> Result<()> {
-            registrar.channel(
+            registrar.channel_with_options(
                 ids::CHAT_CHANNEL,
                 |context: WebSocketContext, payload: serde_json::Value| async move {
                     context.publish(ids::ECHO_EVENT, payload).await
                 },
+                WebSocketChannelOptions::new()
+                    .server_events([ids::ECHO_EVENT, ids::HTTP_NOTICE_EVENT]),
             )?;
             registrar.channel_with_options(
                 ids::CLIENT_EVENTS_CHANNEL,
+                |_context: WebSocketContext, _payload: serde_json::Value| async move { Ok(()) },
+                WebSocketChannelOptions::new().client_event(ids::TYPING_EVENT),
+            )?;
+            registrar.channel_with_options(
+                ids::OPEN_CLIENT_EVENTS_CHANNEL,
                 |_context: WebSocketContext, _payload: serde_json::Value| async move { Ok(()) },
                 WebSocketChannelOptions::new().allow_client_events(true),
             )?;
@@ -666,6 +674,52 @@ async fn websocket_room_routing_distinguishes_channel_wide_and_room_broadcasts()
 }
 
 #[tokio::test]
+async fn websocket_publisher_rejects_undocumented_server_events() {
+    let config_dir = tempdir().unwrap();
+    let server_port = free_port();
+    let websocket_port = free_port();
+    write_phase2_config(
+        config_dir.path(),
+        server_port,
+        websocket_port,
+        &format!("phase2-server-events-{websocket_port}"),
+    );
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let kernel = build_websocket_app(config_dir.path(), log, false)
+        .build_websocket_kernel()
+        .await
+        .unwrap();
+    let publisher = kernel.app().websocket().unwrap();
+
+    publisher
+        .publish(
+            app::ids::FAIL_CHANNEL,
+            ChannelEventId::new("undocumented"),
+            None,
+            serde_json::json!({ "compatible": true }),
+        )
+        .await
+        .unwrap();
+
+    let error = publisher
+        .publish(
+            app::ids::CHAT_CHANNEL,
+            ChannelEventId::new("undocumented"),
+            None,
+            serde_json::json!({ "compatible": false }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("websocket channel `chat` does not document server event `undocumented`"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn websocket_client_events_require_subscription_and_relay_to_matching_subscribers() {
     let config_dir = tempdir().unwrap();
     let server_port = free_port();
@@ -713,6 +767,24 @@ async fn websocket_client_events_require_subscription_and_relay_to_matching_subs
         serde_json::json!({
             "action": "client_event",
             "channel": "client_events",
+            "event": "status",
+            "payload": { "user": "one" }
+        }),
+    )
+    .await;
+    let rejected = next_ws_message(&mut sender).await;
+    assert_eq!(rejected.event, ERROR_EVENT);
+    assert!(rejected.payload["message"]
+        .as_str()
+        .unwrap()
+        .contains("client event `status` is not allowed"));
+    expect_no_ws_message(&mut receiver).await;
+
+    send_ws_json(
+        &mut sender,
+        serde_json::json!({
+            "action": "client_event",
+            "channel": "client_events",
             "event": "typing",
             "payload": { "user": "one" }
         }),
@@ -722,6 +794,30 @@ async fn websocket_client_events_require_subscription_and_relay_to_matching_subs
     assert_eq!(relayed.event, app::ids::TYPING_EVENT);
     assert_eq!(relayed.payload["user"], "one");
     expect_no_ws_message(&mut sender).await;
+
+    send_ws_json(
+        &mut sender,
+        serde_json::json!({ "action": "subscribe", "channel": "open_client_events" }),
+    )
+    .await;
+    assert_eq!(next_ws_message(&mut sender).await.event, SUBSCRIBED_EVENT);
+
+    send_ws_json(
+        &mut sender,
+        serde_json::json!({
+            "action": "client_event",
+            "channel": "open_client_events",
+            "event": "subscribed",
+            "payload": { "user": "one" }
+        }),
+    )
+    .await;
+    let reserved = next_ws_message(&mut sender).await;
+    assert_eq!(reserved.event, ERROR_EVENT);
+    assert!(reserved.payload["message"]
+        .as_str()
+        .unwrap()
+        .contains("reserved Foundry protocol event"));
 
     server.abort();
 }

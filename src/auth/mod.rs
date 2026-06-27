@@ -12,6 +12,7 @@ use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::ops::Deref;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +26,7 @@ use serde_json::Value;
 
 use crate::config::AuthConfig;
 use crate::database::{ColumnRef, ComparisonOp, DbType, DbValue, Expr, Model, QueryExecutor};
-use crate::foundation::{AppContext, Error, Result};
+use crate::foundation::{AppContext, Error, ErrorResponse, Result};
 use crate::logging::{catch_async_panic, panic_payload_message};
 use crate::support::sync::lock_unpoisoned;
 use crate::support::{GuardId, ModelId, PermissionId, PolicyId, RoleId};
@@ -100,16 +101,60 @@ pub struct GuardedAccess {
     pub permissions: BTreeSet<PermissionId>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct Actor {
     pub id: String,
     pub guard: GuardId,
     #[serde(default)]
+    #[ts(optional, as = "Option<_>")]
     pub roles: BTreeSet<RoleId>,
     #[serde(default)]
+    #[ts(optional, as = "Option<_>")]
     pub permissions: BTreeSet<PermissionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub claims: Option<Value>,
+}
+
+impl ts_rs::TS for Actor {
+    type WithoutGenerics = Self;
+
+    fn ident() -> String {
+        "Actor".to_string()
+    }
+
+    fn name() -> String {
+        "Actor".to_string()
+    }
+
+    fn inline() -> String {
+        "{ id: string, guard: string, roles?: Array<string>, permissions?: Array<string>, claims?: JsonValue, }".to_string()
+    }
+
+    fn inline_flattened() -> String {
+        panic!("{} cannot be flattened", Self::name())
+    }
+
+    fn decl() -> String {
+        format!("type {} = {};", Self::name(), Self::inline())
+    }
+
+    fn decl_concrete() -> String {
+        Self::decl()
+    }
+
+    fn output_path() -> Option<&'static Path> {
+        Some(Path::new("Actor.ts"))
+    }
+
+    fn visit_dependencies(v: &mut impl ts_rs::TypeVisitor)
+    where
+        Self: 'static,
+    {
+        v.visit::<serde_json::Value>();
+    }
 }
 
 impl Actor {
@@ -196,8 +241,7 @@ impl Actor {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, foundry_macros::AppEnum)]
 pub enum AuthErrorCode {
     InvalidBearerToken,
     InvalidRefreshToken,
@@ -368,18 +412,19 @@ impl AuthError {
         }
     }
 
-    pub fn payload(&self) -> serde_json::Value {
-        let mut payload = serde_json::json!({
-            "message": self.public_message(),
-            "status": self.status_code().as_u16(),
-        });
+    pub fn response_body(&self) -> ErrorResponse {
+        let mut body = ErrorResponse::new(self.public_message(), self.status_code());
 
         if let Some(code) = self.code() {
-            payload["error_code"] = serde_json::Value::String(code.as_str().to_string());
-            payload["message_key"] = serde_json::Value::String(code.translation_key().to_string());
+            body.error_code = Some(code.as_str().to_string());
+            body.message_key = Some(code.translation_key().to_string());
         }
 
-        payload
+        body
+    }
+
+    pub fn payload(&self) -> serde_json::Value {
+        serde_json::to_value(self.response_body()).expect("auth error response should serialize")
     }
 }
 
@@ -387,7 +432,7 @@ impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let error_text = self.message().to_string();
-        let mut response = (status, Json(self.payload())).into_response();
+        let mut response = (status, Json(self.response_body())).into_response();
         if status.is_server_error() {
             crate::logging::mark_handler_error_response(
                 &mut response,
@@ -501,6 +546,47 @@ pub(crate) type AuthenticatableRegistryHandle = Arc<Mutex<AuthenticatableRegistr
 pub(crate) enum GuardAuthenticator {
     Bearer(Arc<dyn BearerAuthenticator>),
     Session(Arc<session::SessionManager>),
+}
+
+impl GuardAuthenticator {
+    fn kind(&self) -> AuthGuardKind {
+        match self {
+            Self::Bearer(_) => AuthGuardKind::Bearer,
+            Self::Session(_) => AuthGuardKind::Session,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthGuardKind {
+    Bearer,
+    Session,
+}
+
+impl AuthGuardKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+            Self::Session => "session",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthGuardDescriptor {
+    pub id: GuardId,
+    pub kind: AuthGuardKind,
+    pub default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthPolicyDescriptor {
+    pub id: PolicyId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatableDescriptor {
+    pub guard: GuardId,
 }
 
 #[derive(Default)]
@@ -674,6 +760,17 @@ impl AuthenticatableRegistry {
     pub fn contains_guard(&self, guard: &GuardId) -> bool {
         self.resolvers.contains_key(guard)
     }
+
+    pub fn descriptors(&self) -> Vec<AuthenticatableDescriptor> {
+        let mut descriptors = self
+            .resolvers
+            .keys()
+            .cloned()
+            .map(|guard| AuthenticatableDescriptor { guard })
+            .collect::<Vec<_>>();
+        descriptors.sort_by(|left, right| left.guard.as_str().cmp(right.guard.as_str()));
+        descriptors
+    }
 }
 
 #[derive(Clone)]
@@ -692,6 +789,21 @@ impl AuthManager {
 
     pub fn default_guard(&self) -> &GuardId {
         &self.config.default_guard
+    }
+
+    pub fn descriptors(&self) -> Vec<AuthGuardDescriptor> {
+        let default_guard = self.default_guard();
+        let mut descriptors = self
+            .guards
+            .iter()
+            .map(|(id, authenticator)| AuthGuardDescriptor {
+                id: id.clone(),
+                kind: authenticator.kind(),
+                default: id == default_guard,
+            })
+            .collect::<Vec<_>>();
+        descriptors.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        descriptors
     }
 
     /// Authenticate a request using the appropriate strategy for the guard.
@@ -812,6 +924,17 @@ impl Authorizer {
 
     pub fn allows_permission(&self, actor: &Actor, permission: &PermissionId) -> bool {
         actor.permissions.contains(permission)
+    }
+
+    pub fn descriptors(&self) -> Vec<AuthPolicyDescriptor> {
+        let mut descriptors = self
+            .policies
+            .keys()
+            .cloned()
+            .map(|id| AuthPolicyDescriptor { id })
+            .collect::<Vec<_>>();
+        descriptors.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        descriptors
     }
 
     pub fn allows_permissions(&self, actor: &Actor, permissions: &BTreeSet<PermissionId>) -> bool {
@@ -1059,7 +1182,7 @@ mod tests {
     use axum::response::IntoResponse;
 
     use super::{
-        Actor, AuthConfig, AuthManager, AuthenticatableRegistryBuilder, Authorizer,
+        Actor, AuthConfig, AuthGuardKind, AuthManager, AuthenticatableRegistryBuilder, Authorizer,
         GuardRegistryBuilder, PermissionId, PolicyRegistryBuilder, StaticBearerAuthenticator,
     };
     use crate::config::ConfigRepository;
@@ -1146,6 +1269,61 @@ mod tests {
         assert!(error.to_string().contains("already registered"));
     }
 
+    #[test]
+    fn auth_manager_descriptors_include_guard_kind_and_default() {
+        let config = AuthConfig {
+            default_guard: GuardId::new("admin"),
+            ..AuthConfig::default()
+        };
+        let manager = AuthManager::new(
+            config,
+            HashMap::from([
+                (
+                    GuardId::new("api"),
+                    super::GuardAuthenticator::Bearer(Arc::new(StaticBearerAuthenticator::new())),
+                ),
+                (
+                    GuardId::new("admin"),
+                    super::GuardAuthenticator::Bearer(Arc::new(StaticBearerAuthenticator::new())),
+                ),
+            ]),
+        );
+
+        let descriptors = manager.descriptors();
+
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].id, GuardId::new("admin"));
+        assert_eq!(descriptors[0].kind, AuthGuardKind::Bearer);
+        assert!(descriptors[0].default);
+        assert_eq!(descriptors[1].id, GuardId::new("api"));
+        assert!(!descriptors[1].default);
+        assert_eq!(AuthGuardKind::Bearer.as_str(), "bearer");
+        assert_eq!(AuthGuardKind::Session.as_str(), "session");
+    }
+
+    #[test]
+    fn authorizer_descriptors_include_registered_policies() {
+        let authorizer = Authorizer::new(
+            app(),
+            HashMap::from([
+                (
+                    PolicyId::new("reports.view"),
+                    Arc::new(AllowEverythingPolicy) as Arc<dyn super::Policy>,
+                ),
+                (
+                    PolicyId::new("admin.users.manage"),
+                    Arc::new(AllowEverythingPolicy) as Arc<dyn super::Policy>,
+                ),
+            ]),
+        );
+
+        let descriptors = authorizer.descriptors();
+
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].id, PolicyId::new("admin.users.manage"));
+        assert_eq!(descriptors[1].id, PolicyId::new("reports.view"));
+    }
+
     #[tokio::test]
     async fn uses_default_guard_and_parses_bearer_header() {
         let actor = Actor::new("user-1", GuardId::new("placeholder"));
@@ -1204,6 +1382,22 @@ mod tests {
         assert_eq!(payload["status"], 500);
         assert!(!payload["message"].as_str().unwrap().contains("secret"));
         assert!(!payload["message"].as_str().unwrap().contains("postgres://"));
+    }
+
+    #[test]
+    fn auth_error_response_body_uses_standard_error_contract() {
+        let body =
+            super::AuthError::unauthorized_code(super::AuthErrorCode::MissingAuthCredentials)
+                .response_body();
+
+        assert_eq!(body.message, "Authentication credentials are required.");
+        assert_eq!(body.status, 401);
+        assert_eq!(body.error_code.as_deref(), Some("missing_auth_credentials"));
+        assert_eq!(
+            body.message_key.as_deref(),
+            Some("auth.missing_auth_credentials")
+        );
+        assert!(body.errors.is_none());
     }
 
     #[tokio::test]
@@ -1394,6 +1588,20 @@ mod tests {
         let frozen = AuthenticatableRegistryBuilder::freeze_shared(registry);
         assert!(frozen.contains_guard(&GuardId::new("api")));
         assert!(frozen.contains_guard(&GuardId::new("admin")));
+    }
+
+    #[test]
+    fn authenticatable_registry_descriptors_include_registered_guards() {
+        let registry = AuthenticatableRegistryBuilder::shared();
+        registry.lock().unwrap().register::<FakeUser>().unwrap();
+        registry.lock().unwrap().register::<FakeAdmin>().unwrap();
+
+        let frozen = AuthenticatableRegistryBuilder::freeze_shared(registry);
+        let descriptors = frozen.descriptors();
+
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].guard, GuardId::new("admin"));
+        assert_eq!(descriptors[1].guard, GuardId::new("api"));
     }
 
     #[tokio::test]

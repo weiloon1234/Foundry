@@ -319,6 +319,15 @@ async fn countries_seed_and_read_helpers_use_typed_queries() {
     let malaysia = Country::find(&runtime.app, "my").await.unwrap().unwrap();
     assert_eq!(malaysia.iso2, "MY");
     assert_eq!(malaysia.iso3, "MYS");
+    assert!(malaysia
+        .currencies
+        .iter()
+        .any(|currency| currency.code == "MYR"));
+    assert!(malaysia.tlds.iter().any(|tld| tld == ".my"));
+    assert!(malaysia
+        .timezones
+        .iter()
+        .any(|timezone| timezone == "Asia/Kuala_Lumpur"));
     assert!(Country::exists(&runtime.app, "my").await.unwrap());
     assert_eq!(Country::all(&runtime.app).await.unwrap().len(), 250);
     assert_eq!(Country::enabled(&runtime.app).await.unwrap().len(), 0);

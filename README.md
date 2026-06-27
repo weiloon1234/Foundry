@@ -19,7 +19,7 @@ Foundry is a modular Rust backend framework built on **Axum**, **Tokio**, and **
 - **5 Runtime Kernels** &mdash; HTTP, CLI, Scheduler, Worker, WebSocket &mdash; each an independent async runtime
 - **AST-First Database** &mdash; typed models, relations, projections, eager loading, cursor pagination, streaming, upsert, window functions
 - **Auth System** &mdash; bearer tokens, sessions, guards, policies, roles, permissions, password reset, email verification
-- **Validation** &mdash; 38+ built-in rules, custom rules, request validation extractor, file validation
+- **Validation** &mdash; 89 built-in field/collection validation features, custom rules, request validation extractor, file validation
 - **Background Jobs** &mdash; leased at-least-once delivery with batching, chaining, rate limiting
 - **Email** &mdash; multi-driver: SMTP, Mailgun, Postmark, Resend, SES, Log
 - **Storage** &mdash; local + S3, multipart uploads, image processing pipeline
@@ -195,7 +195,7 @@ async fn admin_handler(CurrentActor(actor): CurrentActor) -> impl IntoResponse {
 
 ## Validation
 
-38+ built-in rules with async database checks. Use `#[derive(Validate)]` to generate validation from attributes, or implement `RequestValidator` manually for full control:
+89 built-in field and collection validation features with async database checks, plus first-class file upload validation. Use `#[derive(Validate)]` to generate validation from attributes, or implement `RequestValidator` manually for full control:
 
 ```rust
 #[derive(Deserialize, ApiSchema, Validate)]
@@ -207,13 +207,13 @@ struct CreateUser {
     #[validate(required, email, unique("users", "email"))]
     email: String,
 
-    #[validate(required, min_length(8))]
+    #[validate(required, min(8), confirmed("password_confirmation"))]
     password: String,
 
-    #[validate(required, confirmed)]
+    #[validate(required)]
     password_confirmation: String,
 
-    #[validate(required, app_enum)]
+    #[validate(required, app_enum(UserStatus))]
     status: UserStatus,  // AppEnum auto-validates + auto-generates OpenAPI schema
 }
 
@@ -371,16 +371,16 @@ struct CreateUserRequest {
     #[validate(required, email, unique("users", "email"))]
     email: String,
 
-    #[validate(required, min_length(2))]
+    #[validate(required, min(2))]
     name: String,
 
-    #[validate(required, min_length(8))]
+    #[validate(required, min(8), confirmed("password_confirmation"))]
     password: String,
 
-    #[validate(required, confirmed)]
+    #[validate(required)]
     password_confirmation: String,
 
-    #[validate(required, app_enum)]
+    #[validate(required, app_enum(UserStatus))]
     status: UserStatus,   // auto-validated + auto-documented in OpenAPI
 }
 
@@ -617,7 +617,7 @@ make verify-release
 | [i18n](docs/guides/i18n.md) | Translation catalogs, locale resolution |
 | [Plugin Guide](docs/guides/plugins.md) | 5 real-world plugin use cases with full code |
 | [Datatable Guide](docs/guides/datatable.md) | Server-side datatables: filtering, sorting, export |
-| [Validation Guide](docs/guides/validation.md) | 38+ rules, custom rules, request validation |
+| [Validation Guide](docs/guides/validation.md) | 89 built-in field/collection validation features, custom rules, request validation |
 | [CONTRIBUTING](CONTRIBUTING.md) | Contributor workflow and expectations |
 | [CHANGELOG](CHANGELOG.md) | Release history |
 | [Release Checklist](docs/release-checklist.md) | Release procedure |

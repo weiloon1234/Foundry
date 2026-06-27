@@ -68,6 +68,10 @@ where
         self
     }
 
+    pub fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
+
     pub(crate) fn matches(&self, field: &str) -> bool {
         self.field == field || self.aliases.iter().any(|alias| alias == field)
     }

@@ -46,8 +46,9 @@ pub use relation::{
     RelationDef, RelationLoader,
 };
 pub use runtime::{
-    DatabaseManager, DatabaseTransaction, DbRecord, DbRecordStream, QueryExecutionOptions,
-    QueryExecutor, SlowQueryEntry,
+    DatabaseManager, DatabaseTransaction, DbRecord, DbRecordStream, NPlusOneSuspect,
+    QueryExecutionOptions, QueryExecutor, SlowQueryEntry, SqlObservabilitySnapshot,
+    SqlObservabilityStats,
 };
 
 pub(crate) use lifecycle::{

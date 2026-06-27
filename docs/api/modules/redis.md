@@ -32,10 +32,10 @@ struct RedisKey
 struct RedisManager
   fn from_config(config: &ConfigRepository) -> Result<Self>
   fn namespace(&self) -> &str
+  fn is_configured(&self) -> bool
   fn key(&self, suffix: impl AsRef<str>) -> RedisKey
   fn key_in_namespace( &self, namespace: impl AsRef<str>, suffix: impl AsRef<str>, ) -> RedisKey
   fn channel(&self, suffix: impl AsRef<str>) -> RedisChannel
   fn channel_in_namespace( &self, namespace: impl AsRef<str>, suffix: impl AsRef<str>, ) -> RedisChannel
   async fn connection(&self) -> Result<RedisConnection>
 ```
-

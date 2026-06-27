@@ -1,0 +1,5 @@
+error: `max_file_size` requires exactly 1 argument
+ --> tests/ui/derive/fail_validate_file_rule_extra_arg.rs:3:34
+  |
+3 |     #[validate(max_file_size(1024, 2048))]
+  |                                  ^

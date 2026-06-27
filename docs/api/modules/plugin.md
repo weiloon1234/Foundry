@@ -14,11 +14,14 @@ struct PluginAsset
   fn id(&self) -> &PluginAssetId
   fn kind(&self) -> &PluginAssetKind
   fn target_path(&self) -> &Path
+struct PluginAssetDescriptor
 struct PluginContributions
 struct PluginDependency
   fn new<I>(id: I, version_req: VersionReq) -> Self
   fn id(&self) -> &PluginId
   fn version_req(&self) -> &VersionReq
+struct PluginDependencyDescriptor
+struct PluginDescriptor
 struct PluginInstallOptions
   fn new() -> Self
   fn plugin<I>(self, plugin: I) -> Self
@@ -64,6 +67,7 @@ struct PluginRegistry
   fn new( plugins: Vec<PluginManifest>, contributions: HashMap<PluginId, PluginContributions>, ) -> Self
   fn plugins(&self) -> &[PluginManifest]
   fn plugin(&self, id: &PluginId) -> Option<&PluginManifest>
+  fn descriptors(&self) -> Vec<PluginDescriptor>
   fn install_assets( &self, options: &PluginInstallOptions, ) -> Result<Vec<PathBuf>>
   fn render_scaffold( &self, options: &PluginScaffoldOptions, ) -> Result<Vec<PathBuf>>
   fn contributions(&self, id: &PluginId) -> Option<&PluginContributions>
@@ -77,6 +81,7 @@ struct PluginScaffold
   fn description_text(&self) -> Option<&str>
   fn variables(&self) -> &[PluginScaffoldVar]
   fn files(&self) -> Vec<PathBuf>
+struct PluginScaffoldDescriptor
 struct PluginScaffoldOptions
   fn new<P, S>(plugin: P, scaffold: S) -> Self
   fn set_var(self, key: impl Into<String>, value: impl Into<String>) -> Self
@@ -88,6 +93,7 @@ struct PluginScaffoldVar
   fn default(self, value: impl Into<String>) -> Self
   fn name(&self) -> &str
   fn description_text(&self) -> Option<&str>
+struct PluginScaffoldVarDescriptor
   fn default_value(&self) -> Option<&str>
 trait Plugin
   fn manifest(&self) -> PluginManifest
@@ -95,4 +101,3 @@ trait Plugin
   fn boot<'life0, 'life1, 'async_trait>(
   fn shutdown<'life0, 'life1, 'async_trait>(
 ```
-

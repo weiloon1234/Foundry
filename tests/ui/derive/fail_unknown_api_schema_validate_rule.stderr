@@ -1,0 +1,5 @@
+error: unknown validation rule `emial`
+ --> tests/ui/derive/fail_unknown_api_schema_validate_rule.rs:5:16
+  |
+5 |     #[validate(emial)]
+  |                ^^^^^

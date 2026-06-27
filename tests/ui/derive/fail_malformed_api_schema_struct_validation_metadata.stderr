@@ -1,0 +1,5 @@
+error: expected `=`
+ --> tests/ui/derive/fail_malformed_api_schema_struct_validation_metadata.rs:4:34
+  |
+4 | #[validate(messages(email(unique "This email is already registered.")))]
+  |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

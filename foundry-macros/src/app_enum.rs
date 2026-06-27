@@ -1,68 +1,10 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Expr, ExprLit, Fields, Lit, Path, Variant};
 
-// ---------------------------------------------------------------------------
-// Compile-time identifier normalization (proc-macro version, independent from runtime)
-// ---------------------------------------------------------------------------
-
-fn push_token(tokens: &mut Vec<String>, current: &mut String) {
-    if !current.is_empty() {
-        tokens.push(std::mem::take(current));
-    }
-}
-
-fn is_separator(ch: char) -> bool {
-    matches!(ch, '_' | '-' | ' ')
-}
-
-fn should_split(prev: char, current: char, next: Option<char>) -> bool {
-    if is_separator(prev) || is_separator(current) {
-        return false;
-    }
-
-    (prev.is_lowercase() && current.is_uppercase())
-        || (prev.is_alphabetic() && current.is_ascii_digit())
-        || (prev.is_ascii_digit() && current.is_alphabetic())
-        || (prev.is_uppercase()
-            && current.is_uppercase()
-            && next.is_some_and(|ch| ch.is_lowercase()))
-}
-
-fn split_identifier_words(name: &str) -> Vec<String> {
-    let chars: Vec<char> = name.chars().collect();
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-
-    for (index, ch) in chars.iter().copied().enumerate() {
-        if is_separator(ch) {
-            push_token(&mut tokens, &mut current);
-            continue;
-        }
-
-        if let Some(prev) = current.chars().last() {
-            let next = chars.get(index + 1).copied();
-            if should_split(prev, ch, next) {
-                push_token(&mut tokens, &mut current);
-            }
-        }
-
-        current.push(ch);
-    }
-
-    push_token(&mut tokens, &mut current);
-    tokens
-}
-
-fn to_snake_case(name: &str) -> String {
-    split_identifier_words(name)
-        .into_iter()
-        .map(|token| token.to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join("_")
-}
+use crate::common::to_snake_case;
 
 // ---------------------------------------------------------------------------
 // Parsed variant info
@@ -72,8 +14,13 @@ struct VariantInfo {
     ident: syn::Ident,
     key_str: String,
     label_key_str: String,
-    aliases: Vec<String>,
+    aliases: Vec<VariantAlias>,
     discriminant: Option<i32>,
+}
+
+struct VariantAlias {
+    value: String,
+    span: proc_macro2::Span,
 }
 
 struct EnumArgs {
@@ -134,7 +81,7 @@ fn parse_enum_args(attrs: &[syn::Attribute]) -> syn::Result<EnumArgs> {
 
 fn parse_variant_attrs(
     variant: &Variant,
-) -> syn::Result<(Option<String>, Option<String>, Vec<String>)> {
+) -> syn::Result<(Option<String>, Option<String>, Vec<VariantAlias>)> {
     let mut key = None;
     let mut label_key = None;
     let mut aliases = Vec::new();
@@ -169,7 +116,10 @@ fn parse_variant_attrs(
                                 lit: Lit::Str(s), ..
                             }) = elem
                             {
-                                aliases.push(s.value());
+                                aliases.push(VariantAlias {
+                                    value: s.value(),
+                                    span: s.span(),
+                                });
                             } else {
                                 return Err(syn::Error::new(
                                     elem.span(),
@@ -335,6 +285,8 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         });
     }
 
+    validate_aliases(&variant_infos)?;
+
     // Generate all impl blocks
     let foundry_impl =
         generate_foundry_app_enum_impl(&ident, &enum_id, &variant_infos, is_int_backed)?;
@@ -342,6 +294,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let from_db = generate_from_db_value_impl(&ident, &variant_infos, is_int_backed)?;
     let serialize = generate_serialize_impl(&ident, &variant_infos, is_int_backed)?;
     let deserialize = generate_deserialize_impl(&ident, &variant_infos, is_int_backed)?;
+    let from_str = generate_from_str_impl(&ident);
     let api_schema = generate_api_schema_impl(&ident, &variant_infos, is_int_backed);
     let ts = generate_ts_impl(&ident, &variant_infos, is_int_backed);
     let typed_id = generate_typed_id_impl(&ident, &variant_infos, enum_args.id_type.as_ref());
@@ -352,10 +305,71 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         #from_db
         #serialize
         #deserialize
+        #from_str
         #api_schema
         #ts
         #typed_id
     })
+}
+
+fn validate_aliases(variants: &[VariantInfo]) -> syn::Result<()> {
+    let canonical_keys = variants
+        .iter()
+        .map(|variant| variant.key_str.clone())
+        .collect::<HashSet<_>>();
+    let mut seen_aliases = HashMap::<String, proc_macro2::Span>::new();
+
+    for variant in variants {
+        for alias in &variant.aliases {
+            if alias.value.trim().is_empty() || alias.value.trim() != alias.value {
+                return Err(syn::Error::new(
+                    alias.span,
+                    "AppEnum aliases must be non-empty trimmed string literals",
+                ));
+            }
+
+            if canonical_keys.contains(&alias.value) {
+                return Err(syn::Error::new(
+                    alias.span,
+                    format!(
+                        "AppEnum alias `{}` collides with a canonical key; aliases must be distinct from stored keys",
+                        alias.value
+                    ),
+                ));
+            }
+
+            if seen_aliases
+                .insert(alias.value.clone(), alias.span)
+                .is_some()
+            {
+                return Err(syn::Error::new(
+                    alias.span,
+                    format!("duplicate AppEnum alias `{}`", alias.value),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn generate_from_str_impl(ident: &syn::Ident) -> TokenStream {
+    quote! {
+        impl ::core::str::FromStr for #ident {
+            type Err = ::std::string::String;
+
+            fn from_str(value: &str) -> ::core::result::Result<Self, Self::Err> {
+                <Self as ::foundry::app_enum::FoundryAppEnum>::parse_key(value)
+                    .ok_or_else(|| {
+                        ::std::format!(
+                            "invalid {} key: {}",
+                            <Self as ::foundry::app_enum::FoundryAppEnum>::id(),
+                            value,
+                        )
+                    })
+            }
+        }
+    }
 }
 
 fn ts_string_literal(value: &str) -> String {
@@ -538,16 +552,20 @@ fn generate_foundry_app_enum_impl(
         if is_int_backed {
             let n = v.discriminant.unwrap();
             let l = &v.label_key_str;
+            let aliases = v.aliases.iter().map(|alias| alias.value.as_str());
             quote!(::foundry::app_enum::EnumOption {
                 value: ::foundry::app_enum::EnumKey::Int(#n),
                 label_key: #l.to_string(),
+                aliases: vec![#(#aliases.to_string()),*],
             })
         } else {
             let k = &v.key_str;
             let l = &v.label_key_str;
+            let aliases = v.aliases.iter().map(|alias| alias.value.as_str());
             quote!(::foundry::app_enum::EnumOption {
                 value: ::foundry::app_enum::EnumKey::String(#k.to_string()),
                 label_key: #l.to_string(),
+                aliases: vec![#(#aliases.to_string()),*],
             })
         }
     });
@@ -635,6 +653,7 @@ fn generate_parse_arms(variants: &[VariantInfo], is_int_backed: bool) -> TokenSt
         }
 
         for alias in &v.aliases {
+            let alias = &alias.value;
             alias_arms.push(quote! {
                 #alias => Some(Self::#v_ident)
             });
@@ -767,12 +786,12 @@ fn generate_serialize_impl(
         let arms = variants.iter().map(|v| {
             let v_ident = &v.ident;
             let n = v.discriminant.unwrap();
-            quote!(Self::#v_ident => #n.serialize(serializer))
+            quote!(Self::#v_ident => ::foundry::serde::Serialize::serialize(&#n, serializer))
         });
 
         Ok(quote! {
-            impl serde::Serialize for #ident {
-                fn serialize<S: serde::Serializer>(&self, serializer: S) -> ::core::result::Result<S::Ok, S::Error> {
+            impl ::foundry::serde::Serialize for #ident {
+                fn serialize<S: ::foundry::serde::Serializer>(&self, serializer: S) -> ::core::result::Result<S::Ok, S::Error> {
                     match self {
                         #(#arms),*
                     }
@@ -783,12 +802,12 @@ fn generate_serialize_impl(
         let arms = variants.iter().map(|v| {
             let v_ident = &v.ident;
             let k = &v.key_str;
-            quote!(Self::#v_ident => #k.serialize(serializer))
+            quote!(Self::#v_ident => ::foundry::serde::Serialize::serialize(#k, serializer))
         });
 
         Ok(quote! {
-            impl serde::Serialize for #ident {
-                fn serialize<S: serde::Serializer>(&self, serializer: S) -> ::core::result::Result<S::Ok, S::Error> {
+            impl ::foundry::serde::Serialize for #ident {
+                fn serialize<S: ::foundry::serde::Serializer>(&self, serializer: S) -> ::core::result::Result<S::Ok, S::Error> {
                     match self {
                         #(#arms),*
                     }
@@ -811,11 +830,11 @@ fn generate_deserialize_impl(
 
     if is_int_backed {
         Ok(quote! {
-            impl<'de> serde::Deserialize<'de> for #ident {
-                fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> ::core::result::Result<Self, D::Error> {
-                    let n = i32::deserialize(deserializer)?;
+            impl<'de> ::foundry::serde::Deserialize<'de> for #ident {
+                fn deserialize<D: ::foundry::serde::Deserializer<'de>>(deserializer: D) -> ::core::result::Result<Self, D::Error> {
+                    let n = <i32 as ::foundry::serde::Deserialize>::deserialize(deserializer)?;
                     <Self as ::foundry::app_enum::FoundryAppEnum>::parse_key(&n.to_string())
-                        .ok_or_else(|| serde::de::Error::custom(
+                        .ok_or_else(|| <D::Error as ::foundry::serde::de::Error>::custom(
                             format!("unknown {} variant: {}", #type_name, n)
                         ))
                 }
@@ -823,11 +842,11 @@ fn generate_deserialize_impl(
         })
     } else {
         Ok(quote! {
-            impl<'de> serde::Deserialize<'de> for #ident {
-                fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> ::core::result::Result<Self, D::Error> {
-                    let s = String::deserialize(deserializer)?;
+            impl<'de> ::foundry::serde::Deserialize<'de> for #ident {
+                fn deserialize<D: ::foundry::serde::Deserializer<'de>>(deserializer: D) -> ::core::result::Result<Self, D::Error> {
+                    let s = <String as ::foundry::serde::Deserialize>::deserialize(deserializer)?;
                     <Self as ::foundry::app_enum::FoundryAppEnum>::parse_key(&s)
-                        .ok_or_else(|| serde::de::Error::custom(
+                        .ok_or_else(|| <D::Error as ::foundry::serde::de::Error>::custom(
                             format!("unknown {} variant: {}", #type_name, s)
                         ))
                 }
@@ -863,8 +882,8 @@ fn generate_api_schema_impl(
 
     quote! {
         impl ::foundry::openapi::ApiSchema for #ident {
-            fn schema() -> ::serde_json::Value {
-                ::serde_json::json!({
+            fn schema() -> ::foundry::serde_json::Value {
+                ::foundry::serde_json::json!({
                     "type": #type_str,
                     "enum": [#enum_values]
                 })

@@ -1,0 +1,5 @@
+error: Foundry contract derives cannot represent custom serde field transforms such as `#[serde(with = "...")]`, `#[serde(serialize_with = "...")]`, or `#[serde(deserialize_with = "...")]`; use an explicit typed DTO shape or normalize legacy input before validation
+  --> tests/ui/derive/fail_api_schema_serde_serialize_with_field.rs:12:30
+   |
+12 |     #[serde(serialize_with = "serialize_email")]
+   |                              ^^^^^^^^^^^^^^^^^

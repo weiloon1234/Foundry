@@ -24,11 +24,14 @@ enum AuthError { Unauthorized, Forbidden, Internal }
   fn status_code(&self) -> StatusCode
   fn code(&self) -> Option<AuthErrorCode>
   fn message(&self) -> &str
+  fn response_body(&self) -> ErrorResponse
   fn payload(&self) -> Value
 enum AuthErrorCode { Show 13 variants    InvalidBearerToken, InvalidRefreshToken, MissingSessionCookie, InvalidSession, MissingAuthorizationHeader, InvalidAuthorizationHeader, InvalidAuthorizationScheme, MissingBearerToken, MissingAuthCredentials, MissingRequiredPermission, AuthenticatedActorNotFound, AuthenticatedModelNotFound, MaxConnectionsPerUserExceeded }
   const fn as_str(self) -> &'static str
   const fn translation_key(self) -> &'static str
   const fn default_message(self) -> &'static str
+enum AuthGuardKind { Bearer, Session }
+  fn as_str(self) -> &'static str
 struct Actor
   fn new<I, G>(id: I, guard: G) -> Self
   fn with_guard<I>(self, guard: I) -> Self
@@ -45,14 +48,20 @@ struct AuthErrorMessage
   fn code(&self) -> Option<AuthErrorCode>
 struct AuthManager
   fn default_guard(&self) -> &GuardId
+  fn descriptors(&self) -> Vec<AuthGuardDescriptor>
   async fn authenticate_headers( &self, headers: &HeaderMap, guard: Option<&GuardId>, ) -> Result<Actor, AuthError>
   async fn authenticate_token( &self, token: &str, guard: Option<&GuardId>, ) -> Result<Actor, AuthError>
   fn extract_token(&self, headers: &HeaderMap) -> Result<String, AuthError>
+struct AuthGuardDescriptor
+struct AuthPolicyDescriptor
+struct AuthenticatableDescriptor
 struct AuthenticatableRegistry
   async fn resolve_dynamic( &self, actor: &Actor, app: &AppContext, ) -> Result<Option<Box<dyn Any + Send + Sync>>>
   fn contains_guard(&self, guard: &GuardId) -> bool
+  fn descriptors(&self) -> Vec<AuthenticatableDescriptor>
 struct AuthenticatedModel
 struct Authorizer
+  fn descriptors(&self) -> Vec<AuthPolicyDescriptor>
   fn allows_permission( &self, actor: &Actor, permission: &PermissionId, ) -> bool
   fn allows_permissions( &self, actor: &Actor, permissions: &BTreeSet<PermissionId>, ) -> bool
   async fn authorize_permissions( &self, actor: &Actor, permissions: &BTreeSet<PermissionId>, ) -> Result<(), AuthError>
@@ -73,6 +82,14 @@ trait BearerAuthenticator
 trait Policy
   fn evaluate<'life0, 'life1, 'life2, 'async_trait>(
 ```
+
+## Notes
+
+- `types:export` writes `AuthManifest.ts` from guard/policy registrations and
+  frontend-safe auth config. It includes token/session TTLs, session cookie
+  integration metadata, password-reset and email-verification expiry, lockout
+  policy, MFA settings, and per-guard token TTL overrides without exporting
+  token length, pruning internals, or raw session cookie domain.
 
 ## foundry::auth::email_verification
 
@@ -211,4 +228,3 @@ trait HasToken: Authenticatable
   fn sync_token_abilities_with<'life0, 'life1, 'async_trait, E>(
 fn actor_has_mfa_pending(actor: &Actor) -> bool
 ```
-

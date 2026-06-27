@@ -1,6 +1,6 @@
 # validation
 
-Validation: 38+ rules, custom rules, request validation extractor
+Validation: 89 built-in field/collection validation features, custom rules, request validation extractor
 
 [Back to index](../index.md)
 
@@ -19,31 +19,31 @@ struct EachValidator
   fn numeric(self) -> Self
   fn alpha(self) -> Self
   fn alpha_numeric(self) -> Self
-  fn in_list( self, values: impl IntoIterator<Item = impl Into<String>>, ) -> Self
-  fn not_in(self, values: impl IntoIterator<Item = impl Into<String>>) -> Self
+  fn in_list( self, values: impl IntoIterator<Item = impl ToString>, ) -> Self
+  fn not_in(self, values: impl IntoIterator<Item = impl ToString>) -> Self
   fn starts_with(self, prefix: impl Into<String>) -> Self
   fn ends_with(self, suffix: impl Into<String>) -> Self
   fn ip(self) -> Self
   fn json(self) -> Self
-  fn confirmed( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
+  fn confirmed( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
   fn digits(self) -> Self
   fn timezone(self) -> Self
   fn date(self) -> Self
   fn time(self) -> Self
   fn datetime(self) -> Self
   fn local_datetime(self) -> Self
-  fn before( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
-  fn before_or_equal( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
-  fn after( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
-  fn after_or_equal( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
+  fn before( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
+  fn before_or_equal( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
+  fn after( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
+  fn after_or_equal( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
   fn min_numeric(self, min: f64) -> Self
   fn max_numeric(self, max: f64) -> Self
   fn integer(self) -> Self
   fn between(self, min: f64, max: f64) -> Self
   fn ipv4(self) -> Self
   fn ipv6(self) -> Self
-  fn same( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
-  fn different( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
+  fn same( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
+  fn different( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
   fn unique(self, table: impl Into<String>, column: impl Into<String>) -> Self
   fn exists(self, table: impl Into<String>, column: impl Into<String>) -> Self
   fn app_enum<E: FoundryAppEnum>(self) -> Self
@@ -64,31 +64,31 @@ struct FieldValidator
   fn numeric(self) -> Self
   fn alpha(self) -> Self
   fn alpha_numeric(self) -> Self
-  fn in_list( self, values: impl IntoIterator<Item = impl Into<String>>, ) -> Self
-  fn not_in(self, values: impl IntoIterator<Item = impl Into<String>>) -> Self
+  fn in_list( self, values: impl IntoIterator<Item = impl ToString>, ) -> Self
+  fn not_in(self, values: impl IntoIterator<Item = impl ToString>) -> Self
   fn starts_with(self, prefix: impl Into<String>) -> Self
   fn ends_with(self, suffix: impl Into<String>) -> Self
   fn ip(self) -> Self
   fn json(self) -> Self
-  fn confirmed( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
+  fn confirmed( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
   fn digits(self) -> Self
   fn timezone(self) -> Self
   fn date(self) -> Self
   fn time(self) -> Self
   fn datetime(self) -> Self
   fn local_datetime(self) -> Self
-  fn before( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
-  fn before_or_equal( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
-  fn after( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
-  fn after_or_equal( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
+  fn before( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
+  fn before_or_equal( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
+  fn after( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
+  fn after_or_equal( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
   fn min_numeric(self, min: f64) -> Self
   fn max_numeric(self, max: f64) -> Self
   fn integer(self) -> Self
   fn between(self, min: f64, max: f64) -> Self
   fn ipv4(self) -> Self
   fn ipv6(self) -> Self
-  fn same( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
-  fn different( self, other_field: impl Into<String>, other_value: impl Into<String>, ) -> Self
+  fn same( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
+  fn different( self, other_field: impl Into<String>, other_value: impl ToString, ) -> Self
   fn unique(self, table: impl Into<String>, column: impl Into<String>) -> Self
   fn exists(self, table: impl Into<String>, column: impl Into<String>) -> Self
   fn app_enum<E: FoundryAppEnum>(self) -> Self
@@ -117,7 +117,7 @@ struct ValidationErrors
 struct Validator
   fn new(app: AppContext) -> Self
   fn app(&self) -> &AppContext
-  fn field<'a>( &'a mut self, name: impl Into<String>, value: impl Into<String>, ) -> FieldValidator<'a>
+  fn field<'a>( &'a mut self, name: impl Into<String>, value: impl ToString, ) -> FieldValidator<'a>
   fn each<'a, T>( &'a mut self, field: impl Into<String>, items: &'a [T], ) -> EachValidator<'a, T>
   fn finish(self) -> Result<(), ValidationErrors>
   fn add_error(&mut self, field: &str, code: &str, params: &[(&str, &str)])
@@ -146,4 +146,3 @@ fn check_max_size(file: &UploadedFile, max_kb: u64) -> bool
 async fn get_image_dimensions(file: &UploadedFile) -> Result<(u32, u32)>
 async fn is_image(file: &UploadedFile) -> Result<bool>
 ```
-

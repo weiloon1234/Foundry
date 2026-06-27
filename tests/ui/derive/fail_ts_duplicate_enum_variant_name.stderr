@@ -1,0 +1,6 @@
+error: Foundry contract derive contains duplicate JSON enum variant `pending_review` from Rust variants `PendingReview` and `Pending`; use unique serde rename values or split the enum
+ --> tests/ui/derive/fail_ts_duplicate_enum_variant_name.rs:7:5
+  |
+7 | /     #[serde(rename = "pending_review")]
+8 | |     Pending,
+  | |___________^

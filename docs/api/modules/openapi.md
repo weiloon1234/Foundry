@@ -34,5 +34,5 @@ trait ApiSchema
 ```rust
 struct DocumentedRoute
 fn generate_openapi_spec( title: &str, version: &str, routes: &[DocumentedRoute], ) -> Value
+fn try_generate_openapi_spec( title: &str, version: &str, routes: &[DocumentedRoute], ) -> Result<Value>
 ```
-

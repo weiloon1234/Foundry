@@ -1,0 +1,5 @@
+error: validation rule accepts no positional arguments; use `message = "..."` for message overrides
+ --> tests/ui/derive/fail_api_schema_no_arg_validate_rule_positional_arg.rs:5:25
+  |
+5 |     #[validate(required("email is required"))]
+  |                         ^^^^^^^^^^^^^^^^^^^

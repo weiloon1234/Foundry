@@ -87,7 +87,15 @@ pub struct EmailManager {
     from_config: EmailFromConfig,
     attachment_limits: config::EmailAttachmentLimits,
     drivers: Arc<HashMap<String, Arc<dyn EmailDriver>>>,
+    mailer_drivers: Arc<HashMap<String, String>>,
     app: AppContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailMailerDescriptor {
+    pub name: String,
+    pub driver: String,
+    pub default: bool,
 }
 
 impl std::fmt::Debug for EmailManager {
@@ -115,11 +123,13 @@ impl EmailManager {
                 from_config: email_config.from,
                 attachment_limits,
                 drivers: Arc::new(HashMap::new()),
+                mailer_drivers: Arc::new(HashMap::new()),
                 app,
             });
         }
 
         let mut drivers = HashMap::new();
+        let mut mailer_drivers = HashMap::new();
         for (name, table) in &email_config.mailers {
             let driver_key = table
                 .get("driver")
@@ -160,6 +170,7 @@ impl EmailManager {
                 }
             };
             drivers.insert(name.clone(), driver);
+            mailer_drivers.insert(name.clone(), driver_key.to_string());
         }
 
         // Validate default mailer exists
@@ -176,6 +187,7 @@ impl EmailManager {
             from_config: email_config.from,
             attachment_limits,
             drivers: Arc::new(drivers),
+            mailer_drivers: Arc::new(mailer_drivers),
             app,
         })
     }
@@ -207,6 +219,20 @@ impl EmailManager {
         let mut names: Vec<String> = self.drivers.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    pub fn descriptors(&self) -> Vec<EmailMailerDescriptor> {
+        let mut descriptors = self
+            .mailer_drivers
+            .iter()
+            .map(|(name, driver)| EmailMailerDescriptor {
+                name: name.clone(),
+                driver: driver.clone(),
+                default: name == &self.default,
+            })
+            .collect::<Vec<_>>();
+        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        descriptors
     }
 
     /// Get the driver for a mailer (used by EmailMailer internally).
@@ -341,6 +367,42 @@ mod tests {
 
         assert_eq!(manager.default_mailer_name(), "resend");
         assert_eq!(manager.configured_mailers(), vec!["resend"]);
+    }
+
+    #[test]
+    fn email_manager_descriptors_include_driver_and_default_metadata() {
+        let config = config_from_toml(
+            r#"
+            [email]
+            default = "log"
+            from.address = "noreply@example.com"
+
+            [email.mailers.log]
+            target = "email.outbound"
+
+            [email.mailers.tenant]
+            driver = "smtp"
+            host = "smtp.example.com"
+        "#,
+        );
+        let manager = EmailManager::from_config(&config, HashMap::new(), test_app())
+            .expect("mailers should configure");
+
+        assert_eq!(
+            manager.descriptors(),
+            vec![
+                EmailMailerDescriptor {
+                    name: "log".to_string(),
+                    driver: "log".to_string(),
+                    default: true,
+                },
+                EmailMailerDescriptor {
+                    name: "tenant".to_string(),
+                    driver: "smtp".to_string(),
+                    default: false,
+                },
+            ]
+        );
     }
 
     #[test]

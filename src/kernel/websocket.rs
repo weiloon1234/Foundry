@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::auth::{Actor, AuthError, AuthErrorCode};
 use crate::config::WebSocketConfig;
-use crate::foundation::{AppContext, Error, Result};
+use crate::foundation::{AppContext, Error, ErrorResponse, Result};
 use crate::logging::{
     catch_async_panic, catch_future_panic, panic_payload_message, AuthOutcome, RuntimeDiagnostics,
     WebSocketConnectionState,
@@ -28,8 +28,10 @@ use crate::support::runtime::RuntimeBackend;
 use crate::support::sync::lock_unpoisoned;
 use crate::support::{ChannelEventId, ChannelId, GuardId};
 use crate::websocket::{
-    presence_key, presence_member_value, ClientAction, ClientMessage, RegisteredChannel,
-    ServerMessage, WebSocketContext, ACK_EVENT, ERROR_EVENT, PRESENCE_JOIN_EVENT,
+    is_reserved_channel_protocol_event, presence_key, presence_member_value,
+    reserved_channel_protocol_event_message, ClientAction, ClientMessage, RegisteredChannel,
+    ServerMessage, WebSocketAckPayload, WebSocketContext, WebSocketPresenceJoinPayload,
+    WebSocketPresenceLeavePayload, ACK_EVENT, ERROR_EVENT, PRESENCE_JOIN_EVENT,
     PRESENCE_LEAVE_EVENT, SUBSCRIBED_EVENT, SYSTEM_CHANNEL, UNSUBSCRIBED_EVENT,
 };
 
@@ -548,13 +550,7 @@ async fn websocket_handler(
         .map(|config| config.environment.is_production_like())
         .unwrap_or(false);
     if !origin_allowed(&headers, &state.ws_config.allowed_origins, production_like) {
-        return (
-            StatusCode::FORBIDDEN,
-            axum::Json(serde_json::json!({
-                "message": "websocket origin is not allowed",
-            })),
-        )
-            .into_response();
+        return websocket_rejection(StatusCode::FORBIDDEN, "websocket origin is not allowed");
     }
 
     // Support short-lived tokens via query param for browser WebSocket
@@ -621,9 +617,7 @@ fn websocket_rejection(status: StatusCode, message: impl Into<String>) -> Respon
     };
     let mut response = (
         status,
-        axum::Json(serde_json::json!({
-            "message": public_message,
-        })),
+        axum::Json(ErrorResponse::new(public_message, status)),
     )
         .into_response();
     if status.is_server_error() {
@@ -635,6 +629,10 @@ fn websocket_rejection(status: StatusCode, message: impl Into<String>) -> Respon
         );
     }
     response
+}
+
+fn protocol_payload(payload: impl serde::Serialize) -> serde_json::Value {
+    serde_json::to_value(payload).expect("websocket protocol payload should serialize")
 }
 
 fn validate_query_token_config(config: &WebSocketConfig) -> Result<()> {
@@ -965,7 +963,10 @@ async fn process_client_message(
                     channel: SYSTEM_CHANNEL,
                     event: ERROR_EVENT,
                     room: None,
-                    payload: serde_json::json!({"message": "rate limit exceeded"}),
+                    payload: protocol_payload(ErrorResponse::new(
+                        "rate limit exceeded",
+                        StatusCode::TOO_MANY_REQUESTS,
+                    )),
                 }),
             )
             .await
@@ -1074,10 +1075,7 @@ async fn process_client_message(
                     channel: message.channel.clone(),
                     event: PRESENCE_JOIN_EVENT,
                     room: message.room.clone(),
-                    payload: serde_json::json!({
-                        "actor_id": actor_id,
-                        "joined_at": now,
-                    }),
+                    payload: protocol_payload(WebSocketPresenceJoinPayload::new(actor_id, now)),
                 };
                 state.broadcast_except(connection_id, &join_msg).await;
             }
@@ -1163,9 +1161,7 @@ async fn process_client_message(
                     channel: entry.channel,
                     event: PRESENCE_LEAVE_EVENT,
                     room: entry.room,
-                    payload: serde_json::json!({
-                        "actor_id": entry.actor_id,
-                    }),
+                    payload: protocol_payload(WebSocketPresenceLeavePayload::new(entry.actor_id)),
                 };
                 state.broadcast(&leave_msg).await;
             }
@@ -1235,9 +1231,9 @@ async fn process_client_message(
 
             // Send ACK if requested.
             if let Some(ack_id) = message.ack_id {
-                let (status, error) = match &result {
-                    Ok(()) => ("ok", None),
-                    Err(e) => ("error", Some(e.to_string())),
+                let payload = match &result {
+                    Ok(()) => WebSocketAckPayload::ok(ack_id),
+                    Err(error) => WebSocketAckPayload::error(ack_id, error.to_string()),
                 };
                 let _ = state
                     .send(
@@ -1246,11 +1242,7 @@ async fn process_client_message(
                             channel: SYSTEM_CHANNEL,
                             event: ACK_EVENT,
                             room: None,
-                            payload: serde_json::json!({
-                                "ack_id": ack_id,
-                                "status": status,
-                                "error": error,
-                            }),
+                            payload: protocol_payload(payload),
                         }),
                     )
                     .await;
@@ -1263,6 +1255,27 @@ async fn process_client_message(
                 return Err(Error::http(
                     403,
                     "client events not allowed on this channel",
+                ));
+            }
+            let event_id = message
+                .event
+                .clone()
+                .unwrap_or_else(|| ChannelEventId::new("client_event"));
+            if is_reserved_channel_protocol_event(&event_id) {
+                return Err(Error::http(
+                    400,
+                    reserved_channel_protocol_event_message("client", &event_id),
+                ));
+            }
+            if !channel.options.client_events.is_empty()
+                && !channel.options.client_events.contains(&event_id)
+            {
+                return Err(Error::http(
+                    403,
+                    format!(
+                        "client event `{event_id}` is not allowed on channel `{}`",
+                        message.channel
+                    ),
                 ));
             }
 
@@ -1296,9 +1309,6 @@ async fn process_client_message(
                 return Ok(());
             }
 
-            let event_id = message
-                .event
-                .unwrap_or_else(|| ChannelEventId::new("client_event"));
             let server_msg = ServerMessage {
                 channel: message.channel,
                 event: event_id,
@@ -2226,6 +2236,7 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(payload["message"], Error::internal_server_error_message());
+        assert_eq!(payload["status"], 500);
         assert!(!payload["message"].as_str().unwrap().contains("secret"));
     }
 
@@ -2435,6 +2446,60 @@ mod tests {
             Error::Http { status, .. } if *status == 429
         ));
         assert_eq!(error.to_string(), "websocket subscription limit exceeded");
+    }
+
+    #[tokio::test]
+    async fn websocket_rate_limit_error_uses_standard_error_payload() {
+        let mut registrar = WebSocketRegistrar::new();
+        registrar
+            .channel(
+                ChannelId::new("chat"),
+                |_context: WebSocketContext, _payload: serde_json::Value| async { Ok(()) },
+            )
+            .unwrap();
+        let state = websocket_state_with_config(
+            registrar.into_channels(),
+            "ws-rate-limit-error-payload",
+            WebSocketConfig {
+                max_messages_per_second: 1,
+                ..WebSocketConfig::default()
+            },
+        );
+        let (connection_id, mut outbound, _last_pong) =
+            state.hub.register(ConnectionIdentity::default()).await;
+
+        process_client_message(
+            &state,
+            connection_id,
+            serde_json::json!({
+                "action": "subscribe",
+                "channel": "chat",
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let subscribed = next_json(&mut outbound).await;
+        assert_eq!(subscribed.event, SUBSCRIBED_EVENT);
+
+        process_client_message(
+            &state,
+            connection_id,
+            serde_json::json!({
+                "action": "message",
+                "channel": "chat",
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let limited = next_json(&mut outbound).await;
+        assert_eq!(limited.channel, SYSTEM_CHANNEL);
+        assert_eq!(limited.event, ERROR_EVENT);
+        assert_eq!(limited.payload["message"], "rate limit exceeded");
+        assert_eq!(limited.payload["status"], 429);
+        assert!(limited.payload.get("error").is_none());
     }
 
     #[tokio::test]

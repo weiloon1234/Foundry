@@ -1,0 +1,5 @@
+error: duplicate validation attribute label for field `email`
+ --> tests/ui/derive/fail_api_schema_duplicate_struct_attribute.rs:4:48
+  |
+4 | #[validate(attributes(email = "email address", email = "login email"))]
+  |                                                ^^^^^

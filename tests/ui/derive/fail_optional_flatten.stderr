@@ -1,0 +1,6 @@
+error: `#[serde(flatten)]` on `Option<T>` is not supported by Foundry's TypeScript export; flatten a struct with optional fields instead
+  --> tests/ui/derive/fail_optional_flatten.rs:10:5
+   |
+10 | /     #[serde(flatten)]
+11 | |     child: Option<FlattenedChild>,
+   | |_________________________________^

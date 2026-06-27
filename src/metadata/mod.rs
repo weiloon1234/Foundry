@@ -1,4 +1,4 @@
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::database::{DbValue, OrderBy, Query, Sql};
@@ -7,7 +7,9 @@ use crate::foundation::{AppContext, Error, Result};
 const METADATA_TABLE: &str = "metadata";
 
 /// A metadata record — polymorphic key-value store.
-#[derive(Clone, Debug)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct ModelMeta {
     pub id: String,
     pub metadatable_type: String,

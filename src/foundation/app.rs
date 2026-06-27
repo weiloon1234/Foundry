@@ -1184,7 +1184,7 @@ impl AppBuilder {
         app.container().singleton_arc(error_reporter_registry)?;
 
         app.container().singleton_arc(diagnostics.clone())?;
-        app.container().singleton_arc(websocket_publisher)?;
+        app.container().singleton_arc(websocket_publisher.clone())?;
         app.container().singleton_arc(event_bus)?;
         app.container().singleton_arc(job_runtime)?;
         app.container().singleton_arc(job_dispatcher)?;
@@ -1216,6 +1216,10 @@ impl AppBuilder {
             app.container().singleton_arc(route_registry)?;
         }
 
+        let mut boot_websocket_routes = Vec::new();
+        boot_websocket_routes.extend(prepared_plugins.websocket_routes.clone());
+        boot_websocket_routes.extend(websocket_routes.clone());
+
         // Freeze registries that providers populated during register() before boot()
         // so boot hooks can resolve the same runtime services as handlers and jobs.
         let custom_storage_drivers =
@@ -1243,18 +1247,23 @@ impl AppBuilder {
             app.container().singleton_arc(crypt)?;
         }
 
-        if profile.websocket_routes {
-            let mut boot_websocket_routes = prepared_plugins.websocket_routes;
-            boot_websocket_routes.extend(websocket_routes);
+        let websocket_channel_registry =
+            if profile.websocket_routes || !boot_websocket_routes.is_empty() {
+                let ws_registrar = crate::websocket::build_registrar(&boot_websocket_routes)?;
+                let ws_registry = Arc::new(
+                    crate::websocket::WebSocketChannelRegistry::from_registrar(ws_registrar),
+                );
+                websocket_publisher.attach_channel_registry(ws_registry.clone());
+                Some(ws_registry)
+            } else {
+                None
+            };
 
-            let ws_registrar = crate::websocket::build_registrar(&boot_websocket_routes)?;
-            let ws_registry =
-                crate::websocket::WebSocketChannelRegistry::from_registrar(ws_registrar);
+        if let (true, Some(ws_registry)) = (profile.websocket_routes, websocket_channel_registry) {
             for descriptor in ws_registry.descriptors() {
                 diagnostics.register_websocket_channel(&descriptor.id);
             }
-            app.container()
-                .singleton_arc(std::sync::Arc::new(ws_registry))?;
+            app.container().singleton_arc(ws_registry)?;
         }
 
         for provider in &prepared_plugins.providers {
@@ -1291,6 +1300,13 @@ impl AppBuilder {
 
         diagnostics.mark_bootstrap_complete();
 
+        let collect_schedule_metadata = profile.schedules || profile.commands;
+        let mut boot_schedules = Vec::new();
+        if collect_schedule_metadata {
+            boot_schedules.extend(prepared_plugins.schedules.clone());
+            boot_schedules.extend(schedules.clone());
+        }
+
         let mut boot_commands = Vec::new();
         if profile.commands {
             boot_commands.extend([
@@ -1309,17 +1325,15 @@ impl AppBuilder {
             if !prepared_plugins.registry.is_empty() {
                 boot_commands.push(crate::plugin::builtin_cli_registrar());
             }
-            boot_commands.push(crate::typescript::builtin_cli_registrar(
-                boot_routes.clone(),
-            ));
+            boot_commands.push(
+                crate::typescript::builtin_cli_registrar_with_websocket_routes_and_schedules(
+                    boot_routes.clone(),
+                    boot_websocket_routes.clone(),
+                    boot_schedules.clone(),
+                ),
+            );
             boot_commands.extend(prepared_plugins.commands);
             boot_commands.extend(commands);
-        }
-
-        let mut boot_schedules = Vec::new();
-        if profile.schedules {
-            boot_schedules.extend(prepared_plugins.schedules);
-            boot_schedules.extend(schedules);
         }
 
         let mut boot_middlewares = Vec::new();
@@ -1555,14 +1569,22 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use semver::{Version, VersionReq};
     use serde::Serialize;
     use tempfile::tempdir;
 
     use super::{finish_kernel_run, run_after_commit_callbacks, App};
-    use crate::database::AfterCommitCallback;
+    use crate::database::{AfterCommitCallback, ProjectionQuery};
+    use crate::datatable::{Datatable, DatatableColumn, DatatableContext, DatatableSort};
     use crate::events::{Event, EventContext, EventListener};
     use crate::foundation::{AppContext, Error, Result, ServiceProvider, ServiceRegistrar};
-    use crate::support::{EventId, RouteId};
+    use crate::plugin::{Plugin, PluginManifest};
+    use crate::scheduler::{CronExpression, ScheduleOptions};
+    use crate::support::{
+        ChannelEventId, ChannelId, EventId, GuardId, PermissionId, PolicyId, ProbeId, RouteId,
+        ScheduleId, ValidationRuleId,
+    };
+    use crate::validation::{RuleContext, ValidationError, ValidationRule};
 
     struct TestProvider {
         order: Arc<Mutex<Vec<&'static str>>>,
@@ -1585,6 +1607,52 @@ mod tests {
 
     impl Event for AppAwareFactoryEvent {
         const ID: EventId = EventId::new("tests.foundation.app_aware_factory");
+    }
+
+    struct TypesExportValidationRule;
+
+    #[async_trait]
+    impl ValidationRule for TypesExportValidationRule {
+        async fn validate(
+            &self,
+            _context: &RuleContext,
+            _value: &str,
+        ) -> std::result::Result<(), ValidationError> {
+            Ok(())
+        }
+    }
+
+    struct TypesExportReadinessCheck;
+
+    #[async_trait]
+    impl crate::logging::ReadinessCheck for TypesExportReadinessCheck {
+        async fn run(&self, _app: &AppContext) -> Result<crate::logging::ProbeResult> {
+            Ok(crate::logging::ProbeResult::healthy(ProbeId::new(
+                "plugin.types_export",
+            )))
+        }
+    }
+
+    struct TypesExportPlugin;
+
+    #[async_trait]
+    impl Plugin for TypesExportPlugin {
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new(
+                crate::plugin::PluginId::new("foundry.types-export-test"),
+                Version::parse("1.0.0").unwrap(),
+                VersionReq::parse("^0.1").unwrap(),
+            )
+            .description("Types export test plugin")
+        }
+
+        fn register(&self, registrar: &mut crate::plugin::PluginRegistrar) -> Result<()> {
+            registrar.register_readiness_check(
+                ProbeId::new("plugin.types_export"),
+                TypesExportReadinessCheck,
+            );
+            Ok(())
+        }
     }
 
     struct AppAwareFactoryListener {
@@ -1628,6 +1696,94 @@ mod tests {
     struct RegisterPanicProvider;
 
     struct BootPanicProvider;
+
+    #[derive(Clone, Serialize, crate::Projection)]
+    struct TypesExportDatatableRow {
+        id: i64,
+        name: String,
+    }
+
+    struct TypesExportDatatable;
+
+    #[async_trait]
+    impl Datatable for TypesExportDatatable {
+        type Row = TypesExportDatatableRow;
+        type Query = ProjectionQuery<TypesExportDatatableRow>;
+
+        const ID: &'static str = "types-export.users";
+
+        fn query(_ctx: &DatatableContext) -> Self::Query {
+            ProjectionQuery::table("types_export_users")
+        }
+
+        fn columns() -> Vec<DatatableColumn<Self::Row>> {
+            vec![
+                DatatableColumn::field(TypesExportDatatableRow::ID)
+                    .label("ID")
+                    .sortable()
+                    .exportable(),
+                DatatableColumn::field(TypesExportDatatableRow::NAME)
+                    .label("Name")
+                    .filter_by(TypesExportDatatableRow::NAME.column_ref_from("types_export_users")),
+            ]
+        }
+
+        fn default_sort() -> Vec<DatatableSort<Self::Row>> {
+            vec![DatatableSort::asc(TypesExportDatatableRow::ID)]
+        }
+    }
+
+    struct TypesExportDatatableProvider;
+
+    #[async_trait]
+    impl ServiceProvider for TypesExportDatatableProvider {
+        async fn register(&self, registrar: &mut ServiceRegistrar) -> Result<()> {
+            registrar.register_datatable::<TypesExportDatatable>()?;
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct TypesExportUser;
+
+    impl crate::database::Model for TypesExportUser {
+        type Lifecycle = crate::database::NoModelLifecycle;
+
+        fn table_meta() -> &'static crate::database::TableMeta<Self> {
+            unimplemented!("metadata-only test stub")
+        }
+    }
+
+    #[async_trait]
+    impl crate::auth::Authenticatable for TypesExportUser {
+        fn guard() -> GuardId {
+            GuardId::new("api")
+        }
+    }
+
+    struct TypesExportPolicy;
+
+    #[async_trait]
+    impl crate::auth::Policy for TypesExportPolicy {
+        async fn evaluate(&self, _actor: &crate::auth::Actor, _app: &AppContext) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    struct TypesExportAuthProvider;
+
+    #[async_trait]
+    impl ServiceProvider for TypesExportAuthProvider {
+        async fn register(&self, registrar: &mut ServiceRegistrar) -> Result<()> {
+            registrar.register_guard(
+                GuardId::new("api"),
+                crate::auth::StaticBearerAuthenticator::new(),
+            )?;
+            registrar.register_policy(PolicyId::new("reports.view"), TypesExportPolicy)?;
+            registrar.register_authenticatable::<TypesExportUser>()?;
+            Ok(())
+        }
+    }
 
     async fn route_url_health() -> &'static str {
         "ok"
@@ -2152,8 +2308,6 @@ mod tests {
 
     #[tokio::test]
     async fn cli_kernel_does_not_register_websocket_channel_registry() {
-        use crate::support::ChannelId;
-
         let kernel = crate::App::builder()
             .register_websocket_routes(|r| {
                 r.channel(ChannelId::new("alerts"), |_ctx, _payload| async { Ok(()) })?;
@@ -2167,6 +2321,370 @@ mod tests {
         assert!(error
             .to_string()
             .contains("WebSocketChannelRegistry` not registered"));
+    }
+
+    #[tokio::test]
+    async fn worker_kernel_attaches_websocket_metadata_to_publisher() {
+        let kernel = crate::App::builder()
+            .register_websocket_routes(|r| {
+                r.channel_with_options(
+                    ChannelId::new("alerts"),
+                    |_ctx, _payload| async { Ok(()) },
+                    crate::websocket::WebSocketChannelOptions::new()
+                        .server_event(ChannelEventId::new("sent")),
+                )?;
+                Ok(())
+            })
+            .build_worker_kernel()
+            .await
+            .unwrap();
+
+        let publisher = kernel.app().websocket().unwrap();
+        publisher
+            .publish(
+                ChannelId::new("alerts"),
+                ChannelEventId::new("sent"),
+                None,
+                serde_json::json!({ "ok": true }),
+            )
+            .await
+            .unwrap();
+
+        let error = publisher
+            .publish(
+                ChannelId::new("alerts"),
+                ChannelEventId::new("missed"),
+                None,
+                serde_json::json!({ "ok": false }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("websocket channel `alerts` does not document server event `missed`"),
+            "unexpected error: {error}"
+        );
+
+        let registry_error = kernel.app().websocket_channels().unwrap_err();
+        assert!(registry_error
+            .to_string()
+            .contains("WebSocketChannelRegistry` not registered"));
+    }
+
+    #[tokio::test]
+    async fn types_export_includes_registered_websocket_channels() {
+        let dir = tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let storage_root = dir.path().join("storage");
+        let locales_root = dir.path().join("locales");
+        let output = dir.path().join("types");
+        let output_arg = output.to_string_lossy().into_owned();
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(locales_root.join("en")).unwrap();
+        fs::create_dir_all(locales_root.join("ms")).unwrap();
+        fs::write(
+            locales_root.join("en/messages.json"),
+            r#"{ "welcome": "Welcome" }"#,
+        )
+        .unwrap();
+        fs::write(
+            locales_root.join("ms/messages.json"),
+            r#"{ "welcome": "Selamat datang" }"#,
+        )
+        .unwrap();
+        fs::write(
+            config_dir.join("storage.toml"),
+            format!(
+                r#"
+[storage]
+default = "uploads"
+
+[storage.disks.uploads]
+driver = "local"
+root = "{}"
+visibility = "public"
+"#,
+                storage_root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            config_dir.join("email.toml"),
+            r#"
+[email]
+default = "log"
+from.address = "noreply@example.com"
+
+[email.mailers.log]
+driver = "log"
+target = "email.outbound"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            config_dir.join("i18n.toml"),
+            format!(
+                r#"
+[i18n]
+default_locale = "en"
+fallback_locale = "en"
+resource_path = "{}"
+"#,
+                locales_root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let kernel = crate::App::builder()
+            .load_config_dir(&config_dir)
+            .register_plugin(TypesExportPlugin)
+            .register_provider(TypesExportAuthProvider)
+            .register_provider(TypesExportDatatableProvider)
+            .register_websocket_routes(|r| {
+                r.channel_with_options(
+                    ChannelId::new("chat"),
+                    |_ctx, _payload| async { Ok(()) },
+                    crate::websocket::WebSocketChannelOptions::new()
+                        .presence(true)
+                        .replay(10)
+                        .allow_client_events(true)
+                        .guard(GuardId::new("api"))
+                        .permission(PermissionId::new("chat:read")),
+                )?;
+                Ok(())
+            })
+            .register_schedule(|registry| {
+                registry.cron_with_options(
+                    ScheduleId::new("reports.daily"),
+                    CronExpression::daily()?,
+                    ScheduleOptions::new()
+                        .without_overlapping()
+                        .environments(&["production"])
+                        .before(|_| async { Ok(()) }),
+                    |_| async { Ok(()) },
+                )?;
+                Ok(())
+            })
+            .register_validation_rule(ValidationRuleId::new("mobile"), TypesExportValidationRule)
+            .register_validation_rule(
+                ValidationRuleId::new("openapi.mobile"),
+                TypesExportValidationRule,
+            )
+            .register_validation_rule(
+                ValidationRuleId::new("tenant.mobile"),
+                TypesExportValidationRule,
+            )
+            .build_cli_kernel()
+            .await
+            .unwrap();
+
+        kernel
+            .run_with_args(["foundry", "types:export", "--output", output_arg.as_str()])
+            .await
+            .unwrap();
+
+        let manifest = fs::read_to_string(output.join("WebSocketChannelManifest.ts")).unwrap();
+        assert!(
+            manifest.contains("\"chat\": { id: \"chat\""),
+            "expected websocket channel manifest entry:\n{manifest}"
+        );
+        assert!(
+            manifest.contains("replayCount: 10"),
+            "expected websocket replay metadata:\n{manifest}"
+        );
+        assert!(
+            manifest.contains("guard: \"api\""),
+            "expected websocket guard metadata:\n{manifest}"
+        );
+        assert!(
+            manifest.contains("permissions: [\"chat:read\"]"),
+            "expected websocket permission metadata:\n{manifest}"
+        );
+
+        let datatable_manifest = fs::read_to_string(output.join("DatatableManifest.ts")).unwrap();
+        assert!(
+            datatable_manifest.contains("\"types-export.users\": { id: \"types-export.users\""),
+            "expected datatable manifest entry:\n{datatable_manifest}"
+        );
+        assert!(
+            datatable_manifest.contains("name: \"id\", label: \"ID\", sortable: true")
+                && datatable_manifest.contains("exportable: true"),
+            "expected datatable column metadata:\n{datatable_manifest}"
+        );
+        assert!(
+            datatable_manifest.contains("defaultSort: [{ field: \"id\", direction: \"asc\" }]"),
+            "expected datatable default sort metadata:\n{datatable_manifest}"
+        );
+        assert!(
+            datatable_manifest.contains("typesExport: {\n    users: \"types-export.users\""),
+            "expected datatable id tree metadata:\n{datatable_manifest}"
+        );
+        assert!(
+            datatable_manifest.contains("export function datatableSort")
+                && datatable_manifest.contains("export function datatableRequest")
+                && datatable_manifest.contains("export function datatableQueryParams")
+                && datatable_manifest.contains("type DatatableRequestFor"),
+            "expected datatable request helpers:\n{datatable_manifest}"
+        );
+
+        let schedule_manifest = fs::read_to_string(output.join("ScheduleManifest.ts")).unwrap();
+        assert!(
+            schedule_manifest.contains(
+                "\"reports.daily\": { id: \"reports.daily\", kind: \"cron\", expression: \"0 0 0 * * *\", withoutOverlapping: true, environments: [\"production\"], hooks: { before: true, after: false, onFailure: false } }"
+            ),
+            "expected schedule manifest entry:\n{schedule_manifest}"
+        );
+        assert!(
+            schedule_manifest.contains("reports: {\n    daily: \"reports.daily\"")
+                && schedule_manifest.contains("export function scheduleCronExpression"),
+            "expected schedule id tree and cron helper:\n{schedule_manifest}"
+        );
+
+        let command_manifest = fs::read_to_string(output.join("CommandManifest.ts")).unwrap();
+        assert!(
+            command_manifest.contains(
+                "\"types:export\": { id: \"types:export\", name: \"types:export\", about: \"Export registered TypeScript types\""
+            ),
+            "expected command manifest to include the running types exporter:\n{command_manifest}"
+        );
+        assert!(
+            command_manifest.contains("typesExport: \"types:export\"")
+                && command_manifest.contains("export function commandManifestEntry"),
+            "expected command id tree and helpers:\n{command_manifest}"
+        );
+
+        let validation_rule_manifest =
+            fs::read_to_string(output.join("ValidationRuleManifest.ts")).unwrap();
+        assert!(
+            validation_rule_manifest
+                .contains("\"tenant.mobile\": { id: \"tenant.mobile\", serverOnly: true }"),
+            "expected validation rule manifest to include registered custom rule:\n{validation_rule_manifest}"
+        );
+        assert!(
+            validation_rule_manifest.contains("tenant: {\n    mobile: \"tenant.mobile\"")
+                && validation_rule_manifest.contains("export function validationRuleManifestEntry"),
+            "expected validation rule id tree and helpers:\n{validation_rule_manifest}"
+        );
+
+        let app_manifest = fs::read_to_string(output.join("AppManifest.ts")).unwrap();
+        assert!(
+            app_manifest.contains("name: \"foundry\"")
+                && app_manifest.contains("environment: \"development\"")
+                && app_manifest.contains("timezone: \"UTC\"")
+                && app_manifest.contains("export const ApplicationTimezone")
+                && !app_manifest.contains("signing"),
+            "expected app manifest to include safe app metadata:\n{app_manifest}"
+        );
+
+        let auth_manifest = fs::read_to_string(output.join("AuthManifest.ts")).unwrap();
+        assert!(
+            auth_manifest.contains(
+                "\"api\": { id: \"api\", kind: \"bearer\", default: true, authenticatable: true }"
+            ) && auth_manifest.contains("\"reports.view\": { id: \"reports.view\" }"),
+            "expected auth manifest entries:\n{auth_manifest}"
+        );
+        assert!(
+            auth_manifest.contains("export const DefaultAuthGuard = \"api\"")
+                && auth_manifest.contains("reports: {\n    view: \"reports.view\"")
+                && auth_manifest.contains("export function authGuardHasAuthenticatable"),
+            "expected auth id tree and helpers:\n{auth_manifest}"
+        );
+
+        let audit_manifest = fs::read_to_string(output.join("AuditManifest.ts")).unwrap();
+        assert!(
+            audit_manifest.contains("eventTypes: [\"created\", \"updated\", \"soft_deleted\", \"restored\", \"deleted\"]")
+                && audit_manifest.contains("redactedValue: \"[redacted]\"")
+                && audit_manifest.contains("export function auditFieldIsSensitive"),
+            "expected audit manifest to include event and redaction helpers:\n{audit_manifest}"
+        );
+
+        let logging_manifest = fs::read_to_string(output.join("LoggingManifest.ts")).unwrap();
+        assert!(
+            logging_manifest.contains("level: \"info\"")
+                && logging_manifest.contains("format: \"json\"")
+                && logging_manifest.contains("logDir: \"logs\"")
+                && logging_manifest.contains("retentionDays: 30")
+                && logging_manifest.contains("export function loggingUsesJson")
+                && logging_manifest.contains("export function loggingWritesFiles")
+                && logging_manifest.contains("export function loggingRetentionDisabled"),
+            "expected logging manifest to include configured logging metadata:\n{logging_manifest}"
+        );
+
+        let storage_manifest = fs::read_to_string(output.join("StorageManifest.ts")).unwrap();
+        assert!(
+            storage_manifest.contains(
+                "\"uploads\": { name: \"uploads\", driver: \"local\", visibility: \"public\", default: true }"
+            ),
+            "expected storage manifest to include configured local disk:\n{storage_manifest}"
+        );
+        assert!(
+            storage_manifest.contains("uploads: \"uploads\"")
+                && storage_manifest.contains("export const DefaultStorageDisk = \"uploads\"")
+                && storage_manifest.contains("export function storageDiskVisibility"),
+            "expected storage id tree and helpers:\n{storage_manifest}"
+        );
+
+        let email_manifest = fs::read_to_string(output.join("EmailManifest.ts")).unwrap();
+        assert!(
+            email_manifest.contains("\"log\": { name: \"log\", driver: \"log\", default: true }"),
+            "expected email manifest to include configured log mailer:\n{email_manifest}"
+        );
+        assert!(
+            email_manifest.contains("log: \"log\"")
+                && email_manifest.contains("export const DefaultEmailMailer = \"log\"")
+                && email_manifest.contains("export function emailMailerDriver"),
+            "expected email id tree and helpers:\n{email_manifest}"
+        );
+
+        let i18n_manifest = fs::read_to_string(output.join("I18nManifest.ts")).unwrap();
+        assert!(
+            i18n_manifest.contains("defaultLocale: \"en\"")
+                && i18n_manifest.contains("fallbackLocale: \"en\"")
+                && i18n_manifest.contains("{ locale: \"en\", default: true, fallback: true }")
+                && i18n_manifest.contains("{ locale: \"ms\", default: false, fallback: false }"),
+            "expected i18n manifest to include loaded locale catalogs:\n{i18n_manifest}"
+        );
+        assert!(
+            i18n_manifest.contains("en: \"en\"")
+                && i18n_manifest.contains("ms: \"ms\"")
+                && i18n_manifest.contains("export function i18nLocaleManifestEntry"),
+            "expected i18n id tree and helpers:\n{i18n_manifest}"
+        );
+
+        let readiness_manifest = fs::read_to_string(output.join("ReadinessManifest.ts")).unwrap();
+        assert!(
+            readiness_manifest.contains(
+                "\"foundry.bootstrap\": { id: \"foundry.bootstrap\", builtIn: true }"
+            ) && readiness_manifest.contains(
+                "\"foundry.runtime_backend\": { id: \"foundry.runtime_backend\", builtIn: true }"
+            ) && readiness_manifest.contains(
+                "\"plugin.types_export\": { id: \"plugin.types_export\", builtIn: false }"
+            ),
+            "expected readiness manifest to include built-in and plugin probes:\n{readiness_manifest}"
+        );
+        assert!(
+            readiness_manifest.contains("foundry: {")
+                && readiness_manifest.contains("bootstrap: \"foundry.bootstrap\"")
+                && readiness_manifest
+                    .contains("plugin: {\n    typesExport: \"plugin.types_export\"")
+                && readiness_manifest.contains("export function readinessProbeIsBuiltIn"),
+            "expected readiness id tree and helpers:\n{readiness_manifest}"
+        );
+
+        let plugin_manifest = fs::read_to_string(output.join("PluginManifest.ts")).unwrap();
+        assert!(
+            plugin_manifest.contains(
+                "\"foundry.types-export-test\": { id: \"foundry.types-export-test\", version: \"1.0.0\", foundryVersion: \"^0.1\", description: \"Types export test plugin\""
+            ),
+            "expected plugin manifest to include registered plugin:\n{plugin_manifest}"
+        );
+        assert!(
+            plugin_manifest
+                .contains("foundry: {\n    typesExportTest: \"foundry.types-export-test\"")
+                && plugin_manifest.contains("export function pluginManifestEntry"),
+            "expected plugin id tree and helpers:\n{plugin_manifest}"
+        );
     }
 
     #[tokio::test]

@@ -138,6 +138,14 @@ mod app {
             pub age: Option<i32>,
             pub tags: Vec<String>,
             pub scores: Vec<i32>,
+            #[serde(default = "default_timezone")]
+            pub timezone: String,
+            #[serde(default)]
+            pub publish: bool,
+        }
+
+        fn default_timezone() -> String {
+            "UTC".to_string()
         }
 
         pub fn router(registrar: &mut HttpRegistrar) -> Result<()> {
@@ -190,6 +198,8 @@ mod app {
                     "age": payload.age,
                     "tags": payload.tags,
                     "scores": payload.scores,
+                    "timezone": payload.timezone,
+                    "publish": payload.publish,
                 })),
             )
         }
@@ -526,6 +536,26 @@ async fn run_http_async_parses_typed_multipart_fields() {
     assert_eq!(payload["age"], 42);
     assert_eq!(payload["tags"], serde_json::json!(["rust", "foundry"]));
     assert_eq!(payload["scores"], serde_json::json!([10, 20]));
+    assert_eq!(payload["timezone"], "UTC");
+    assert_eq!(payload["publish"], false);
+
+    let explicit_defaults = client
+        .post(format!("{url}/typed-multipart"))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .text("name", "Bob")
+                .text("settings", r#"{"theme":"light"}"#)
+                .text("timezone", "Asia/Kuala_Lumpur")
+                .text("publish", "true"),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(explicit_defaults.status(), reqwest::StatusCode::CREATED);
+    let explicit_payload: serde_json::Value = explicit_defaults.json().await.unwrap();
+    assert_eq!(explicit_payload["timezone"], "Asia/Kuala_Lumpur");
+    assert_eq!(explicit_payload["publish"], true);
 
     task.abort();
 }
@@ -586,6 +616,23 @@ async fn run_http_async_rejects_invalid_typed_multipart_values() {
     assert_eq!(
         invalid_number_payload["message"],
         "field 'age' has invalid value"
+    );
+
+    let missing_required_text = client
+        .post(format!("{url}/typed-multipart"))
+        .multipart(reqwest::multipart::Form::new().text("name", "Alice"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_required_text.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let missing_required_text_payload: serde_json::Value =
+        missing_required_text.json().await.unwrap();
+    assert_eq!(
+        missing_required_text_payload["message"],
+        "field 'settings' is required"
     );
 
     task.abort();

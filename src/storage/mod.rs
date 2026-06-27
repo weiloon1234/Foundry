@@ -3,6 +3,7 @@ pub(crate) mod callback;
 pub mod config;
 pub mod disk;
 pub mod local;
+pub mod memory;
 pub mod multipart;
 pub(crate) mod path;
 pub mod s3;
@@ -65,6 +66,14 @@ pub struct StorageManager {
     disks: Arc<HashMap<String, disk::StorageDisk>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageDiskDescriptor {
+    pub name: String,
+    pub driver: String,
+    pub visibility: StorageVisibility,
+    pub default: bool,
+}
+
 impl std::fmt::Debug for StorageManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StorageManager")
@@ -106,6 +115,7 @@ impl StorageManager {
                     let resolved = config::ResolvedS3Config::from_table(table)?;
                     Arc::new(s3::S3StorageAdapter::from_config(&resolved)?)
                 }
+                "memory" => Arc::new(memory::MemoryStorageAdapter::new()),
                 custom_name => {
                     let factory = custom_drivers.get(custom_name).ok_or_else(|| {
                         Error::message(format!("unknown storage driver `{custom_name}`"))
@@ -117,7 +127,7 @@ impl StorageManager {
             let visibility = config::visibility_from_table(table);
             disks.insert(
                 name.clone(),
-                disk::StorageDisk::new(name.clone(), visibility, adapter),
+                disk::StorageDisk::new(name.clone(), driver.to_string(), visibility, adapter),
             );
         }
 
@@ -154,6 +164,21 @@ impl StorageManager {
         let mut names: Vec<String> = self.disks.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    pub fn descriptors(&self) -> Vec<StorageDiskDescriptor> {
+        let mut descriptors = self
+            .disks
+            .values()
+            .map(|disk| StorageDiskDescriptor {
+                name: disk.name().to_string(),
+                driver: disk.driver().to_string(),
+                visibility: disk.visibility(),
+                default: disk.name() == self.default,
+            })
+            .collect::<Vec<_>>();
+        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        descriptors
     }
 
     // Convenience methods — delegate to default disk
@@ -230,6 +255,7 @@ pub use adapter::{StorageAdapter, StorageVisibility};
 pub use config::{ResolvedLocalConfig, ResolvedS3Config, StorageConfig};
 pub use disk::StorageDisk;
 pub use local::LocalStorageAdapter;
+pub use memory::MemoryStorageAdapter;
 pub use multipart::MultipartForm;
 pub use s3::S3StorageAdapter;
 pub use stored_file::{StorageObject, StoredFile};
@@ -284,6 +310,14 @@ mod tests {
 
         let disk = manager.default_disk().unwrap();
         assert_eq!(disk.name(), "local");
+        assert_eq!(disk.driver(), "local");
+
+        let descriptors = manager.descriptors();
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].name, "local");
+        assert_eq!(descriptors[0].driver, "local");
+        assert_eq!(descriptors[0].visibility, StorageVisibility::Private);
+        assert!(descriptors[0].default);
     }
 
     #[tokio::test]
@@ -364,7 +398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_manager_custom_driver_via_registry() {
+    async fn storage_manager_from_config_with_memory_disk() {
         let config = config_from_toml(
             r#"
             [storage]
@@ -375,18 +409,62 @@ mod tests {
         "#,
         );
 
+        let manager = StorageManager::from_config(&config, HashMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(manager.default_disk_name(), "memory");
+        assert_eq!(manager.configured_disks(), vec!["memory"]);
+
+        let disk = manager.default_disk().unwrap();
+        assert_eq!(disk.name(), "memory");
+        assert_eq!(disk.driver(), "memory");
+
+        let descriptors = manager.descriptors();
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].name, "memory");
+        assert_eq!(descriptors[0].driver, "memory");
+        assert_eq!(descriptors[0].visibility, StorageVisibility::Private);
+        assert!(descriptors[0].default);
+
+        let stored = manager
+            .put("avatars/user-1.txt", b"hello memory")
+            .await
+            .unwrap();
+        assert_eq!(stored.disk, "memory");
+        assert_eq!(stored.path, "avatars/user-1.txt");
+        assert_eq!(
+            manager.get("avatars/user-1.txt").await.unwrap(),
+            b"hello memory"
+        );
+
+        let listed = manager.list_prefix("avatars/", 10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, "avatars/user-1.txt");
+    }
+
+    #[tokio::test]
+    async fn storage_manager_custom_driver_via_registry() {
+        let config = config_from_toml(
+            r#"
+            [storage]
+            default = "ephemeral"
+
+            [storage.disks.ephemeral]
+            driver = "ephemeral"
+        "#,
+        );
+
         let factory: StorageDriverFactory = Arc::new(|_config, _table| {
-            Box::pin(async { Err(Error::message("memory driver not yet implemented")) })
+            Box::pin(async { Err(Error::message("ephemeral driver unavailable")) })
         });
 
         let mut custom = HashMap::new();
-        custom.insert("memory".to_string(), factory);
+        custom.insert("ephemeral".to_string(), factory);
 
         let result = StorageManager::from_config(&config, custom).await;
         let err = result.expect_err("should fail with factory error");
-        assert!(err
-            .to_string()
-            .contains("memory driver not yet implemented"));
+        assert!(err.to_string().contains("ephemeral driver unavailable"));
     }
 
     #[tokio::test]

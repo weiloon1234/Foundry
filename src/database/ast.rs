@@ -1,9 +1,11 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use uuid::Uuid;
 
 use crate::foundation::{Error, Result};
+use crate::openapi::ApiSchema;
 use crate::support::{Date, DateTime, LocalDateTime, ModelId, Time};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -24,6 +26,44 @@ impl Numeric {
 impl fmt::Display for Numeric {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+impl TS for Numeric {
+    type WithoutGenerics = Self;
+
+    fn ident() -> String {
+        "string".to_string()
+    }
+
+    fn name() -> String {
+        "string".to_string()
+    }
+
+    fn inline() -> String {
+        "string".to_string()
+    }
+
+    fn inline_flattened() -> String {
+        panic!("{} cannot be flattened", Self::name())
+    }
+
+    fn decl() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+
+    fn decl_concrete() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+}
+
+impl ApiSchema for Numeric {
+    fn schema() -> serde_json::Value {
+        serde_json::json!({"type": "string"})
+    }
+
+    fn schema_name() -> &'static str {
+        "Numeric"
     }
 }
 
@@ -1162,6 +1202,19 @@ impl Condition {
 pub enum OrderDirection {
     Asc,
     Desc,
+}
+
+impl crate::openapi::ApiSchema for OrderDirection {
+    fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "string",
+            "enum": ["asc", "desc"]
+        })
+    }
+
+    fn schema_name() -> &'static str {
+        "OrderDirection"
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

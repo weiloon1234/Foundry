@@ -121,6 +121,10 @@ impl RedisManager {
         &self.namespace
     }
 
+    pub fn is_configured(&self) -> bool {
+        self.client.is_some()
+    }
+
     pub fn key(&self, suffix: impl AsRef<str>) -> RedisKey {
         RedisKey::new(self.namespace(), suffix)
     }
@@ -435,7 +439,19 @@ mod tests {
     async fn connection_errors_when_redis_is_not_configured() {
         let manager = RedisManager::from_config(&config_with_redis("", "foundry-tests")).unwrap();
 
+        assert!(!manager.is_configured());
         let error = manager.connection().await.unwrap_err();
         assert_eq!(error.to_string(), "redis is not configured");
+    }
+
+    #[test]
+    fn is_configured_tracks_whether_url_is_present() {
+        let configured =
+            RedisManager::from_config(&config_with_redis("redis://127.0.0.1:6379/9", "foundry"))
+                .unwrap();
+        let unconfigured = RedisManager::from_config(&config_with_redis("", "foundry")).unwrap();
+
+        assert!(configured.is_configured());
+        assert!(!unconfigured.is_configured());
     }
 }

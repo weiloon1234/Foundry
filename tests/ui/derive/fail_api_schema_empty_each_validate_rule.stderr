@@ -1,0 +1,5 @@
+error: validation rule `each` requires at least one nested rule
+ --> tests/ui/derive/fail_api_schema_empty_each_validate_rule.rs:5:21
+  |
+5 |     #[validate(each())]
+  |                     ^

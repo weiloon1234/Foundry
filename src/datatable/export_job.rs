@@ -7,7 +7,7 @@ use crate::support::{JobId, Timezone};
 
 use super::export::DatatableExportDelivery;
 use super::request::DatatableRequest;
-use super::response::{DatatableActorSnapshot, DatatableExportAccepted};
+use super::response::{DatatableActorSnapshot, DatatableExportAccepted, DatatableExportStatus};
 
 // ---------------------------------------------------------------------------
 // Job payload
@@ -116,6 +116,6 @@ pub async fn dispatch_export<D: super::datatable_trait::Datatable + ?Sized>(
     Ok(DatatableExportAccepted {
         datatable_id: D::ID.to_string(),
         recipient: recipient.to_string(),
-        status: "queued".to_string(),
+        status: DatatableExportStatus::Queued,
     })
 }

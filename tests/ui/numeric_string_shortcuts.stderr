@@ -13,7 +13,7 @@ help: the following other types implement trait `IntoColumnValue<T>`
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<std::string::String>`
 ...
    | impl IntoColumnValue<Option<String>> for &str {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<Option<std::string::String>>`
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<std::option::Option<std::string::String>>`
 note: required by a bound in `foundry::Column::<M, T>::eq`
   --> src/database/model.rs
    |
@@ -36,7 +36,7 @@ help: the following other types implement trait `IntoColumnValue<T>`
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<std::string::String>`
 ...
    | impl IntoColumnValue<Option<String>> for &str {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<Option<std::string::String>>`
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<std::option::Option<std::string::String>>`
 note: required by a bound in `foundry::Column::<M, T>::in_list`
   --> src/database/model.rs
    |

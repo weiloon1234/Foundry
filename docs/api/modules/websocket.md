@@ -63,6 +63,7 @@ trait ChannelHandler
 
 - WebSocket handshakes use HTTP trusted-proxy config for client IP metadata; forwarded IP headers are ignored unless the TCP peer is trusted.
 - Empty `websocket.allowed_origins` permits same-origin browser handshakes in production-like environments and rejects cross-origin browser handshakes.
+- WebSocket handshake HTTP rejections and WebSocket observability `404` responses use the generated `ErrorResponse` body shape.
 - Inbound messages, frames, query auth tokens, subscriptions, and client-supplied identifiers are bounded by `WebSocketConfig`.
+- `types:export` mirrors frontend-safe `WebSocketConfig` fields into `WebSocketRuntimeManifest` for socket clients while omitting bind host/port, allowed origins, and transport buffer internals.
 - `websocket.query_token_enabled` stays on by default for browser compatibility; keep issued WebSocket tokens short-lived because query strings can be logged outside Foundry.
-

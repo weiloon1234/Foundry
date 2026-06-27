@@ -9,6 +9,21 @@ enum SettingType { Show 16 variants    Text, Textarea, Number, Boolean, Select, 
   fn as_str(&self) -> &'static str
   fn parse(s: &str) -> Option<Self>
   fn all() -> &'static [(&'static str, SettingType)]
+struct SettingDefinition
+  fn new(key: &'static str, label: &'static str, setting_type: SettingType) -> Self
+  fn text(key: &'static str, label: &'static str) -> Self
+  fn boolean(key: &'static str, label: &'static str) -> Self
+  fn number(key: &'static str, label: &'static str) -> Self
+  fn select(key: &'static str, label: &'static str) -> Self
+  fn multiselect(key: &'static str, label: &'static str) -> Self
+  fn parameters(self, parameters: SettingParameters) -> Self
+  fn group(self, group_name: &'static str) -> Self
+  fn description(self, description: &'static str) -> Self
+  fn sort_order(self, sort_order: i32) -> Self
+  fn public(self) -> Self
+  fn private(self) -> Self
+  fn parameters_value(&self) -> Value
+  fn to_new_setting(&self) -> NewSetting
 struct NewSetting
   fn new(key: impl Into<String>, label: impl Into<String>) -> Self
   fn value(self, value: Value) -> Self
@@ -34,4 +49,3 @@ struct Setting
   async fn public(app: &AppContext) -> Result<Vec<Setting>>
   async fn groups(app: &AppContext) -> Result<Vec<String>>
 ```
-

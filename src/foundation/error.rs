@@ -166,16 +166,84 @@ impl Error {
 }
 
 /// The standard JSON error response body.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, foundry_macros::TS, foundry_macros::ApiSchema)]
 pub struct ErrorResponse {
     pub message: String,
-    pub status: u16,
+    pub status: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub message_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub errors: Option<Vec<crate::validation::FieldError>>,
+}
+
+impl ErrorResponse {
+    pub fn new(message: impl Into<String>, status: StatusCode) -> Self {
+        Self {
+            message: message.into(),
+            status: status.as_u16().into(),
+            error_code: None,
+            message_key: None,
+            errors: None,
+        }
+    }
+}
+
+impl ts_rs::TS for ErrorResponse {
+    type WithoutGenerics = Self;
+
+    fn name() -> String {
+        "ErrorResponse".to_string()
+    }
+
+    fn decl() -> String {
+        concat!(
+            "type ErrorResponse = { ",
+            "message: string, ",
+            "status: number, ",
+            "error_code?: string, ",
+            "message_key?: string, ",
+            "errors?: Array<FieldError>, ",
+            "};",
+        )
+        .to_string()
+    }
+
+    fn decl_concrete() -> String {
+        Self::decl()
+    }
+
+    fn inline() -> String {
+        concat!(
+            "{ ",
+            "message: string, ",
+            "status: number, ",
+            "error_code?: string, ",
+            "message_key?: string, ",
+            "errors?: Array<FieldError>, ",
+            "}",
+        )
+        .to_string()
+    }
+
+    fn inline_flattened() -> String {
+        Self::inline()
+    }
+
+    fn visit_dependencies(visitor: &mut impl ts_rs::TypeVisitor)
+    where
+        Self: 'static,
+    {
+        visitor.visit::<crate::validation::FieldError>();
+    }
+
+    fn output_path() -> Option<&'static std::path::Path> {
+        Some(std::path::Path::new("ErrorResponse.ts"))
+    }
 }
 
 impl IntoResponse for Error {
@@ -186,18 +254,14 @@ impl IntoResponse for Error {
         }
 
         let status = self.status_code();
-        let body = ErrorResponse {
-            message: self.public_message(),
-            status: status.as_u16(),
-            error_code: match &self {
-                Error::Http { error_code, .. } => error_code.clone(),
-                _ => None,
-            },
-            message_key: match &self {
-                Error::Http { message_key, .. } => message_key.clone(),
-                _ => None,
-            },
-            errors: None,
+        let mut body = ErrorResponse::new(self.public_message(), status);
+        body.error_code = match &self {
+            Error::Http { error_code, .. } => error_code.clone(),
+            _ => None,
+        };
+        body.message_key = match &self {
+            Error::Http { message_key, .. } => message_key.clone(),
+            _ => None,
         };
         let error_text = self.to_string();
         let chain = self.source_chain();

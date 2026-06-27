@@ -26,15 +26,15 @@ pub use filter_meta::{
     DatatableFilterRow, DatatableFilterValueKind,
 };
 pub use mapping::DatatableMapping;
-pub use registry::DatatableRegistry;
+pub use registry::{DatatableDescriptor, DatatableRegistry, DatatableRelationFilterMeta};
 pub use relation_filter::{DatatableRelationColumn, DatatableRelationFilter};
 pub use request::{
     DatatableFilterInput, DatatableFilterOp, DatatableFilterValue, DatatableRequest,
     DatatableSortInput,
 };
 pub use response::{
-    DatatableActorSnapshot, DatatableColumnMeta, DatatableExportAccepted, DatatableJsonResponse,
-    DatatablePaginationMeta,
+    DatatableActorSnapshot, DatatableColumnMeta, DatatableExportAccepted, DatatableExportStatus,
+    DatatableJsonResponse, DatatablePaginationMeta,
 };
 pub use sort::DatatableSort;
 pub use value::DatatableValue;

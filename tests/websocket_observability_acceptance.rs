@@ -1,7 +1,12 @@
 use axum::http::StatusCode;
-use foundry::support::{ChannelId, GuardId, PermissionId};
+use foundry::notifications::{
+    Notifiable, Notification, NOTIFICATION_BROADCAST_CHANNEL, NOTIFICATION_BROADCAST_EVENT,
+    NOTIFY_BROADCAST,
+};
+use foundry::support::{ChannelEventId, ChannelId, GuardId, PermissionId};
 use foundry::testing::TestApp;
-use foundry::websocket::WebSocketChannelOptions;
+use foundry::websocket::{WebSocketChannelOptions, WebSocketRegistrar};
+use foundry::App;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -16,6 +21,8 @@ struct WebSocketChannelConfigContract {
     presence: bool,
     replay_count: u32,
     allow_client_events: bool,
+    client_events: Vec<String>,
+    server_events: Vec<String>,
     requires_auth: bool,
     guard: Option<String>,
     permissions: Vec<String>,
@@ -53,6 +60,79 @@ struct WebSocketHistoryMessageContract {
 struct WebSocketStatsContract {
     global: WebSocketGlobalStatsContract,
     channels: Vec<WebSocketChannelStatsContract>,
+}
+
+struct BroadcastUser {
+    id: &'static str,
+}
+
+impl Notifiable for BroadcastUser {
+    fn notification_id(&self) -> String {
+        self.id.to_string()
+    }
+}
+
+struct BroadcastNotice;
+
+impl Notification for BroadcastNotice {
+    fn notification_type(&self) -> &str {
+        "test.broadcast"
+    }
+
+    fn via(&self) -> Vec<foundry::support::NotificationChannelId> {
+        vec![NOTIFY_BROADCAST]
+    }
+
+    fn to_broadcast(&self) -> Option<Value> {
+        Some(serde_json::json!({ "message": "hello" }))
+    }
+}
+
+fn register_notification_broadcast_channel(
+    registrar: &mut WebSocketRegistrar,
+) -> foundry::Result<()> {
+    registrar.channel_with_options(
+        NOTIFICATION_BROADCAST_CHANNEL,
+        |_ctx, _payload| async { Ok(()) },
+        WebSocketChannelOptions::new().server_event(NOTIFICATION_BROADCAST_EVENT),
+    )?;
+    Ok(())
+}
+
+async fn notification_history(app: &TestApp) -> WebSocketHistoryContract {
+    let response = app
+        .client()
+        .get(&format!(
+            "/_foundry/ws/history/{}",
+            NOTIFICATION_BROADCAST_CHANNEL
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.json().unwrap()
+}
+
+fn assert_notification_broadcast_message(body: &WebSocketHistoryContract, room: &str) {
+    assert_eq!(body.channel, NOTIFICATION_BROADCAST_CHANNEL.as_str());
+    assert_eq!(body.messages.len(), 1);
+    assert_eq!(
+        body.messages[0].channel,
+        NOTIFICATION_BROADCAST_CHANNEL.as_str()
+    );
+    assert_eq!(
+        body.messages[0].event,
+        NOTIFICATION_BROADCAST_EVENT.as_str()
+    );
+    assert_eq!(body.messages[0].room.as_deref(), Some(room));
+    assert_eq!(
+        body.messages[0].payload.as_ref().unwrap()["notification_type"],
+        "test.broadcast"
+    );
+    assert_eq!(
+        body.messages[0].payload.as_ref().unwrap()["data"]["message"],
+        "hello"
+    );
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +212,10 @@ async fn ws_presence_endpoint_returns_404_for_non_presence_channel() {
         .await
         .unwrap();
     assert_eq!(response.status(), 404);
+    let body: Value = response.json().unwrap();
+    assert_eq!(body["message"], "presence not enabled for channel");
+    assert_eq!(body["status"], 404);
+    assert!(body.get("error").is_none());
 }
 
 #[tokio::test]
@@ -150,6 +234,10 @@ async fn ws_presence_endpoint_returns_404_for_unregistered_channel() {
         .await
         .unwrap();
     assert_eq!(response.status(), 404);
+    let body: Value = response.json().unwrap();
+    assert_eq!(body["message"], "channel not registered");
+    assert_eq!(body["status"], 404);
+    assert!(body.get("error").is_none());
 }
 
 #[tokio::test]
@@ -163,7 +251,8 @@ async fn ws_channels_endpoint_lists_registered_channels() {
                 WebSocketChannelOptions::new()
                     .presence(true)
                     .replay(10)
-                    .allow_client_events(false)
+                    .client_event(ChannelEventId::new("typing"))
+                    .server_event(ChannelEventId::new("message"))
                     .guard(GuardId::new("api"))
                     .permissions([PermissionId::new("chat:read")]),
             )?;
@@ -191,7 +280,9 @@ async fn ws_channels_endpoint_lists_registered_channels() {
         .expect("chat present");
     assert!(chat.presence);
     assert_eq!(chat.replay_count, 10);
-    assert!(!chat.allow_client_events);
+    assert!(chat.allow_client_events);
+    assert_eq!(chat.client_events, vec!["typing"]);
+    assert_eq!(chat.server_events, vec!["message"]);
     assert!(chat.requires_auth);
     assert_eq!(chat.guard.as_deref(), Some("api"));
     assert_eq!(chat.permissions, vec!["chat:read"]);
@@ -202,6 +293,8 @@ async fn ws_channels_endpoint_lists_registered_channels() {
         .find(|channel| channel.id == "public")
         .expect("public present");
     assert!(!public.presence);
+    assert!(public.client_events.is_empty());
+    assert!(public.server_events.is_empty());
     assert!(!public.requires_auth);
 }
 
@@ -309,6 +402,84 @@ include_payloads = true
 }
 
 #[tokio::test]
+async fn broadcast_notifications_publish_to_canonical_channel_room() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("00-observability.toml"),
+        r#"
+[observability.websocket]
+include_payloads = true
+"#,
+    )
+    .unwrap();
+
+    let app = TestApp::builder()
+        .load_config_dir(tmp.path())
+        .enable_observability()
+        .register_websocket_routes(register_notification_broadcast_channel)
+        .build()
+        .await
+        .unwrap();
+
+    app.app()
+        .notify(&BroadcastUser { id: "user_42" }, &BroadcastNotice)
+        .await
+        .unwrap();
+
+    let body = notification_history(&app).await;
+    assert_notification_broadcast_message(&body, "user_42");
+}
+
+#[tokio::test]
+async fn queued_broadcast_notifications_publish_to_canonical_channel_room() {
+    let tmp = tempfile::tempdir().unwrap();
+    let namespace = format!(
+        "queued-notification-broadcast-{}",
+        tmp.path().file_name().unwrap().to_string_lossy()
+    );
+    std::fs::write(
+        tmp.path().join("00-runtime.toml"),
+        format!(
+            r#"
+[redis]
+namespace = "{namespace}"
+
+[jobs]
+poll_interval_ms = 10
+
+[observability.websocket]
+include_payloads = true
+"#
+        ),
+    )
+    .unwrap();
+
+    let app = TestApp::builder()
+        .load_config_dir(tmp.path())
+        .enable_observability()
+        .register_websocket_routes(register_notification_broadcast_channel)
+        .build()
+        .await
+        .unwrap();
+    let worker = App::builder()
+        .load_config_dir(tmp.path())
+        .register_websocket_routes(register_notification_broadcast_channel)
+        .build_worker_kernel()
+        .await
+        .unwrap();
+
+    app.app()
+        .notify_queued(&BroadcastUser { id: "user_queued" }, &BroadcastNotice)
+        .await
+        .unwrap();
+
+    assert!(worker.run_once().await.unwrap());
+
+    let body = notification_history(&app).await;
+    assert_notification_broadcast_message(&body, "user_queued");
+}
+
+#[tokio::test]
 async fn ws_history_returns_404_for_unregistered_channel() {
     let app = TestApp::builder()
         .enable_observability()
@@ -324,6 +495,10 @@ async fn ws_history_returns_404_for_unregistered_channel() {
         .await
         .unwrap();
     assert_eq!(response.status(), 404);
+    let body: Value = response.json().unwrap();
+    assert_eq!(body["message"], "channel not registered");
+    assert_eq!(body["status"], 404);
+    assert!(body.get("error").is_none());
 }
 
 #[tokio::test]

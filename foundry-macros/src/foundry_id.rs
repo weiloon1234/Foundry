@@ -4,6 +4,8 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, LitStr, Path};
 
+use crate::common::to_snake_case;
+
 #[derive(Default)]
 struct FoundryIdArgs {
     id: Option<Path>,
@@ -177,56 +179,4 @@ fn set_once_lit_str(
 
     *slot = Some(value.parse()?);
     Ok(())
-}
-
-fn to_snake_case(name: &str) -> String {
-    split_identifier_words(name)
-        .into_iter()
-        .map(|token| token.to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join("_")
-}
-
-fn split_identifier_words(name: &str) -> Vec<String> {
-    let chars: Vec<char> = name.chars().collect();
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-
-    for (index, ch) in chars.iter().copied().enumerate() {
-        if matches!(ch, '_' | '-' | ' ') {
-            push_token(&mut tokens, &mut current);
-            continue;
-        }
-
-        if let Some(prev) = current.chars().last() {
-            let next = chars.get(index + 1).copied();
-            if should_split(prev, ch, next) {
-                push_token(&mut tokens, &mut current);
-            }
-        }
-
-        current.push(ch);
-    }
-
-    push_token(&mut tokens, &mut current);
-    tokens
-}
-
-fn push_token(tokens: &mut Vec<String>, current: &mut String) {
-    if !current.is_empty() {
-        tokens.push(std::mem::take(current));
-    }
-}
-
-fn should_split(prev: char, current: char, next: Option<char>) -> bool {
-    if matches!(prev, '_' | '-' | ' ') || matches!(current, '_' | '-' | ' ') {
-        return false;
-    }
-
-    (prev.is_lowercase() && current.is_uppercase())
-        || (prev.is_alphabetic() && current.is_ascii_digit())
-        || (prev.is_ascii_digit() && current.is_alphabetic())
-        || (prev.is_uppercase()
-            && current.is_uppercase()
-            && next.is_some_and(|ch| ch.is_lowercase()))
 }

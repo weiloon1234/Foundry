@@ -3,9 +3,610 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::{
-    Attribute, Data, DeriveInput, Expr, Field, Fields, FieldsNamed, GenericArgument, Ident,
-    LitBool, LitStr, Path, PathArguments, Type,
+    Attribute, Data, DataEnum, DeriveInput, Expr, Field, Fields, FieldsNamed, GenericArgument,
+    Ident, LitBool, LitStr, Path, PathArguments, Token, Type,
 };
+
+pub fn split_identifier_words(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if is_identifier_separator(ch) {
+            push_identifier_token(&mut tokens, &mut current);
+            continue;
+        }
+
+        if let Some(prev) = current.chars().last() {
+            let next = chars.get(index + 1).copied();
+            if should_split_identifier(prev, ch, next) {
+                push_identifier_token(&mut tokens, &mut current);
+            }
+        }
+
+        current.push(ch);
+    }
+
+    push_identifier_token(&mut tokens, &mut current);
+    tokens
+}
+
+pub fn to_snake_case(name: &str) -> String {
+    split_identifier_words(name)
+        .into_iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+#[derive(Clone, Copy)]
+pub enum SerdeRenameRule {
+    Lowercase,
+    Uppercase,
+    PascalCase,
+    CamelCase,
+    SnakeCase,
+    ScreamingSnakeCase,
+    KebabCase,
+    ScreamingKebabCase,
+}
+
+impl SerdeRenameRule {
+    fn from_lit(lit: &LitStr) -> syn::Result<Self> {
+        match lit.value().as_str() {
+            "lowercase" => Ok(Self::Lowercase),
+            "UPPERCASE" => Ok(Self::Uppercase),
+            "PascalCase" => Ok(Self::PascalCase),
+            "camelCase" => Ok(Self::CamelCase),
+            "snake_case" => Ok(Self::SnakeCase),
+            "SCREAMING_SNAKE_CASE" => Ok(Self::ScreamingSnakeCase),
+            "kebab-case" => Ok(Self::KebabCase),
+            "SCREAMING-KEBAB-CASE" => Ok(Self::ScreamingKebabCase),
+            _ => Err(syn::Error::new_spanned(
+                lit,
+                "unsupported serde rename_all value for Foundry derive",
+            )),
+        }
+    }
+
+    fn apply(self, name: &str) -> String {
+        match self {
+            Self::Lowercase => name.to_ascii_lowercase(),
+            Self::Uppercase => name.to_ascii_uppercase(),
+            Self::PascalCase => to_pascal_case(name),
+            Self::CamelCase => to_camel_case(name),
+            Self::SnakeCase => to_snake_case(name),
+            Self::ScreamingSnakeCase => split_identifier_words(name)
+                .into_iter()
+                .map(|word| word.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join("_"),
+            Self::KebabCase => split_identifier_words(name)
+                .into_iter()
+                .map(|word| word.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join("-"),
+            Self::ScreamingKebabCase => split_identifier_words(name)
+                .into_iter()
+                .map(|word| word.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join("-"),
+        }
+    }
+}
+
+pub fn apply_serde_rename_all(rule: Option<SerdeRenameRule>, name: &str) -> String {
+    rule.map(|rule| rule.apply(name))
+        .unwrap_or_else(|| name.to_string())
+}
+
+pub fn rust_ident_name(ident: &syn::Ident) -> String {
+    let name = ident.to_string();
+    name.strip_prefix("r#").unwrap_or(&name).to_string()
+}
+
+pub fn serde_rename(attrs: &[Attribute]) -> syn::Result<Option<String>> {
+    let mut rename = None::<LitStr>;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                if let Some(value) = parse_serde_name_value(meta, "rename")? {
+                    set_once_lit_str(&mut rename, value, "rename")?;
+                }
+            } else {
+                consume_meta_value(meta)?;
+            }
+            Ok(())
+        })?;
+    }
+
+    Ok(rename.map(|value| value.value()))
+}
+
+pub fn serde_rename_all(attrs: &[Attribute]) -> syn::Result<Option<SerdeRenameRule>> {
+    let mut rename_all = None::<LitStr>;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_all") {
+                if let Some(value) = parse_serde_name_value(meta, "rename_all")? {
+                    set_once_lit_str(&mut rename_all, value, "rename_all")?;
+                }
+            } else {
+                consume_meta_value(meta)?;
+            }
+            Ok(())
+        })?;
+    }
+
+    rename_all
+        .as_ref()
+        .map(SerdeRenameRule::from_lit)
+        .transpose()
+}
+
+pub fn wire_field_name(rust_field_name: &str, field_wire_names: &[(String, String)]) -> String {
+    field_wire_names
+        .iter()
+        .find_map(|(rust, wire)| (rust == rust_field_name).then_some(wire.clone()))
+        .unwrap_or_else(|| rust_field_name.to_string())
+}
+
+pub fn reject_duplicate_contract_field_names(
+    fields: &FieldsNamed,
+    attrs: &[Attribute],
+) -> syn::Result<()> {
+    reject_ts_renames(attrs, "contract struct")?;
+
+    let rename_all = serde_rename_all(attrs)?;
+    let mut seen = Vec::<(String, String)>::new();
+
+    for field in &fields.named {
+        if should_skip_contract_field(field)? {
+            continue;
+        }
+        reject_custom_serde_transforms(&field.attrs, "field")?;
+        reject_ts_renames(&field.attrs, "public field")?;
+        if serde_has_flatten(&field.attrs)? {
+            continue;
+        }
+        reject_serde_aliases(
+            &field.attrs,
+            "Foundry contract derives cannot represent `#[serde(alias = \"...\")]` on public fields; aliases make the backend accept undocumented JSON keys",
+        )?;
+
+        let Some(ident) = &field.ident else {
+            continue;
+        };
+        let rust_name = rust_ident_name(ident);
+        let wire_name = serde_rename(&field.attrs)?
+            .unwrap_or_else(|| apply_serde_rename_all(rename_all, &rust_name));
+
+        if let Some((previous_rust_name, _)) =
+            seen.iter().find(|(_, seen_wire)| seen_wire == &wire_name)
+        {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "Foundry contract derive contains duplicate JSON field `{wire_name}` from Rust fields `{previous_rust_name}` and `{rust_name}`; use unique serde rename values or split the DTO"
+                ),
+            ));
+        }
+
+        seen.push((rust_name, wire_name));
+    }
+
+    Ok(())
+}
+
+pub fn reject_duplicate_contract_variant_names(
+    data: &DataEnum,
+    attrs: &[Attribute],
+) -> syn::Result<()> {
+    reject_ts_renames(attrs, "contract enum")?;
+
+    let rename_all = serde_rename_all(attrs)?;
+    let mut seen = Vec::<(String, String)>::new();
+
+    for variant in &data.variants {
+        reject_custom_serde_transforms(&variant.attrs, "enum variant")?;
+        reject_ts_renames(&variant.attrs, "enum variant")?;
+        reject_serde_aliases(
+            &variant.attrs,
+            "Foundry contract derives cannot represent `#[serde(alias = \"...\")]` on enum variants; aliases make the backend accept undocumented enum values",
+        )?;
+        let rust_name = rust_ident_name(&variant.ident);
+        let wire_name = serde_rename(&variant.attrs)?
+            .unwrap_or_else(|| apply_serde_rename_all(rename_all, &rust_name));
+
+        if let Some((previous_rust_name, _)) =
+            seen.iter().find(|(_, seen_wire)| seen_wire == &wire_name)
+        {
+            return Err(syn::Error::new_spanned(
+                variant,
+                format!(
+                    "Foundry contract derive contains duplicate JSON enum variant `{wire_name}` from Rust variants `{previous_rust_name}` and `{rust_name}`; use unique serde rename values or split the enum"
+                ),
+            ));
+        }
+
+        seen.push((rust_name, wire_name));
+    }
+
+    Ok(())
+}
+
+fn reject_ts_renames(attrs: &[Attribute], target: &str) -> syn::Result<()> {
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("ts")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") || meta.path.is_ident("rename_all") {
+                let attr_name = if meta.path.is_ident("rename") {
+                    "rename"
+                } else {
+                    "rename_all"
+                };
+                let message = format!(
+                    "Foundry contract derives use serde names as the single wire-name source; `#[ts({attr_name} = \"...\")]` on {target} would make generated TypeScript disagree with JSON, OpenAPI, or validation metadata. Use `#[serde(rename = \"...\")]` or `#[serde(rename_all = \"...\")]` instead"
+                );
+
+                if meta.input.peek(Token![=]) {
+                    let value: Expr = meta.value()?.parse()?;
+                    return Err(syn::Error::new_spanned(value, message));
+                }
+
+                return Err(meta.error(message));
+            }
+
+            consume_meta_value(meta)?;
+            Ok(())
+        })?;
+    }
+
+    Ok(())
+}
+
+fn reject_custom_serde_transforms(attrs: &[Attribute], target: &str) -> syn::Result<()> {
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("with")
+                || meta.path.is_ident("serialize_with")
+                || meta.path.is_ident("deserialize_with")
+            {
+                let message = format!(
+                    "Foundry contract derives cannot represent custom serde {target} transforms such as `#[serde(with = \"...\")]`, `#[serde(serialize_with = \"...\")]`, or `#[serde(deserialize_with = \"...\")]`; use an explicit typed DTO shape or normalize legacy input before validation"
+                );
+                if meta.input.peek(Token![=]) {
+                    let value: Expr = meta.value()?.parse()?;
+                    return Err(syn::Error::new_spanned(value, message));
+                }
+
+                return Err(meta.error(message));
+            }
+
+            consume_meta_value(meta)?;
+            Ok(())
+        })?;
+    }
+
+    Ok(())
+}
+
+fn reject_serde_aliases(attrs: &[Attribute], message: &str) -> syn::Result<()> {
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("alias") {
+                if meta.input.peek(Token![=]) {
+                    let value: LitStr = meta.value()?.parse()?;
+                    return Err(syn::Error::new_spanned(value, message));
+                }
+
+                return Err(meta.error(message));
+            }
+
+            consume_meta_value(meta)?;
+            Ok(())
+        })?;
+    }
+
+    Ok(())
+}
+
+pub fn should_skip_contract_field(field: &Field) -> syn::Result<bool> {
+    for attr in &field.attrs {
+        if is_contract_skip_attr(attr)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+pub fn serde_directional_skip(attrs: &[Attribute]) -> syn::Result<Option<&'static str>> {
+    let mut directional_skip = None;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip_serializing") {
+                directional_skip.get_or_insert("skip_serializing");
+            } else if meta.path.is_ident("skip_deserializing") {
+                directional_skip.get_or_insert("skip_deserializing");
+            }
+            consume_meta_value(meta)?;
+            Ok(())
+        })?;
+    }
+
+    Ok(directional_skip)
+}
+
+pub fn serde_skips_deserializing(attrs: &[Attribute]) -> syn::Result<Option<&'static str>> {
+    let mut skip = None;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip") {
+                skip.get_or_insert("skip");
+            } else if meta.path.is_ident("skip_deserializing") {
+                skip.get_or_insert("skip_deserializing");
+            }
+            consume_meta_value(meta)?;
+            Ok(())
+        })?;
+    }
+
+    Ok(skip)
+}
+
+pub fn reject_directional_serde_skip(field: &Field) -> syn::Result<()> {
+    if let Some(attr) = serde_directional_skip(&field.attrs)? {
+        return Err(syn::Error::new_spanned(
+            field,
+            format!("Foundry cannot represent `#[serde({attr})]` in a single TypeScript/OpenAPI contract; use separate request/response DTOs, or use `#[serde(skip)]` / `#[ts(skip)]` when the field is never public"),
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn serde_has_default(attrs: &[Attribute]) -> syn::Result<bool> {
+    let mut has_default = false;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("default") {
+                has_default = true;
+            }
+            consume_meta_value(meta)?;
+            Ok(())
+        })?;
+    }
+
+    Ok(has_default)
+}
+
+pub fn serde_denies_unknown_fields(attrs: &[Attribute]) -> syn::Result<bool> {
+    let mut denies_unknown_fields = false;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("deny_unknown_fields") {
+                denies_unknown_fields = true;
+            }
+            consume_meta_value(meta)?;
+            Ok(())
+        })?;
+    }
+
+    Ok(denies_unknown_fields)
+}
+
+pub fn serde_has_flatten(attrs: &[Attribute]) -> syn::Result<bool> {
+    let mut has_flatten = false;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("flatten") {
+                has_flatten = true;
+            }
+            consume_meta_value(meta)?;
+            Ok(())
+        })?;
+    }
+
+    Ok(has_flatten)
+}
+
+pub fn reject_serde_flatten_with_deny_unknown_fields(field: &Field) -> syn::Result<()> {
+    if serde_has_flatten(&field.attrs)? {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[serde(deny_unknown_fields)]` cannot be combined with `#[serde(flatten)]`; remove one of the attributes or split the DTO so the strict request shape has explicit fields",
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn serde_has_skip_serializing_if(attrs: &[Attribute]) -> syn::Result<bool> {
+    let mut skip_serializing = false;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip_serializing_if") {
+                skip_serializing = true;
+            }
+            consume_meta_value(meta)?;
+            Ok(())
+        })?;
+    }
+
+    Ok(skip_serializing)
+}
+
+pub fn ts_has_optional(attrs: &[Attribute]) -> syn::Result<bool> {
+    let mut optional = false;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("ts")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("optional") {
+                optional = true;
+            }
+            consume_meta_value(meta)?;
+            Ok(())
+        })?;
+    }
+
+    Ok(optional)
+}
+
+pub fn validate_has_required_rule(attrs: &[Attribute]) -> syn::Result<bool> {
+    let mut required = false;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("validate")) {
+        attr.parse_args_with(|input: syn::parse::ParseStream<'_>| {
+            while !input.is_empty() {
+                let ident: syn::Ident = input.parse()?;
+                if ident == "required" {
+                    required = true;
+                }
+                if input.peek(syn::token::Paren) {
+                    let content;
+                    syn::parenthesized!(content in input);
+                    let _ = content.parse::<TokenStream>();
+                }
+                if !input.is_empty() {
+                    let _: syn::Token![,] = input.parse()?;
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    Ok(required)
+}
+
+fn is_contract_skip_attr(attr: &Attribute) -> syn::Result<bool> {
+    if !(attr.path().is_ident("serde") || attr.path().is_ident("ts")) {
+        return Ok(false);
+    }
+
+    let mut skipped = false;
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("skip") {
+            skipped = true;
+        }
+        consume_meta_value(meta)?;
+        Ok(())
+    })?;
+
+    Ok(skipped)
+}
+
+fn parse_serde_name_value(
+    meta: syn::meta::ParseNestedMeta<'_>,
+    name: &str,
+) -> syn::Result<Option<LitStr>> {
+    if meta.input.peek(Token![=]) {
+        return Ok(Some(meta.value()?.parse()?));
+    }
+
+    if !meta.input.peek(syn::token::Paren) {
+        return Ok(None);
+    }
+
+    let mut serialize = None::<LitStr>;
+    let mut deserialize = None::<LitStr>;
+    meta.parse_nested_meta(|nested| {
+        if nested.path.is_ident("serialize") {
+            set_once_lit_str(&mut serialize, nested.value()?.parse()?, "serialize")?;
+        } else if nested.path.is_ident("deserialize") {
+            set_once_lit_str(&mut deserialize, nested.value()?.parse()?, "deserialize")?;
+        } else {
+            consume_meta_value(nested)?;
+        }
+        Ok(())
+    })?;
+
+    match (serialize, deserialize) {
+        (Some(serialize), Some(deserialize)) if serialize.value() != deserialize.value() => {
+            Err(syn::Error::new_spanned(
+                serialize,
+                format!(
+                    "Foundry derives cannot represent serde {name} with different serialize and deserialize names"
+                ),
+            ))
+        }
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn set_once_lit_str(slot: &mut Option<LitStr>, value: LitStr, name: &str) -> syn::Result<()> {
+    if slot.is_some() {
+        return Err(syn::Error::new_spanned(
+            value,
+            format!("duplicate serde `{name}` attribute"),
+        ));
+    }
+
+    *slot = Some(value);
+    Ok(())
+}
+
+pub fn consume_meta_value(meta: syn::meta::ParseNestedMeta<'_>) -> syn::Result<()> {
+    if meta.input.peek(Token![=]) {
+        let _ = meta.value()?.parse::<Expr>()?;
+    } else if meta.input.peek(syn::token::Paren) {
+        let content;
+        syn::parenthesized!(content in meta.input);
+        let _ = content.parse::<TokenStream>();
+    }
+    Ok(())
+}
+
+fn to_pascal_case(name: &str) -> String {
+    split_identifier_words(name)
+        .into_iter()
+        .map(|word| capitalize_word(&word))
+        .collect::<String>()
+}
+
+fn to_camel_case(name: &str) -> String {
+    let mut words = split_identifier_words(name).into_iter();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let mut output = first.to_ascii_lowercase();
+    for word in words {
+        output.push_str(&capitalize_word(&word));
+    }
+    output
+}
+
+fn capitalize_word(word: &str) -> String {
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut output = first.to_uppercase().collect::<String>();
+    output.push_str(&chars.as_str().to_ascii_lowercase());
+    output
+}
+
+fn push_identifier_token(tokens: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() {
+        tokens.push(std::mem::take(current));
+    }
+}
+
+fn is_identifier_separator(ch: char) -> bool {
+    matches!(ch, '_' | '-' | ' ')
+}
+
+fn should_split_identifier(prev: char, current: char, next: Option<char>) -> bool {
+    if is_identifier_separator(prev) || is_identifier_separator(current) {
+        return false;
+    }
+
+    (prev.is_lowercase() && current.is_uppercase())
+        || (prev.is_alphabetic() && current.is_ascii_digit())
+        || (prev.is_ascii_digit() && current.is_alphabetic())
+        || (prev.is_uppercase()
+            && current.is_uppercase()
+            && next.is_some_and(|ch| ch.is_lowercase()))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DbTypeSpec {

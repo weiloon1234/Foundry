@@ -220,6 +220,24 @@ page.total;        // total matching rows
 page.pagination;   // { page: 1, per_page: 20 }
 ```
 
+In HTTP handlers, accepting `Pagination` directly reads
+`database.default_per_page` when the request omits `per_page`:
+
+```rust
+async fn users(State(app): State<AppContext>, pagination: Pagination) -> Result<Json<Value>> {
+    let db = app.database()?;
+    let page = User::model_query()
+        .paginate(&*db, pagination)
+        .await?;
+
+    Ok(Json(UserResource::paginated(&page, "/api/users")))
+}
+```
+
+`Query<Pagination>` still works for existing handlers, but its serde fallback
+uses the framework default `15` because Axum query deserialization has no app
+state.
+
 **Cursor-based (for large datasets):**
 
 ```rust
@@ -232,6 +250,29 @@ result.data;           // Vec<User>
 result.meta.has_next;  // bool
 result.cursors.next;   // Option<String> — pass as .after() for next page
 ```
+
+Generated TypeScript exports the framework-owned pagination helpers used by
+these response shapes: `Pagination`, `PaginationMeta`, `PaginationLinks`,
+`CursorMeta`, and `CursorInfo`. Use those generated contracts in frontend list
+screens instead of duplicating pagination metadata interfaces by hand. Routes
+documented with `response::<PaginatedResponse<T>>(...)` or
+`response::<CursorPaginated<T>>(...)` also generate concrete route helper
+response aliases with typed `data`, `meta`, and `links` / `cursors` fields.
+`DatabaseManifest.ts` exports `DatabaseDefaultPerPage`,
+`databaseDefaultPagination()`, `databaseNormalizePagination()`,
+`databasePaginationWithDefaults()`, `databasePaginationQueryParamNameMap()`,
+`databasePaginationPageQueryParamName()`,
+`databasePaginationPerPageQueryParamName()`,
+`databaseHasPaginationQueryParamName()`,
+`databasePaginationQueryParamNameOrNull()`, and
+`databasePaginationQueryParams()` from the same backend
+`database.default_per_page` config used by the direct `Pagination` extractor.
+The generated default per-page value is the effective backend value after the
+extractor's positive pagination clamp, and manifest export rejects direct
+pagination defaults that are zero or above JavaScript's safe integer range.
+Offset pagination links preserve existing query parameters, replace stale
+`page` / `per_page` values, and keep URL fragments, so filtered list URLs can
+reuse `Paginated::links()` / `to_response()` without rebuilding links manually.
 
 ### Chunking
 
@@ -725,6 +766,7 @@ entirely, extend `audit.sensitive_fields` for project-specific credential names,
 `redact_sensitive_fields = false` to return to explicit model-only exclusions.
 
 Query audit rows through the built-in `AuditLog` model:
+`types:export` emits the `AuditLog` TypeScript type automatically, so audit review screens can import the backend-owned row shape. Snapshot payloads (`before_data`, `after_data`, and `changes`) are generated as `JsonValue | null`; narrow them per audited model before reading object properties.
 
 ```rust
 let logs = AuditLog::query()
@@ -926,10 +968,14 @@ tooling should fail instead of waiting behind another migration process. If the 
 contains an applied migration that is not registered in the current binary, `db:migrate:status`
 reports it and `db:migrate:status --json` includes it under `missing_applied`; migrate/rollback
 remain strict and stop until the binary or migration files are corrected.
+The JSON `summary` also includes `drifted` and `up_to_date` booleans so deploy
+checks can branch without re-deriving state from the counts.
 
 For source-free servers, run `doctor --deploy --json` from the compiled binary before stopping
 services. The command uses the server-managed `.env`, checks migration drift through the same
-lifecycle code as `db:migrate:status`, and lets deploy scripts fail before swapping runtime files.
+lifecycle code as `db:migrate:status`, reports pending migrations as warnings, and lets deploy
+scripts fail before swapping runtime files. Use `--strict` after `db:migrate` when pending
+migrations should block the readiness gate.
 
 ### Seeders
 
@@ -1019,6 +1065,9 @@ url = "postgres://foundry:secret@127.0.0.1:5432/foundry"
 `GET /_foundry/sql` exposes retained slow queries, a top-slowest ranking, and potential HTTP
 N+1 query suspects. N+1 detection groups repeated SQL fingerprints inside a single HTTP
 request; jobs and scheduler runs are intentionally excluded to avoid batch-work noise.
+Generated OpenAPI documents the endpoint with the backend-owned
+`SqlObservabilitySnapshot`, `SqlObservabilityStats`, `SlowQueryEntry`, and
+`NPlusOneSuspect` schemas.
 
 SQL observability data is process-local and bounded in memory. It is cleared on restart and does
 not require a database migration or cleanup scheduler. SQL shown in logs and

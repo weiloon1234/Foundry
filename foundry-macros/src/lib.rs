@@ -29,17 +29,17 @@ pub fn derive_foundry_id(input: TokenStream) -> TokenStream {
     expand(input, foundry_id::expand)
 }
 
-#[proc_macro_derive(Validate, attributes(validate))]
+#[proc_macro_derive(Validate, attributes(serde, validate))]
 pub fn derive_validate(input: TokenStream) -> TokenStream {
     expand(input, validate::expand)
 }
 
-#[proc_macro_derive(ApiSchema)]
+#[proc_macro_derive(ApiSchema, attributes(serde, ts, validate))]
 pub fn derive_api_schema(input: TokenStream) -> TokenStream {
     expand_with_ts(input, openapi::expand)
 }
 
-#[proc_macro_derive(TS)]
+#[proc_macro_derive(TS, attributes(serde, ts, validate))]
 pub fn derive_ts(input: TokenStream) -> TokenStream {
     expand(input, typescript::expand)
 }

@@ -2204,6 +2204,12 @@ pub fn spawn_worker(app: AppContext) -> Result<tokio::task::JoinHandle<()>> {
 
 pub(crate) type JobRegistryHandle = Arc<Mutex<JobRegistryBuilder>>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobDescriptor {
+    pub id: JobId,
+    pub queue: QueueId,
+}
+
 #[derive(Default)]
 pub(crate) struct JobRegistryBuilder {
     jobs: HashMap<JobId, JobRegistrationBuilder>,
@@ -2293,6 +2299,10 @@ impl JobRuntime {
             config,
             registry,
         }
+    }
+
+    pub(crate) fn descriptors(&self) -> Vec<JobDescriptor> {
+        self.registry.descriptors()
     }
 
     fn poll_interval(&self) -> Duration {
@@ -2485,6 +2495,21 @@ fn claimed_job_result<T>(
 pub(crate) struct JobRegistrySnapshot {
     jobs: HashMap<JobId, JobRegistration>,
     queues: Vec<QueueId>,
+}
+
+impl JobRegistrySnapshot {
+    fn descriptors(&self) -> Vec<JobDescriptor> {
+        let mut descriptors = self
+            .jobs
+            .iter()
+            .map(|(id, registration)| JobDescriptor {
+                id: id.clone(),
+                queue: registration.queue.clone(),
+            })
+            .collect::<Vec<_>>();
+        descriptors.sort_by(|a, b| a.id.cmp(&b.id));
+        descriptors
+    }
 }
 
 struct JobRegistrationBuilder {

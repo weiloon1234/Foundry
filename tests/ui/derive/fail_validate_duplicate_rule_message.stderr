@@ -1,0 +1,5 @@
+error: validation rule `required` declares duplicate `message` override
+ --> tests/ui/derive/fail_validate_duplicate_rule_message.rs:3:44
+  |
+3 |     #[validate(required(message = "First", message = "Second"))]
+  |                                            ^^^^^^^

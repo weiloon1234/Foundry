@@ -9,22 +9,16 @@ help: the trait `foundry::FoundryAppEnum` is not implemented for `CustomType`
    |
  6 | struct CustomType;
    | ^^^^^^^^^^^^^^^^^
-help: the following other types implement trait `foundry::FoundryAppEnum`
-  --> src/jobs/mod.rs
-   |
-   | #[derive(Clone, Copy, Debug, PartialEq, Eq, foundry_macros::AppEnum)]
-   |                                             ^^^^^^^^^^^^^^^^^^^^^^^ `JobHistoryStatus`
-   |
-  ::: src/countries/mod.rs
-   |
-   | #[derive(Clone, Debug, Default, PartialEq, Eq, foundry_macros::AppEnum)]
-   |                                                ^^^^^^^^^^^^^^^^^^^^^^^ `CountryStatus`
-   |
-  ::: src/settings/mod.rs
-   |
-   | #[derive(Clone, Debug, Default, PartialEq, Eq, foundry_macros::AppEnum)]
-   |                                                ^^^^^^^^^^^^^^^^^^^^^^^ `SettingType`
-   = note: this error originates in the derive macro `foundry_macros::AppEnum` (in Nightly builds, run with -Z macro-backtrace for more info)
+   = help: the following other types implement trait `foundry::FoundryAppEnum`:
+             AuthErrorCode
+             AuthOutcome
+             ClientAction
+             CountryStatus
+             DatatableExportStatus
+             HttpOutcomeClass
+             JobHistoryStatus
+             JobOutcome
+           and $N others
 
 error[E0277]: the trait bound `CustomType: FromDbValue` is not satisfied
   --> tests/ui/derive/fail_unsupported_field_type.rs:10:8
@@ -44,14 +38,14 @@ help: the trait `FromDbValue` is not implemented for `CustomType`
  6 | struct CustomType;
    | ^^^^^^^^^^^^^^^^^
    = help: the following other types implement trait `FromDbValue`:
+             AuthErrorCode
+             AuthOutcome
+             ClientAction
              CountryStatus
+             DatatableExportStatus
              DbValue
+             HttpOutcomeClass
              JobHistoryStatus
-             LocalDateTime
-             ModelId<M>
-             Option<T>
-             SettingType
-             Vec<T>
            and $N others
 note: required by a bound in `database::model::<impl DbRecord>::decode_column`
   --> src/database/model.rs

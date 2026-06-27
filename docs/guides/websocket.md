@@ -47,8 +47,121 @@ Clients connect to `ws://host:3010/ws` and subscribe to channels by sending:
 ### Basic Channel
 
 ```rust
-r.channel(ChannelId::new("notifications"), NotificationHandler)?;
+r.channel_with_options(
+    NOTIFICATION_BROADCAST_CHANNEL,
+    NotificationHandler,
+    WebSocketChannelOptions::new().server_event(NOTIFICATION_BROADCAST_EVENT),
+)?;
 ```
+
+Registered channels are exported during `types:export` to
+`WebSocketChannelManifest.ts`, including channel ids, presence/replay settings,
+client-event support, guard, and permissions. Import `WebSocketChannelIds` or
+`WebSocketChannelManifest` in frontend clients instead of copying channel
+strings by hand. Dotted channel ids are grouped and camelCased in
+`WebSocketChannelIds`, so `chat.rooms.updates` becomes
+`WebSocketChannelIds.chat.rooms.updates`. The same generated file exports
+`webSocketChannelNameOrNull()`, `webSocketPresenceChannelNameOrNull()`,
+`webSocketClientEventChannelNameOrNull()`, WebSocket protocol event safe
+parsers,
+`WebSocketRuntimeManifest`, `WebSocketPath`, heartbeat timing constants,
+`WebSocketQueryTokenName`, `webSocketPath()`, `webSocketHeartbeat()`,
+`webSocketLimits()`, `webSocketQueryToken()`, `webSocketHistory()`,
+`webSocketQueryTokenEnabled()`, and `webSocketUrl()` from frontend-safe
+`WebSocketConfig` fields. Use those in socket clients instead of copying the
+configured path, query-token name, limits, history caps, or heartbeat timings
+into frontend code. Channel tooling can import `webSocketChannelManifestEntry()`,
+`webSocketChannels()`, `webSocketChannelNames()`,
+`webSocketPresenceChannels()`, `webSocketPresenceChannelNames()`,
+`webSocketClientEventChannels()`, `webSocketClientEventChannelNames()`,
+`webSocketChannelsRequiringAuth()`, `webSocketChannelNamesRequiringAuth()`,
+`webSocketChannelsWithPermission()`, `webSocketChannelHasPermission()`,
+`webSocketChannelAllowsClientEvent()`, `webSocketChannelAllowsServerEvent()`,
+`webSocketChannelClientEvents()`, and `webSocketChannelServerEvents()` instead
+of hand-scanning the manifest object. Generated WebSocket channel, payload,
+protocol, runtime, and id metadata are frozen at runtime, while WebSocket
+selector helpers return cloned channel entries, event/permission arrays, and
+runtime sub-config objects for local dashboard or socket-client annotations.
+Payload inspectors can also use `webSocketPayloadsForEvent()` and
+`webSocketPayloadsForChannelEvent()` plus their count, presence, first-item, and
+name variants instead of local filters over `webSocketPayloadEntries()`.
+Notification broadcasts also export
+`NotificationBroadcastChannel`, `NotificationBroadcastEvent`, and
+`isTypedNotificationBroadcastPayload()` from `NotificationManifest.ts`, so
+notification clients do not need to copy the canonical channel/event strings.
+The manifest does not export backend deployment details
+such as bind host/port, allowed origins, or low-level transport buffers.
+The same generated file exports
+`subscribeToChannel()`,
+`unsubscribeFromChannel()`, `messageToChannel()`, and `clientEventToChannel()`
+helpers so clients can build canonical `snake_case` protocol frames from the
+backend-owned channel manifest. App message and client-event payload generics
+default to Foundry's generated `JsonValue` contract, and inbound frame guards
+only narrow app frames whose payload is valid JSON. Protocol error frames use
+`WebSocketErrorPayload`, which aliases the generated `ErrorResponse` contract.
+ACK frames use `WebSocketAckPayload` / `WebSocketAckStatus`, and presence
+protocol frames use `WebSocketPresenceJoinPayload` /
+`WebSocketPresenceLeavePayload`, so clients can import these backend-owned
+payload shapes instead of maintaining local protocol interfaces.
+Register app-event payload DTOs with `TsWebSocketPayload` when a server event or
+client event should narrow beyond `JsonValue`:
+
+```rust
+use foundry::prelude::{ChannelEventId, ChannelId, TsWebSocketPayload};
+
+foundry::inventory::submit! {
+    TsWebSocketPayload::server(
+        ChannelId::new("chat.rooms"),
+        ChannelEventId::new("message"),
+        "ChatMessagePayload",
+    )
+}
+
+foundry::inventory::submit! {
+    TsWebSocketPayload::client_event(
+        ChannelId::new("chat.rooms"),
+        ChannelEventId::new("typing"),
+        "TypingPayload",
+    )
+}
+```
+
+Generated `WebSocketChannelManifest.ts` then exports `WebSocketPayloadManifest`,
+`WebSocketServerPayloadMap`, `WebSocketClientEventPayloadMap`,
+`TypedWebSocketAppServerFrame`, `TypedWebSocketClientEventFrame`, and
+`typedClientEventToChannel()`. Use `webSocketPayloadNameOrNull()`,
+`webSocketClientEventNameOrNull()`, and `webSocketServerEventNameOrNull()` when
+normalizing runtime payload or event names before dispatch. Payload metadata must target a registered channel
+and, when the channel has explicit `client_events` or `server_events`, must use
+one of those registered event ids.
+`clientEventToChannel()` only accepts channel ids
+whose backend options enable `allow_client_events(true)`.
+`types:export` also emits the backend-owned `ClientAction` AppEnum helpers, and
+`WebSocketClientAction` aliases that enum so action unions stay generated from
+the Rust protocol type. The raw `ClientMessage`, `ServerMessage`,
+`PresenceInfo`, and `WebSocketChannelDescriptor` records are exported too for
+tooling, diagnostics, and custom clients that need the exact backend protocol
+shape.
+WebSocket observability endpoints export their response DTOs as well:
+`WebSocketChannelsResponse`, `WebSocketPresenceResponse`,
+`WebSocketHistoryResponse`, `WebSocketStatsResponse`, and their member/stat row
+types. Admin dashboards can import those generated contracts instead of
+duplicating `/_foundry/ws/*` response shapes.
+The same `/_foundry/ws/channels`, `/_foundry/ws/presence/{channel}`,
+`/_foundry/ws/history/{channel}`, and `/_foundry/ws/stats` endpoints are
+documented in generated OpenAPI with stable operation ids and backend-owned
+response schemas.
+The manifest also exports `isWebSocketServerFrame()` and
+`parseWebSocketServerFrame()` for checking unknown socket payloads against the
+registered channel list, Foundry protocol events, and declared server-event
+allowlists before frontend dispatch. Presence protocol frame aliases and
+`isWebSocketProtocolFrame()` are narrowed from the manifest's `presence` flag,
+so `presence:join` / `presence:leave` are treated as Foundry protocol frames
+only on channels registered with `presence(true)`.
+Generated inbound frame types keep Foundry protocol frames separate from app
+server frames. Reserve `subscribed`, `unsubscribed`, `presence:join`, and
+`presence:leave` for the framework protocol; use domain-specific names such as
+`message`, `announcement`, or `order.updated` for backend-published app events.
 
 ### Channel with Options
 
@@ -87,6 +200,8 @@ r.channel_with_options(
 | `.authorize(async fn)` | Custom async auth check after guard/permission |
 | `.presence(true)` | Enable join/leave tracking |
 | `.allow_client_events(true)` | Allow clients to relay events to other clients |
+| `.client_event(EventId)` / `.client_events([...])` | Allow clients to relay only the listed event ids |
+| `.server_event(EventId)` / `.server_events([...])` | Document backend-published event ids for generated clients |
 | `.replay(N)` | Buffer last N messages, send to new subscribers |
 | `.on_join(async fn)` | Callback when a user subscribes |
 | `.on_leave(async fn)` | Callback when a user unsubscribes |
@@ -179,6 +294,29 @@ app.websocket()?.publish(
     json!({ "text": "server maintenance in 5 minutes" }),
 ).await?;
 ```
+
+Declare backend-published event ids on the channel when frontend clients should
+receive typed server-frame events:
+
+```rust
+WebSocketChannelOptions::new()
+    .server_events([ChannelEventId::new("message"), ChannelEventId::new("announcement")])
+```
+
+When a registered channel declares server events, `WebSocketPublisher` rejects
+backend publishes for other event ids in any kernel booted with those WebSocket
+routes, including HTTP handlers, WebSocket handlers, queued jobs, and scheduler
+tasks. Channels without declared server events keep the older open-event
+behavior.
+Generated TypeScript frame guards still treat Foundry protocol event ids as
+protocol-only even when a channel keeps open-event behavior, so custom app
+events should avoid `subscribed`, `unsubscribed`, `presence:join`, and
+`presence:leave`. Directly constructed `WebSocketChannelDescriptor` values must
+follow the same registry shape: channel ids, guard ids, permission ids, and
+declared event ids must be non-empty and trimmed; permissions must be unique per
+channel; guard or permission metadata requires `requires_auth: true`;
+`client_events` requires `allow_client_events: true`; and declared client/server
+events must be unique domain event ids rather than reserved protocol events.
 
 ---
 
@@ -276,6 +414,38 @@ Clients communicate via JSON frames over WebSocket:
 
 Client actions are canonical `snake_case`: `subscribe`, `unsubscribe`, `message`, and `client_event`. Foundry temporarily accepts the older PascalCase spellings shown in early docs (`Subscribe`, `Unsubscribe`, `Message`, `ClientEvent`) for compatibility, but new clients should use `snake_case`.
 
+Generated TypeScript clients can import frame builders from
+`WebSocketChannelManifest.ts` instead of constructing these objects manually:
+
+```typescript
+import { WebSocketChannelIds, messageToChannel, subscribeToChannel } from "@shared/types/generated";
+
+socket.send(JSON.stringify(subscribeToChannel(WebSocketChannelIds.chat)));
+socket.send(JSON.stringify(
+  messageToChannel(WebSocketChannelIds.chat, { text: "hello" }, { ackId: "msg-1" }),
+));
+```
+
+Payloads passed to `messageToChannel()` and `clientEventToChannel()` must be JSON
+values: objects, arrays, strings, numbers, booleans, or `null`. Convert browser
+objects such as `Date`, `File`, `Map`, or class instances to JSON-friendly DTOs
+before sending.
+
+Use the generated parser when reading raw socket messages:
+
+```typescript
+import { parseWebSocketServerFrame } from "@shared/types/generated";
+
+socket.addEventListener("message", (event) => {
+  const frame = parseWebSocketServerFrame(JSON.parse(event.data));
+  if (!frame) {
+    return;
+  }
+
+  // frame can be a protocol frame or an app channel frame checked against the manifest.
+});
+```
+
 ### Subscribe
 
 ```json
@@ -333,6 +503,17 @@ When `allow_client_events(true)` is set:
 
 Relayed to all other subscribers (not back to sender).
 
+Use `client_event(...)` or `client_events(...)` when event ids should also be
+backend-owned:
+
+```rust
+WebSocketChannelOptions::new()
+    .client_events([ChannelEventId::new("typing"), ChannelEventId::new("stopped_typing")])
+```
+
+If a channel registers client event ids, the runtime rejects other client-event
+ids and generated TypeScript narrows `clientEventToChannel()` to the same list.
+
 ---
 
 ## System Events
@@ -349,6 +530,17 @@ The framework automatically sends these events:
 | `ACK_EVENT` | `ack` | Message acknowledged |
 
 `error` and `ack` are sent on the `system` channel. `subscribed`, `unsubscribed`, `presence:join`, and `presence:leave` are sent on the channel they describe and include the room when relevant.
+Generated TypeScript exports these wire values as `WebSocketProtocol` and
+includes typed protocol frame aliases such as `WebSocketAckFrame`,
+`WebSocketErrorFrame`, and `WebSocketPresenceJoinFrame`. Presence frame aliases
+use `WebSocketPresenceChannelName`, a union derived from channels whose backend
+options enable `presence(true)`. Their payloads reuse the generated
+`WebSocketAckPayload`, `WebSocketErrorPayload`,
+`WebSocketPresenceJoinPayload`, and `WebSocketPresenceLeavePayload` contracts.
+Foundry rejects app-published channel frames that reuse these channel protocol
+event names, even when the channel has an open server-event list. Use
+domain-specific event names for app broadcasts so frontend dispatch stays
+obvious.
 
 ---
 
@@ -382,6 +574,17 @@ history_ttl_seconds = 604800          # auto-reap idle history after 7 days
 ```
 
 If `allowed_origins` is empty, Foundry allows same-origin browser handshakes in production/staging and remains permissive outside production-like environments. If `allowed_origins` is non-empty, browser handshakes must include an `Origin` header that exactly matches one configured value. Use this with session-cookie authentication to prevent cross-site WebSocket handshakes.
+
+Frontend clients can import `WebSocketRuntimeManifest`, `WebSocketPath`,
+`WebSocketQueryTokenName`, `webSocketPath()`, `webSocketHeartbeat()`,
+`webSocketLimits()`, `webSocketQueryToken()`, `webSocketHistory()`, and
+`webSocketUrl()` from generated types after `types:export`; do not mirror
+`path`, query-token, limits, history, or heartbeat settings by hand.
+Deployment-only settings such as `host`, `port`, and `allowed_origins` stay
+backend-only. Runtime manifest export requires a non-empty trimmed `path` that
+starts with `/`, positive heartbeat timings, a positive `history_buffer_size`,
+and a valid `query_token_name` when query tokens are enabled, so frontend socket
+helpers see the same effective contract the server runs.
 
 Foundry accepts bearer tokens in the query string by default because browser
 WebSocket clients cannot set custom `Authorization` headers. The decoded token
@@ -429,6 +632,10 @@ Foundry exposes read-only JSON endpoints under the observability base path (defa
 | `GET /_foundry/ws/history/:channel`     | Recent buffered messages (metadata only by default) |
 | `GET /_foundry/ws/stats`                | Global + per-channel counters                |
 
+Presence and history lookups that cannot find the channel, or presence lookups
+for non-presence channels, return the standard generated `ErrorResponse`
+contract (`{ message, status }`) with `404`.
+
 #### Example: list registered channels
 
 ```bash
@@ -443,6 +650,8 @@ curl -s http://localhost:3000/_foundry/ws/channels | jq
       "presence": true,
       "replay_count": 10,
       "allow_client_events": false,
+      "client_events": [],
+      "server_events": ["message"],
       "requires_auth": true,
       "guard": "api",
       "permissions": ["chat:read"]

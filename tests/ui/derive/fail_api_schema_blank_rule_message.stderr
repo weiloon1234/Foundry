@@ -1,0 +1,5 @@
+error: validation rule message override must not be blank
+ --> tests/ui/derive/fail_api_schema_blank_rule_message.rs:5:35
+  |
+5 |     #[validate(required(message = ""))]
+  |                                   ^^

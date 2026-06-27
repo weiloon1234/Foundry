@@ -4,6 +4,13 @@ File storage: local + S3, multipart uploads, file validation
 
 [Back to index](../index.md)
 
+## Notes
+
+- `types:export` mirrors browser-safe storage config into
+  `StorageRuntimeManifest`, plus `storageUploadLimits()`,
+  `storageImageLimits()`, and `storageAttachmentOrphanPolicy()` helpers for
+  frontend upload forms and storage admin tooling.
+
 ## foundry::storage
 
 ```rust
@@ -14,6 +21,7 @@ struct StorageManager
   fn disk(&self, name: &str) -> Result<StorageDisk>
   fn default_disk_name(&self) -> &str
   fn configured_disks(&self) -> Vec<String>
+  fn descriptors(&self) -> Vec<StorageDiskDescriptor>
   async fn put( &self, path: &str, contents: impl AsRef<[u8]>, ) -> Result<StoredFile>
   async fn put_bytes( &self, path: &str, bytes: impl AsRef<[u8]>, ) -> Result<StoredFile>
   async fn put_file( &self, path: &str, temp_path: &Path, content_type: Option<&str>, ) -> Result<StoredFile>
@@ -25,6 +33,7 @@ struct StorageManager
   async fn url(&self, path: &str) -> Result<String>
   async fn temporary_url( &self, path: &str, expires_at: DateTime, ) -> Result<String>
   async fn list_prefix( &self, prefix: &str, limit: usize, ) -> Result<Vec<StorageObject>>
+struct StorageDiskDescriptor
 ```
 
 ## foundry::storage::adapter
@@ -62,6 +71,7 @@ struct StorageConfig
 ```rust
 struct StorageDisk
   fn name(&self) -> &str
+  fn driver(&self) -> &str
   fn visibility(&self) -> StorageVisibility
   async fn put( &self, path: &str, contents: impl AsRef<[u8]>, ) -> Result<StoredFile>
   async fn put_bytes( &self, path: &str, bytes: impl AsRef<[u8]>, ) -> Result<StoredFile>
@@ -130,4 +140,3 @@ async fn remove_uploaded_temp_file(file: &UploadedFile) -> bool
 async fn scope_upload_limits<F>( limits: UploadLimits, future: F, ) -> F::Output
 async fn uploaded_file_from_multipart_field( field_name: String, field: Field<'_>, limits: UploadLimits, counters: &mut UploadCounters, ) -> Result<Option<UploadedFile>>
 ```
-

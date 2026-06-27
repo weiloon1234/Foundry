@@ -18,6 +18,20 @@ pub trait FoundryAppEnum: Sized + Clone + Send + Sync + 'static {
     /// All valid keys for this enum.
     fn keys() -> Collection<EnumKey>;
 
+    /// All accepted string inputs for this enum, including canonical keys and
+    /// compatibility aliases.
+    fn accepted_keys() -> Collection<String> {
+        let mut keys = Vec::new();
+        for option in Self::options() {
+            match option.value {
+                EnumKey::String(value) => keys.push(value),
+                EnumKey::Int(value) => keys.push(value.to_string()),
+            }
+            keys.extend(option.aliases);
+        }
+        Collection::from(keys)
+    }
+
     /// Parse a string key into the enum variant.
     /// For string-backed: matches against stored string keys.
     /// For int-backed: parses string as i32, then matches discriminants.

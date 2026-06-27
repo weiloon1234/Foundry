@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{AccessScope, Actor, Authenticatable};
@@ -12,6 +13,7 @@ use crate::logging::{
     catch_future_panic, catch_sync_panic, panic_payload_message, RuntimeDiagnostics,
 };
 use crate::support::runtime::RuntimeBackend;
+use crate::support::sync::{read_unpoisoned, write_unpoisoned};
 use crate::support::{ChannelEventId, ChannelId, GuardId, PermissionId};
 
 pub(crate) fn presence_key(channel: &ChannelId) -> String {
@@ -52,11 +54,102 @@ fn websocket_registrar_panic_error(panic: Box<dyn std::any::Any + Send>) -> Erro
     Error::message(format!("websocket registrar panicked: {message}"))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct PresenceInfo {
     pub actor_id: String,
     pub channel: ChannelId,
+    #[ts(type = "number")]
     pub joined_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, foundry_macros::AppEnum)]
+pub enum WebSocketAckStatus {
+    Ok,
+    Error,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
+pub struct WebSocketAckPayload {
+    pub ack_id: String,
+    pub status: WebSocketAckStatus,
+    pub error: Option<String>,
+}
+
+impl WebSocketAckPayload {
+    pub fn ok(ack_id: impl Into<String>) -> Self {
+        Self {
+            ack_id: ack_id.into(),
+            status: WebSocketAckStatus::Ok,
+            error: None,
+        }
+    }
+
+    pub fn error(ack_id: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            ack_id: ack_id.into(),
+            status: WebSocketAckStatus::Error,
+            error: Some(error.into()),
+        }
+    }
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
+pub struct WebSocketPresenceJoinPayload {
+    pub actor_id: String,
+    #[ts(type = "number")]
+    pub joined_at: i64,
+}
+
+impl WebSocketPresenceJoinPayload {
+    pub fn new(actor_id: impl Into<String>, joined_at: i64) -> Self {
+        Self {
+            actor_id: actor_id.into(),
+            joined_at,
+        }
+    }
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
+pub struct WebSocketPresenceLeavePayload {
+    pub actor_id: String,
+}
+
+impl WebSocketPresenceLeavePayload {
+    pub fn new(actor_id: impl Into<String>) -> Self {
+        Self {
+            actor_id: actor_id.into(),
+        }
+    }
 }
 
 pub const SYSTEM_CHANNEL: ChannelId = ChannelId::new("system");
@@ -67,64 +160,122 @@ pub const PRESENCE_JOIN_EVENT: ChannelEventId = ChannelEventId::new("presence:jo
 pub const PRESENCE_LEAVE_EVENT: ChannelEventId = ChannelEventId::new("presence:leave");
 pub const ACK_EVENT: ChannelEventId = ChannelEventId::new("ack");
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+pub(crate) fn is_reserved_channel_protocol_event(event: &ChannelEventId) -> bool {
+    event == &SUBSCRIBED_EVENT
+        || event == &UNSUBSCRIBED_EVENT
+        || event == &PRESENCE_JOIN_EVENT
+        || event == &PRESENCE_LEAVE_EVENT
+}
+
+pub(crate) fn reserved_channel_protocol_event_message(
+    kind: &str,
+    event: &ChannelEventId,
+) -> String {
+    format!(
+        "websocket {kind} event `{event}` is a reserved Foundry protocol event; use a domain-specific event id"
+    )
+}
+
+fn ensure_app_channel_event(kind: &str, event: &ChannelEventId) -> Result<()> {
+    if is_reserved_channel_protocol_event(event) {
+        return Err(Error::message(reserved_channel_protocol_event_message(
+            kind, event,
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, foundry_macros::AppEnum)]
 pub enum ClientAction {
+    #[foundry(aliases = ["Subscribe"])]
     Subscribe,
+    #[foundry(aliases = ["Unsubscribe"])]
     Unsubscribe,
+    #[foundry(aliases = ["Message"])]
     Message,
+    #[foundry(aliases = ["ClientEvent"])]
     ClientEvent,
 }
 
-impl<'de> Deserialize<'de> for ClientAction {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        match value.as_str() {
-            "subscribe" | "Subscribe" => Ok(Self::Subscribe),
-            "unsubscribe" | "Unsubscribe" => Ok(Self::Unsubscribe),
-            "message" | "Message" => Ok(Self::Message),
-            "client_event" | "ClientEvent" => Ok(Self::ClientEvent),
-            _ => Err(serde::de::Error::unknown_variant(
-                &value,
-                &[
-                    "subscribe",
-                    "unsubscribe",
-                    "message",
-                    "client_event",
-                    "Subscribe",
-                    "Unsubscribe",
-                    "Message",
-                    "ClientEvent",
-                ],
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(
+    Debug, Clone, Deserialize, PartialEq, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct ClientMessage {
     pub action: ClientAction,
     pub channel: ChannelId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    #[ts(optional)]
     pub room: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    #[ts(optional)]
     pub payload: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    #[ts(optional)]
     pub event: Option<ChannelEventId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    #[ts(optional)]
     pub ack_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+impl Serialize for ClientMessage {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut len = 2;
+        len += usize::from(self.room.is_some());
+        len += usize::from(self.payload.is_some());
+        len += usize::from(self.event.is_some());
+        len += usize::from(self.ack_id.is_some());
+
+        let mut state = serializer.serialize_struct("ClientMessage", len)?;
+        state.serialize_field("action", &self.action)?;
+        state.serialize_field("channel", &self.channel)?;
+        if let Some(room) = &self.room {
+            state.serialize_field("room", room)?;
+        }
+        if let Some(payload) = &self.payload {
+            state.serialize_field("payload", payload)?;
+        }
+        if let Some(event) = &self.event {
+            state.serialize_field("event", event)?;
+        }
+        if let Some(ack_id) = &self.ack_id {
+            state.serialize_field("ack_id", ack_id)?;
+        }
+        state.end()
+    }
+}
+
+#[derive(
+    Debug, Clone, Deserialize, PartialEq, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct ServerMessage {
     pub channel: ChannelId,
     pub event: ChannelEventId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    #[ts(optional)]
     pub room: Option<String>,
     pub payload: serde_json::Value,
+}
+
+impl Serialize for ServerMessage {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut len = 3;
+        len += usize::from(self.room.is_some());
+
+        let mut state = serializer.serialize_struct("ServerMessage", len)?;
+        state.serialize_field("channel", &self.channel)?;
+        state.serialize_field("event", &self.event)?;
+        if let Some(room) = &self.room {
+            state.serialize_field("room", room)?;
+        }
+        state.serialize_field("payload", &self.payload)?;
+        state.end()
+    }
 }
 
 #[derive(Clone)]
@@ -231,12 +382,30 @@ where
     }
 }
 
-#[derive(Clone)]
 pub struct WebSocketPublisher {
     backend: RuntimeBackend,
     diagnostics: Arc<RuntimeDiagnostics>,
     history_ttl_seconds: u64,
     history_buffer_size: usize,
+    channel_registry: RwLock<Option<Arc<WebSocketChannelRegistry>>>,
+}
+
+impl Clone for WebSocketPublisher {
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            diagnostics: self.diagnostics.clone(),
+            history_ttl_seconds: self.history_ttl_seconds,
+            history_buffer_size: self.history_buffer_size,
+            channel_registry: RwLock::new(
+                read_unpoisoned(
+                    &self.channel_registry,
+                    "websocket publisher channel registry",
+                )
+                .clone(),
+            ),
+        }
+    }
 }
 
 impl WebSocketPublisher {
@@ -251,7 +420,15 @@ impl WebSocketPublisher {
             diagnostics,
             history_ttl_seconds,
             history_buffer_size: history_buffer_size.max(1),
+            channel_registry: RwLock::new(None),
         }
+    }
+
+    pub(crate) fn attach_channel_registry(&self, registry: Arc<WebSocketChannelRegistry>) {
+        *write_unpoisoned(
+            &self.channel_registry,
+            "websocket publisher channel registry",
+        ) = Some(registry);
     }
 
     pub async fn publish<C, E>(
@@ -275,6 +452,8 @@ impl WebSocketPublisher {
     }
 
     pub async fn publish_message(&self, message: ServerMessage) -> Result<()> {
+        self.validate_publish_event(&message)?;
+
         let payload = serde_json::to_string(&message).map_err(Error::other)?;
         self.diagnostics
             .record_websocket_outbound_message_on(&message.channel);
@@ -296,6 +475,36 @@ impl WebSocketPublisher {
         }
 
         Ok(())
+    }
+
+    fn validate_publish_event(&self, message: &ServerMessage) -> Result<()> {
+        ensure_app_channel_event("server", &message.event)?;
+
+        let registry = read_unpoisoned(
+            &self.channel_registry,
+            "websocket publisher channel registry",
+        )
+        .clone();
+        let Some(registry) = registry else {
+            return Ok(());
+        };
+        let Some(descriptor) = registry.find(&message.channel) else {
+            return Ok(());
+        };
+
+        if descriptor.server_events.is_empty()
+            || descriptor
+                .server_events
+                .iter()
+                .any(|event| event == &message.event)
+        {
+            return Ok(());
+        }
+
+        Err(Error::message(format!(
+            "websocket channel `{}` does not document server event `{}`",
+            message.channel, message.event
+        )))
     }
 
     /// Force disconnect all connections for a specific user (across all instances).
@@ -335,6 +544,8 @@ pub struct WebSocketChannelOptions {
     pub presence: bool,
     pub(crate) authorize: Option<AuthorizeCallback>,
     pub(crate) allow_client_events: bool,
+    pub(crate) client_events: BTreeSet<ChannelEventId>,
+    pub(crate) server_events: BTreeSet<ChannelEventId>,
     pub(crate) on_join: Option<LifecycleCallback>,
     pub(crate) on_leave: Option<LifecycleCallback>,
     pub(crate) replay_count: u32,
@@ -401,6 +612,54 @@ impl WebSocketChannelOptions {
     /// Allow clients to send events that are relayed to other subscribers.
     pub fn allow_client_events(mut self, enabled: bool) -> Self {
         self.allow_client_events = enabled;
+        self
+    }
+
+    /// Allow clients to relay a specific event id on this channel.
+    ///
+    /// Registering one or more client events narrows accepted client-event
+    /// frames to that allowlist and enables client-event relay for the channel.
+    pub fn client_event<I>(mut self, event: I) -> Self
+    where
+        I: Into<ChannelEventId>,
+    {
+        self.allow_client_events = true;
+        self.client_events.insert(event.into());
+        self
+    }
+
+    /// Allow clients to relay the provided event ids on this channel.
+    ///
+    /// If no client events are registered, `allow_client_events(true)` keeps the
+    /// legacy open event-id behavior for compatibility.
+    pub fn client_events<I, E>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = E>,
+        E: Into<ChannelEventId>,
+    {
+        self.allow_client_events = true;
+        self.client_events
+            .extend(events.into_iter().map(Into::into));
+        self
+    }
+
+    /// Document that the backend may publish a specific event id on this channel.
+    pub fn server_event<I>(mut self, event: I) -> Self
+    where
+        I: Into<ChannelEventId>,
+    {
+        self.server_events.insert(event.into());
+        self
+    }
+
+    /// Document that the backend may publish the provided event ids on this channel.
+    pub fn server_events<I, E>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = E>,
+        E: Into<ChannelEventId>,
+    {
+        self.server_events
+            .extend(events.into_iter().map(Into::into));
         self
     }
 
@@ -536,6 +795,12 @@ impl WebSocketRegistrar {
                 "websocket channel `{id}` already registered"
             )));
         }
+        for event in &options.client_events {
+            ensure_app_channel_event("client", event)?;
+        }
+        for event in &options.server_events {
+            ensure_app_channel_event("server", event)?;
+        }
 
         self.channels.insert(
             id.clone(),
@@ -564,15 +829,61 @@ pub(crate) struct RegisteredChannel {
 ///
 /// Emitted by the `/_foundry/ws/channels` dashboard endpoint and returned
 /// from [`AppContext::websocket_channels`](crate::foundation::AppContext::websocket_channels).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS, foundry_macros::TS)]
 pub struct WebSocketChannelDescriptor {
     pub id: ChannelId,
     pub presence: bool,
+    #[ts(type = "number")]
     pub replay_count: u32,
     pub allow_client_events: bool,
+    pub client_events: Vec<ChannelEventId>,
+    pub server_events: Vec<ChannelEventId>,
     pub requires_auth: bool,
     pub guard: Option<GuardId>,
     pub permissions: Vec<PermissionId>,
+}
+
+impl crate::openapi::ApiSchema for WebSocketChannelDescriptor {
+    fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "presence": { "type": "boolean" },
+                "replay_count": { "type": "integer" },
+                "allow_client_events": { "type": "boolean" },
+                "client_events": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                },
+                "server_events": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                },
+                "requires_auth": { "type": "boolean" },
+                "guard": { "type": "string", "nullable": true },
+                "permissions": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                },
+            },
+            "required": [
+                "id",
+                "presence",
+                "replay_count",
+                "allow_client_events",
+                "client_events",
+                "server_events",
+                "requires_auth",
+                "guard",
+                "permissions",
+            ],
+        })
+    }
+
+    fn schema_name() -> &'static str {
+        "WebSocketChannelDescriptor"
+    }
 }
 
 impl From<&RegisteredChannel> for WebSocketChannelDescriptor {
@@ -582,6 +893,8 @@ impl From<&RegisteredChannel> for WebSocketChannelDescriptor {
             presence: channel.options.presence,
             replay_count: channel.options.replay_count,
             allow_client_events: channel.options.allow_client_events,
+            client_events: channel.options.client_events.iter().cloned().collect(),
+            server_events: channel.options.server_events.iter().cloned().collect(),
             requires_auth: channel.options.requires_auth(),
             guard: channel.options.guard_id().cloned(),
             permissions: channel.options.permissions_set().into_iter().collect(),
@@ -633,12 +946,15 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ChannelId, GuardId, PermissionId, WebSocketChannelOptions, WebSocketChannelRegistry,
-        WebSocketRegistrar, WebSocketRouteRegistrar,
+        ChannelEventId, ChannelId, ClientAction, ClientMessage, GuardId, PermissionId,
+        WebSocketChannelOptions, WebSocketChannelRegistry, WebSocketRegistrar,
+        WebSocketRouteRegistrar, PRESENCE_JOIN_EVENT, SUBSCRIBED_EVENT,
     };
     use crate::auth::Actor;
     use crate::config::ConfigRepository;
     use crate::foundation::{AppContext, Container};
+    use crate::logging::{ReadinessRegistryBuilder, RuntimeBackendKind, RuntimeDiagnostics};
+    use crate::support::runtime::RuntimeBackend;
     use crate::validation::RuleRegistry;
 
     fn websocket_context() -> super::WebSocketContext {
@@ -676,6 +992,61 @@ mod tests {
     }
 
     #[test]
+    fn rejects_reserved_protocol_events_in_channel_options() {
+        let mut registrar = WebSocketRegistrar::new();
+        let server_error = registrar
+            .channel_with_options(
+                ChannelId::new("reserved_server"),
+                |_context, _payload| async { Ok(()) },
+                WebSocketChannelOptions::new().server_event(SUBSCRIBED_EVENT),
+            )
+            .err()
+            .unwrap();
+        assert!(server_error
+            .to_string()
+            .contains("reserved Foundry protocol event"));
+
+        let mut registrar = WebSocketRegistrar::new();
+        let client_error = registrar
+            .channel_with_options(
+                ChannelId::new("reserved_client"),
+                |_context, _payload| async { Ok(()) },
+                WebSocketChannelOptions::new().client_event(PRESENCE_JOIN_EVENT),
+            )
+            .err()
+            .unwrap();
+        assert!(client_error
+            .to_string()
+            .contains("reserved Foundry protocol event"));
+    }
+
+    #[test]
+    fn websocket_publisher_rejects_reserved_protocol_server_events() {
+        let publisher = super::WebSocketPublisher::new(
+            RuntimeBackend::memory("websocket-reserved-protocol-events"),
+            Arc::new(RuntimeDiagnostics::new(
+                RuntimeBackendKind::Memory,
+                ReadinessRegistryBuilder::freeze_shared(ReadinessRegistryBuilder::shared()),
+            )),
+            0,
+            1,
+        );
+
+        let error = publisher
+            .validate_publish_event(&super::ServerMessage {
+                channel: ChannelId::new("chat"),
+                event: SUBSCRIBED_EVENT,
+                room: None,
+                payload: serde_json::Value::Null,
+            })
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("reserved Foundry protocol event"));
+    }
+
+    #[test]
     fn websocket_registrar_panic_becomes_error() {
         let registrars: Vec<WebSocketRouteRegistrar> = vec![Arc::new(|_| {
             panic!("websocket registrar explode");
@@ -689,6 +1060,54 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "websocket registrar panicked: websocket registrar explode"
+        );
+    }
+
+    #[test]
+    fn client_action_uses_canonical_keys_and_legacy_aliases() {
+        assert_eq!(
+            serde_json::to_string(&ClientAction::ClientEvent).unwrap(),
+            "\"client_event\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientAction>("\"ClientEvent\"").unwrap(),
+            ClientAction::ClientEvent
+        );
+
+        let message: ClientMessage =
+            serde_json::from_value(serde_json::json!({ "action": "Subscribe", "channel": "chat" }))
+                .unwrap();
+        assert_eq!(message.action, ClientAction::Subscribe);
+        assert_eq!(message.channel, ChannelId::new("chat"));
+
+        let client_frame = serde_json::to_value(ClientMessage {
+            action: ClientAction::Subscribe,
+            channel: ChannelId::new("chat"),
+            room: None,
+            payload: None,
+            event: None,
+            ack_id: None,
+        })
+        .unwrap();
+        assert_eq!(
+            client_frame,
+            serde_json::json!({ "action": "subscribe", "channel": "chat" })
+        );
+
+        let server_frame = serde_json::to_value(super::ServerMessage {
+            channel: ChannelId::new("chat"),
+            event: ChannelEventId::new("message"),
+            room: None,
+            payload: serde_json::json!({ "body": "hello" }),
+        })
+        .unwrap();
+        assert_eq!(
+            server_frame,
+            serde_json::json!({
+                "channel": "chat",
+                "event": "message",
+                "payload": { "body": "hello" },
+            })
         );
     }
 
@@ -776,7 +1195,8 @@ mod tests {
                 WebSocketChannelOptions::new()
                     .presence(true)
                     .replay(25)
-                    .allow_client_events(true)
+                    .client_event(ChannelEventId::new("typing"))
+                    .server_events([ChannelEventId::new("message"), ChannelEventId::new("ack")])
                     .guard(GuardId::new("api"))
                     .permissions([PermissionId::new("chat:read")]),
             )
@@ -791,6 +1211,14 @@ mod tests {
         assert!(descriptor.presence);
         assert_eq!(descriptor.replay_count, 25);
         assert!(descriptor.allow_client_events);
+        assert_eq!(
+            descriptor.client_events,
+            vec![ChannelEventId::new("typing")]
+        );
+        assert_eq!(
+            descriptor.server_events,
+            vec![ChannelEventId::new("ack"), ChannelEventId::new("message")]
+        );
         assert!(descriptor.requires_auth);
         assert_eq!(descriptor.guard.as_ref(), Some(&GuardId::new("api")));
         assert_eq!(descriptor.permissions, vec![PermissionId::new("chat:read")]);

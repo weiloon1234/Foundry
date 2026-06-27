@@ -1,0 +1,5 @@
+error: Foundry contract derives cannot represent `#[serde(alias = "...")]` on public fields; aliases make the backend accept undocumented JSON keys
+ --> tests/ui/derive/fail_ts_serde_alias_field.rs:5:21
+  |
+5 |     #[serde(alias = "emailAddress")]
+  |                     ^^^^^^^^^^^^^^

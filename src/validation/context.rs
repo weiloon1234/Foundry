@@ -40,6 +40,11 @@ pub trait ValidationRule: Send + Sync + 'static {
     ) -> std::result::Result<(), ValidationError>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidationRuleDescriptor {
+    pub id: ValidationRuleId,
+}
+
 #[derive(Clone, Default)]
 pub struct RuleRegistry {
     rules: Arc<RwLock<HashMap<ValidationRuleId, Arc<dyn ValidationRule>>>>,
@@ -76,5 +81,15 @@ impl RuleRegistry {
         Ok(read_unpoisoned(&self.rules, "rule registry")
             .get(id)
             .cloned())
+    }
+
+    pub fn descriptors(&self) -> Vec<ValidationRuleDescriptor> {
+        let mut descriptors = read_unpoisoned(&self.rules, "rule registry")
+            .keys()
+            .cloned()
+            .map(|id| ValidationRuleDescriptor { id })
+            .collect::<Vec<_>>();
+        descriptors.sort_by(|a, b| a.id.cmp(&b.id));
+        descriptors
     }
 }

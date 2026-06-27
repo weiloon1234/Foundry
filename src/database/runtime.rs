@@ -83,9 +83,10 @@ impl SqlLogConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 pub struct SlowQueryEntry {
     pub sql: String,
+    #[ts(type = "number")]
     pub duration_ms: u64,
     pub label: Option<String>,
     pub request_id: Option<String>,
@@ -93,36 +94,47 @@ pub struct SlowQueryEntry {
     pub recorded_at: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct SqlObservabilitySnapshot {
+#[derive(Clone, Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
+pub struct SqlObservabilitySnapshot {
     pub stats: SqlObservabilityStats,
     pub top_slowest: Vec<SlowQueryEntry>,
     pub n_plus_one_suspects: Vec<NPlusOneSuspect>,
     pub slow_queries: Vec<SlowQueryEntry>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct SqlObservabilityStats {
+#[derive(Clone, Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
+pub struct SqlObservabilityStats {
+    #[ts(type = "number")]
     pub retained_count: usize,
+    #[ts(type = "number")]
     pub capacity: usize,
+    #[ts(type = "number")]
     pub slow_query_threshold_ms: u64,
+    #[ts(type = "number | null")]
     pub max_duration_ms: Option<u64>,
+    #[ts(type = "number | null")]
     pub avg_duration_ms: Option<u64>,
     pub latest_recorded_at: Option<String>,
+    #[ts(type = "number")]
     pub n_plus_one_suspect_count: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct NPlusOneSuspect {
+#[derive(Clone, Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
+pub struct NPlusOneSuspect {
     pub method: String,
     pub path: String,
     pub request_id: Option<String>,
     pub trace_id: Option<String>,
     pub fingerprint: String,
+    #[ts(type = "number")]
     pub repeat_count: u64,
+    #[ts(type = "number")]
     pub total_duration_ms: u64,
+    #[ts(type = "number")]
     pub max_duration_ms: u64,
+    #[ts(type = "number")]
     pub avg_duration_ms: u64,
+    #[ts(type = "number")]
     pub rows_total: u64,
     pub labels: Vec<String>,
     pub kinds: Vec<String>,

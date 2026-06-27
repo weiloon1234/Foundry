@@ -4,9 +4,18 @@ Multi-channel notifications: email, database, broadcast
 
 [Back to index](../index.md)
 
+## Notes
+
+- `types:export` writes `NotificationManifest.ts` with registered notification
+  payload DTOs, built-in channel ids, canonical broadcast channel/event
+  constants, and helpers such as `isTypedNotificationBroadcastPayload()` so
+  frontend clients can avoid copying notification routing strings.
+
 ## foundry::notifications
 
 ```rust
+pub const NOTIFICATION_BROADCAST_CHANNEL: ChannelId;
+pub const NOTIFICATION_BROADCAST_EVENT: ChannelEventId;
 pub const NOTIFY_BROADCAST: NotificationChannelId;
 pub const NOTIFY_DATABASE: NotificationChannelId;
 pub const NOTIFY_EMAIL: NotificationChannelId;
@@ -32,4 +41,3 @@ fn build_notification_job( notifiable: &dyn Notifiable, notification: &dyn Notif
 async fn notify( app: &AppContext, notifiable: &dyn Notifiable, notification: &dyn Notification, ) -> Result<()>
 async fn notify_queued( app: &AppContext, notifiable: &dyn Notifiable, notification: &dyn Notification, ) -> Result<()>
 ```
-

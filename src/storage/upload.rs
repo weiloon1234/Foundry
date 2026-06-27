@@ -9,8 +9,10 @@ use axum::response::{IntoResponse, Response};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::foundation::{AppContext, Error, Result};
+use crate::openapi::ApiSchema;
 use crate::support::filename::{safe_extension_from_name, sanitize_filename};
 use serde::de::{self, Deserialize, Deserializer};
+use ts_rs::TS;
 
 use super::stored_file::StoredFile;
 use super::StorageConfig;
@@ -34,6 +36,44 @@ pub struct UploadedFile {
     pub content_type: Option<String>,
     pub size: u64,
     pub temp_path: PathBuf,
+}
+
+impl TS for UploadedFile {
+    type WithoutGenerics = Self;
+
+    fn ident() -> String {
+        "File".to_string()
+    }
+
+    fn name() -> String {
+        "File".to_string()
+    }
+
+    fn inline() -> String {
+        "File".to_string()
+    }
+
+    fn inline_flattened() -> String {
+        panic!("{} cannot be flattened", Self::name())
+    }
+
+    fn decl() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+
+    fn decl_concrete() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+}
+
+impl ApiSchema for UploadedFile {
+    fn schema() -> serde_json::Value {
+        serde_json::json!({"type": "string", "format": "binary"})
+    }
+
+    fn schema_name() -> &'static str {
+        "UploadedFile"
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -536,6 +576,15 @@ mod tests {
             size: 1024,
             temp_path: PathBuf::from("/tmp/upload123"),
         }
+    }
+
+    #[test]
+    fn uploaded_file_exports_as_browser_file_contract() {
+        assert_eq!(<UploadedFile as TS>::inline(), "File");
+        assert_eq!(
+            <UploadedFile as ApiSchema>::schema(),
+            serde_json::json!({"type": "string", "format": "binary"})
+        );
     }
 
     #[test]

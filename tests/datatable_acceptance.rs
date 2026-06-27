@@ -445,6 +445,24 @@ async fn registry_serves_model_and_projection_datatables() {
     seed_orders(database.as_ref()).await;
 
     let registry = app.datatables().unwrap();
+    let descriptors = registry.descriptors().unwrap();
+    let orders_descriptor = descriptors
+        .iter()
+        .find(|descriptor| descriptor.id == "orders")
+        .expect("orders datatable descriptor");
+    assert!(orders_descriptor
+        .columns
+        .iter()
+        .any(|column| column.name == "total" && column.exportable));
+    assert!(orders_descriptor
+        .default_sort
+        .iter()
+        .any(|sort| sort.field == "id" && sort.direction == OrderDirection::Asc));
+    assert!(orders_descriptor
+        .relation_filters
+        .iter()
+        .any(|filter| filter.field == "merchant.name"
+            && filter.aliases.iter().any(|alias| alias == "merchant-name")));
 
     let orders = registry
         .get("orders")
@@ -469,6 +487,15 @@ async fn registry_serves_model_and_projection_datatables() {
         .unwrap();
 
     assert_eq!(orders_response.rows.len(), 2);
+    let total_column = orders_response
+        .columns
+        .iter()
+        .find(|column| column.name == "total")
+        .expect("total column metadata");
+    assert!(total_column.sortable);
+    assert!(total_column.filterable);
+    assert!(total_column.exportable);
+    assert_eq!(total_column.relation, None);
     assert_eq!(
         orders_response.rows[0]
             .get("total")

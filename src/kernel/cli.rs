@@ -34,6 +34,7 @@ impl CliKernel {
         T: Into<OsString> + Clone,
     {
         let registry = self.build_registry()?;
+        let command_descriptors = registry.descriptors();
         let mut root = Command::new("foundry")
             .version(env!("CARGO_PKG_VERSION"))
             .about("Foundry — a Laravel-inspired Rust web framework")
@@ -53,7 +54,11 @@ impl CliKernel {
                 .find(|command| command.id.as_str() == name)
             {
                 let handler = registered.handler.clone();
-                let invocation = CommandInvocation::new(self.app.clone(), sub_matches.clone());
+                let invocation = CommandInvocation::new(
+                    self.app.clone(),
+                    sub_matches.clone(),
+                    command_descriptors.clone(),
+                );
                 match catch_future_panic(async move { handler(invocation).await }).await {
                     Ok(result) => result?,
                     Err(panic) => {

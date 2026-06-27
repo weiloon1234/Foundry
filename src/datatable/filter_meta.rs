@@ -11,7 +11,17 @@ use super::request::DatatableFilterOp;
 // Filter kind
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS, foundry_macros::TS)]
+#[derive(
+    Serialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DatatableFilterKind {
     Text,
@@ -22,7 +32,17 @@ pub enum DatatableFilterKind {
     DateTime,
 }
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS, foundry_macros::TS)]
+#[derive(
+    Serialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DatatableFilterValueKind {
     Text,
@@ -34,7 +54,9 @@ pub enum DatatableFilterValueKind {
     Values,
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS, foundry_macros::TS)]
+#[derive(
+    Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct DatatableFilterBinding {
     pub field: String,
     pub op: DatatableFilterOp,
@@ -59,14 +81,18 @@ impl DatatableFilterBinding {
 // Select option
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS, foundry_macros::TS)]
+#[derive(
+    Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct DatatableFilterOption {
     pub value: String,
     /// For AppEnum-backed filters this carries the translation key.
     pub label: String,
 }
 
-#[derive(Serialize, Clone, Debug, Default, ts_rs::TS, foundry_macros::TS)]
+#[derive(
+    Serialize, Clone, Debug, Default, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 struct DatatableFilterOptions {
     pub items: Vec<DatatableFilterOption>,
 }
@@ -104,7 +130,7 @@ impl From<Collection<EnumOption>> for Collection<DatatableFilterOption> {
 // Filter field
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq, Eq, ts_rs::TS, foundry_macros::TS)]
+#[derive(Clone, Debug, PartialEq, Eq, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 pub struct DatatableFilterField {
     pub name: String,
     pub kind: DatatableFilterKind,
@@ -423,7 +449,7 @@ where
 // Filter row (layout)
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Clone, Debug, ts_rs::TS, foundry_macros::TS)]
+#[derive(Serialize, Clone, Debug, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 pub struct DatatableFilterRow {
     pub fields: Vec<DatatableFilterField>,
 }

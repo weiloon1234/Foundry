@@ -3,7 +3,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::cli::{CommandInvocation, CommandRegistrar};
-use crate::database::lifecycle::migration_status_summary_from_app;
+use crate::database::lifecycle::{migration_status_summary_from_app, MigrationStatusSummary};
 use crate::foundation::{AppContext, Error, Result};
 use crate::logging::ProbeState;
 use crate::support::runtime::RuntimeBackend;
@@ -275,24 +275,42 @@ async fn check_migrations(app: &AppContext) -> DoctorCheck {
     }
 
     match migration_status_summary_from_app(app).await {
-        Ok(summary) if summary.missing_applied == 0 => DoctorCheck::ok_with_details(
-            "migrations",
-            format!(
-                "{} registered, {} applied, {} pending",
-                summary.registered, summary.applied, summary.pending
-            ),
-            json!(summary),
-        ),
-        Ok(summary) => DoctorCheck::failed_with_details(
+        Ok(summary) => migration_doctor_check(summary),
+        Err(error) => DoctorCheck::failed("migrations", error.to_string()),
+    }
+}
+
+fn migration_doctor_check(summary: MigrationStatusSummary) -> DoctorCheck {
+    if summary.drifted {
+        return DoctorCheck::failed_with_details(
             "migrations",
             format!(
                 "{} applied migration(s) are missing from the current binary",
                 summary.missing_applied
             ),
             json!(summary),
-        ),
-        Err(error) => DoctorCheck::failed("migrations", error.to_string()),
+        );
     }
+
+    if !summary.up_to_date {
+        return DoctorCheck::warning_with_details(
+            "migrations",
+            format!(
+                "{} registered, {} applied, {} pending; run db:migrate before deploy",
+                summary.registered, summary.applied, summary.pending
+            ),
+            json!(summary),
+        );
+    }
+
+    DoctorCheck::ok_with_details(
+        "migrations",
+        format!(
+            "{} registered, {} applied, {} pending",
+            summary.registered, summary.applied, summary.pending
+        ),
+        json!(summary),
+    )
 }
 
 async fn check_runtime_backend(app: &AppContext) -> DoctorCheck {
@@ -435,6 +453,7 @@ mod tests {
     use std::fs;
 
     use super::{DoctorReport, DoctorStatus};
+    use crate::database::lifecycle::MigrationStatusSummary;
     use crate::foundation::App;
     use tempfile::tempdir;
 
@@ -521,6 +540,57 @@ mod tests {
 
         assert_eq!(cache.status, DoctorStatus::Ok);
         assert!(cache.message.contains("cache roundtrip succeeded"));
+    }
+
+    #[test]
+    fn migration_doctor_check_marks_clean_summary_ok() {
+        let check = super::migration_doctor_check(MigrationStatusSummary {
+            registered: 2,
+            applied: 2,
+            pending: 0,
+            missing_applied: 0,
+            drifted: false,
+            up_to_date: true,
+            latest_batch: Some(1),
+        });
+
+        assert_eq!(check.status, DoctorStatus::Ok);
+        assert_eq!(check.details.as_ref().unwrap()["up_to_date"], true);
+    }
+
+    #[test]
+    fn migration_doctor_check_warns_when_migrations_are_pending() {
+        let check = super::migration_doctor_check(MigrationStatusSummary {
+            registered: 3,
+            applied: 2,
+            pending: 1,
+            missing_applied: 0,
+            drifted: false,
+            up_to_date: false,
+            latest_batch: Some(1),
+        });
+
+        assert_eq!(check.status, DoctorStatus::Warning);
+        assert!(check.message.contains("run db:migrate before deploy"));
+        assert_eq!(check.details.as_ref().unwrap()["pending"], 1);
+        assert_eq!(check.details.as_ref().unwrap()["up_to_date"], false);
+    }
+
+    #[test]
+    fn migration_doctor_check_fails_when_applied_migrations_are_missing() {
+        let check = super::migration_doctor_check(MigrationStatusSummary {
+            registered: 2,
+            applied: 2,
+            pending: 0,
+            missing_applied: 1,
+            drifted: true,
+            up_to_date: false,
+            latest_batch: Some(1),
+        });
+
+        assert_eq!(check.status, DoctorStatus::Failed);
+        assert!(check.message.contains("missing from the current binary"));
+        assert_eq!(check.details.as_ref().unwrap()["drifted"], true);
     }
 
     #[tokio::test]

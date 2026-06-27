@@ -1,0 +1,7 @@
+error: `#[serde(skip)]` fields cannot carry `#[validate(...)]` rules because serde ignores them during request deserialization; remove the validation rule, remove the serde skip, or move the value into an explicit request DTO field
+ --> tests/ui/derive/fail_validate_serde_skip_rule.rs:3:5
+  |
+3 | /     #[serde(skip)]
+4 | |     #[validate(required)]
+5 | |     internal: String,
+  | |____________________^

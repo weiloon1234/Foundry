@@ -1,0 +1,7 @@
+error: validation rule `min` requires exactly one schema constraint argument, got 2
+ --> tests/ui/derive/fail_api_schema_single_arg_validate_rule_extra_arg.rs:3:32
+  |
+3 | #[derive(Serialize, ts_rs::TS, foundry::ApiSchema)]
+  |                                ^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the derive macro `foundry::ApiSchema` (in Nightly builds, run with -Z macro-backtrace for more info)

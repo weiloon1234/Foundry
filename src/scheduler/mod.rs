@@ -162,6 +162,23 @@ pub enum ScheduleKind {
     Interval { every: Duration },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScheduleDescriptorKind {
+    Cron { expression: String },
+    Interval { every_milliseconds: u128 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleDescriptor {
+    pub id: ScheduleId,
+    pub kind: ScheduleDescriptorKind,
+    pub without_overlapping: bool,
+    pub environments: Vec<String>,
+    pub has_before_hook: bool,
+    pub has_after_hook: bool,
+    pub has_failure_hook: bool,
+}
+
 /// Per-task configuration options.
 #[derive(Clone, Default)]
 pub struct ScheduleOptions {
@@ -227,6 +244,29 @@ pub struct ScheduledTask {
     pub(crate) kind: ScheduleKind,
     pub(crate) handler: ScheduleHandler,
     pub(crate) options: ScheduleOptions,
+}
+
+impl ScheduledTask {
+    fn descriptor(&self) -> ScheduleDescriptor {
+        let kind = match &self.kind {
+            ScheduleKind::Cron { expression } => ScheduleDescriptorKind::Cron {
+                expression: expression.as_str().to_string(),
+            },
+            ScheduleKind::Interval { every } => ScheduleDescriptorKind::Interval {
+                every_milliseconds: every.as_millis(),
+            },
+        };
+
+        ScheduleDescriptor {
+            id: self.id.clone(),
+            kind,
+            without_overlapping: self.options.without_overlapping,
+            environments: self.options.environments.clone(),
+            has_before_hook: self.options.before_hook.is_some(),
+            has_after_hook: self.options.after_hook.is_some(),
+            has_failure_hook: self.options.on_failure.is_some(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -371,6 +411,16 @@ impl ScheduleRegistry {
     pub(crate) fn tasks(self) -> Vec<ScheduledTask> {
         self.tasks
     }
+
+    pub fn descriptors(&self) -> Vec<ScheduleDescriptor> {
+        let mut descriptors = self
+            .tasks
+            .iter()
+            .map(ScheduledTask::descriptor)
+            .collect::<Vec<_>>();
+        descriptors.sort_by(|a, b| a.id.cmp(&b.id));
+        descriptors
+    }
 }
 
 fn ensure_unique_name(tasks: &[ScheduledTask], id: &ScheduleId) -> Result<()> {
@@ -396,7 +446,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{CronExpression, ScheduleOptions, ScheduleRegistrar, ScheduleRegistry};
+    use super::{
+        CronExpression, ScheduleDescriptorKind, ScheduleOptions, ScheduleRegistrar,
+        ScheduleRegistry,
+    };
     use crate::support::ScheduleId;
 
     #[test]
@@ -492,5 +545,52 @@ mod tests {
             .environments(&["production", "staging"]);
         assert!(opts.without_overlapping);
         assert_eq!(opts.environments.len(), 2);
+    }
+
+    #[test]
+    fn descriptors_expose_registered_schedule_metadata() {
+        let mut registry = ScheduleRegistry::new();
+        registry
+            .cron_with_options(
+                ScheduleId::new("reports.daily"),
+                CronExpression::daily().unwrap(),
+                ScheduleOptions::new()
+                    .without_overlapping()
+                    .environments(&["production"])
+                    .before(|_| async { Ok(()) })
+                    .on_failure(|_| async { Ok(()) }),
+                |_| async { Ok(()) },
+            )
+            .unwrap();
+        registry
+            .interval(
+                ScheduleId::new("cache.prune"),
+                Duration::from_secs(300),
+                |_| async { Ok(()) },
+            )
+            .unwrap();
+
+        let descriptors = registry.descriptors();
+
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].id, ScheduleId::new("cache.prune"));
+        assert_eq!(
+            descriptors[0].kind,
+            ScheduleDescriptorKind::Interval {
+                every_milliseconds: 300_000,
+            }
+        );
+        assert_eq!(descriptors[1].id, ScheduleId::new("reports.daily"));
+        assert_eq!(
+            descriptors[1].kind,
+            ScheduleDescriptorKind::Cron {
+                expression: "0 0 0 * * *".to_string(),
+            }
+        );
+        assert!(descriptors[1].without_overlapping);
+        assert_eq!(descriptors[1].environments, vec!["production"]);
+        assert!(descriptors[1].has_before_hook);
+        assert!(!descriptors[1].has_after_hook);
+        assert!(descriptors[1].has_failure_hook);
     }
 }

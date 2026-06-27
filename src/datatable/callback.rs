@@ -9,6 +9,8 @@ use super::context::DatatableContext;
 use super::datatable_trait::Datatable;
 use super::filter_meta::DatatableFilterRow;
 use super::mapping::DatatableMapping;
+use super::relation_filter::DatatableRelationFilter;
+use super::sort::DatatableSort;
 
 pub(crate) fn catch_datatable_callback<T>(
     subject: impl Into<String>,
@@ -44,6 +46,27 @@ where
     D: Datatable + ?Sized,
 {
     catch_datatable_callback(format!("`{}` mappings callback", D::ID), D::mappings)
+}
+
+pub(crate) fn datatable_relation_filters<D>(
+) -> Result<Vec<DatatableRelationFilter<D::Row, D::Query>>>
+where
+    D: Datatable + ?Sized,
+{
+    catch_datatable_callback(
+        format!("`{}` relation_filters callback", D::ID),
+        D::relation_filters,
+    )
+}
+
+pub(crate) fn datatable_default_sort<D>() -> Result<Vec<DatatableSort<D::Row>>>
+where
+    D: Datatable + ?Sized,
+{
+    catch_datatable_callback(
+        format!("`{}` default_sort callback", D::ID),
+        D::default_sort,
+    )
 }
 
 pub(crate) async fn datatable_available_filters<D>(

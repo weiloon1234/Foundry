@@ -1,8 +1,6 @@
 use axum::http::StatusCode;
-use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, foundry_macros::AppEnum)]
 pub enum LogLevel {
     Trace,
     Debug,
@@ -23,8 +21,7 @@ impl LogLevel {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, foundry_macros::AppEnum)]
 pub enum HttpOutcomeClass {
     Informational,
     Success,
@@ -45,8 +42,7 @@ impl HttpOutcomeClass {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, foundry_macros::AppEnum)]
 pub enum AuthOutcome {
     Success,
     Unauthorized,
@@ -54,8 +50,7 @@ pub enum AuthOutcome {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, foundry_macros::AppEnum)]
 pub enum JobOutcome {
     Enqueued,
     Leased,
@@ -66,29 +61,25 @@ pub enum JobOutcome {
     DeadLettered,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, foundry_macros::AppEnum)]
 pub enum WebSocketConnectionState {
     Opened,
     Closed,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, foundry_macros::AppEnum)]
 pub enum RuntimeBackendKind {
     Redis,
     Memory,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, foundry_macros::AppEnum)]
 pub enum SchedulerLeadershipState {
     Acquired,
     Lost,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, foundry_macros::AppEnum)]
 pub enum ProbeState {
     Healthy,
     Unhealthy,

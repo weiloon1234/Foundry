@@ -36,13 +36,13 @@ For import stability and compatibility expectations, see [Public API Contract](p
 | [public](modules/public.md) |  | 67L |
 | [redis](modules/redis.md) | Namespaced Redis wrapper (RedisManager, RedisConnection) | 41L |
 | [scheduler](modules/scheduler.md) | Cron + interval scheduling with Redis-safe leadership | 54L |
-| [settings](modules/settings.md) |  | 37L |
+| [settings](modules/settings.md) |  | 51L |
 | [storage](modules/storage.md) | File storage: local + S3, multipart uploads, file validation | 133L |
 | [support](modules/support.md) | Utilities: typed IDs, datetime/clock, Collection<T>, crypto, hashing, locks | 216L |
 | [testing](modules/testing.md) | Test infrastructure: TestApp, TestClient, Factory | 40L |
 | [translations](modules/translations.md) | Model field translations across locales (HasTranslations) | 42L |
 | [typescript](modules/typescript.md) |  | 14L |
-| [validation](modules/validation.md) | Validation: 38+ rules, custom rules, request validation extractor | 149L |
+| [validation](modules/validation.md) | Validation: 89 built-in field/collection validation features, custom rules, request validation extractor | 148L |
 | [websocket](modules/websocket.md) | Channel-based WebSocket with presence and typed messages | 68L |
 
 **Total: 35 modules, 3529 lines across all files.**

@@ -101,6 +101,13 @@ struct RouteManifestEntry
 struct RouteManifestResponse
 ```
 
+## Notes
+
+- `types:export` writes `HttpManifest.ts` from safe `[http]` config for
+  frontend HTTP integration. It exposes CSRF names, CORS method/header config,
+  body/timeout limits, security-header flags, and global rate-limit metadata
+  without exporting proxy CIDRs, key prefixes, credentials, or raw CSP text.
+
 ## foundry::http::cookie
 
 ```rust
@@ -276,8 +283,13 @@ trait ApiResource
 ## foundry::http::response
 
 ```rust
+struct CsrfTokenResponse
+  fn new(token: impl Into<String>) -> Self
 struct MessageResponse
   fn new(message: impl Into<String>) -> Self
+  fn ok() -> Self
+struct StatusResponse
+  fn new(status: impl Into<String>) -> Self
   fn ok() -> Self
 ```
 
@@ -300,7 +312,6 @@ struct RouteRegistry
 - `HttpConfig.trusted_proxy` honors forwarded client IP headers only from configured CIDRs; the default CIDR set trusts Cloudflare ranges, and `TrustedProxy::new()` uses the same Cloudflare-safe default.
 - Config-derived CORS validates origins, methods, and headers at boot; wildcard origins with credentials are rejected.
 - Config-derived CSRF is opt-in; code-registered `Csrf` remains source-compatible and path exclusions are segment-aware.
-- Config-derived body-limit, request-timeout, and rate-limit rejections return JSON `ErrorResponse` bodies with HTTP 413, 408, and 429.
+- Config-derived body-limit, request-timeout, CSRF, maintenance-mode, and rate-limit rejections return JSON `ErrorResponse` bodies with their HTTP status codes.
 - Actor-only rate limits require an authenticated actor; use `actor_or_ip` when a global rate limit needs an IP fallback.
 - IP rate limits use `TrustedProxy` real IP when available and otherwise fall back to TCP peer connect info on the real server path.
-

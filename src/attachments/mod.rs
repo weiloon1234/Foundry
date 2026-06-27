@@ -27,7 +27,15 @@ pub(crate) use orphans::{
 };
 
 /// A file attachment record from the `attachments` table.
-#[derive(Clone, Debug)]
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+)]
 pub struct Attachment {
     pub id: String,
     pub attachable_type: String,
@@ -38,6 +46,7 @@ pub struct Attachment {
     pub name: String,
     pub original_name: Option<String>,
     pub mime_type: Option<String>,
+    #[ts(type = "number")]
     pub size: i64,
     pub sort_order: i32,
     pub custom_properties: serde_json::Value,

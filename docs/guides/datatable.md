@@ -19,6 +19,62 @@ impl ServiceProvider for AppServiceProvider {
 
 The same registration path works for app providers and plugins.
 
+Registered datatables are also included in `types:export` output. The generated
+`DatatableManifest.ts` contains backend-owned table ids, columns, computed
+mappings, relation-filter aliases, and default sorts so frontend table builders
+can import `DatatableManifest`, `DatatableRuntimeManifest`, `DatatableIds`,
+`DatatableMaxPerPage`, `DatatableMaxExportRows`, `datatablePerPageCap()`,
+`datatableExportRowsCap()`, `datatableManifestEntry()`, `datatableEntries()`,
+`datatableNames()`, `datatableColumns()`, `datatableColumn()`,
+`datatableColumnNames()`, `datatableSortableColumns()`,
+`datatableSortableColumn()`, `datatableSortableFieldNames()`,
+`datatableFilterableColumns()`, `datatableFilterableColumn()`,
+`datatableFilterableColumnNames()`, `datatableMappings()`,
+`datatableMappingNames()`, `datatableRelationFilters()`,
+`datatableRelationFilterForField()`,
+`datatableRelationFilterCanonicalField()`, `datatableRelationFilterFields()`,
+`datatableRelationFilterAliases()`, `datatableStaticFilterFieldNames()`,
+`datatableDefaultSortFieldNames()`, `datatableSort()`, `datatableFilter()`,
+`datatableRequest()`, `datatableQueryParams()`,
+`datatableRequestFromQueryParams()`, `isDatatableName()`, and
+`datatableNameOrNull()` instead of maintaining
+a parallel table registry or copied pagination/export caps. The generated `DatatableRequestFor<Name>`
+type narrows sort fields and static filter fields from the manifest, and
+`datatableRequest()` validates both before query params are generated or parsed.
+Nested safe parsers such as `datatableColumnNameOrNull()`,
+`datatableColumnNameForRelationOrNull()`,
+`datatableRelationFilterFieldNameOrNull()`,
+`datatableRelationFilterFieldNameForRelationOrNull()`,
+`datatableStaticFilterFieldNameOrNull()`, `datatableMappingNameOrNull()`, and
+`datatableDefaultSortFieldNameOrNull()` normalize runtime field, relation,
+mapping, filter, and default-sort strings into generated datatable unions.
+`datatableRequestFromQueryParams()` hydrates a typed request from `URLSearchParams`,
+raw `?sort=...&f-...` strings, or plain query objects for shareable table URLs.
+Dynamic
+`available_filters()` controls can still use the raw generated
+`DatatableRequest` shape when their fields are not part of the static manifest,
+or call `datatableRequestFromQueryParams(name, query, { validate: false })`.
+Directly constructed `DatatableDescriptor` values must use non-empty, trimmed
+field names, unique column/mapping/default-sort names, and non-colliding static
+filter fields for filterable columns and relation filter aliases.
+Generated datatable manifests, runtime caps, and id trees are frozen at runtime,
+so direct mutation cannot change backend-owned table metadata. Datatable
+selector helpers clone entries, columns, mappings, relation-filter aliases, and
+default sorts before returning them, so table builders can add local column
+state, selection state, or UI-only labels to selector results. Lookup helpers
+retrieve a single backend-owned column and normalize relation-filter aliases to
+their canonical field names without local `.find(...)` scans.
+
+Queued export responses are also backend-owned: `DatatableExportAccepted` and
+the AppEnum-backed `DatatableExportStatus` are generated for frontend export
+actions instead of requiring a local `"queued"` union.
+
+OpenAPI schemas use the same backend-owned contracts: `DatatableJsonResponse`
+documents `columns`, `pagination`, `filters`, `applied_filters`, and `sorts`
+with `DatatableColumnMeta`, `DatatablePaginationMeta`, `DatatableFilterRow`,
+`DatatableFilterInput`, and `DatatableSortInput` instead of opaque or duplicated
+object fragments.
+
 ## The `Datatable` Trait
 
 ```rust
@@ -72,6 +128,7 @@ Rules:
 - projection fields get implicit sort-by-alias support
 - projection auto-filtering is explicit: use `filter_by(...)` for `WHERE` and `filter_having(...)` for `HAVING`
 - relation auto-filtering is explicit: use `relation_filters()` for typed `where_has(...)` filters
+- JSON responses include each column's `sortable`, `filterable`, `exportable`, and nullable `relation` metadata so frontend tables can render controls from backend-owned declarations
 
 ## Model Datatable Example
 
@@ -193,11 +250,16 @@ Client requests still use the normal `DatatableRequest` shape; relation filters 
 }
 ```
 
-Legacy query strings normalize to the same filter inputs when routed through `DatatableRequest::from_query_params()`:
+Legacy query strings normalize to the same sort and filter inputs when routed
+through `Query<DatatableRequest>` or `DatatableRequest::from_query_params()`:
 
 ```text
-?f-gte-total=5000&f-like-merchant-name=foundry&f-tags-name=priority
+?sort=total,-created_at&direction=desc,asc&f-gte-total=5000&f-like-merchant-name=foundry&f-eq-tags-name=priority
 ```
+
+Exact filters should use `f-eq-<field>` in generated or custom query builders.
+The older `f-<field>` fallback is still accepted, but it is ambiguous when a
+field name starts with an operator prefix such as `in-`, `date-`, or `not-eq-`.
 
 Projection datatables should keep relation-like behavior explicit with `filter_by(...)`, `filter_having(...)`, or a custom `filters()` hook.
 
@@ -361,7 +423,13 @@ DatatableFilterField::enum_select::<OrderStatus>("status", "Status");
 
 For AppEnum-backed filters, the datatable option payload keeps the enum label metadata unchanged. With the default AppEnum conventions that means `DatatableFilterOption.label` carries the translation key such as `enum.order_status.pending`.
 
-Foundry still accepts structured `DatatableRequest` filters and legacy `f-...` query params through `DatatableRequest::from_query_params()`, but explicit binding metadata is now the preferred frontend contract.
+Foundry accepts structured `DatatableRequest` JSON and legacy `sort` /
+`direction` / `f-...` query params directly through `Query<DatatableRequest>`,
+but generated manifest helpers such as `datatableRequest()` and
+`datatableQueryParams()` are now the preferred frontend contract. Use
+`datatableRequestFromQueryParams(name, window.location.search)` to hydrate table
+state from a shareable URL, and `datatableQueryParams(name, request)` to write it
+back to query params.
 
 ## Output Modes
 
@@ -383,5 +451,13 @@ max_export_rows = 50000  # 0 = no XLSX export row cap
 is applied before XLSX downloads and queued export jobs load rows into memory; if
 the filtered result is larger, Foundry returns a clear error and the operator can
 narrow filters or raise the cap.
+After `types:export`, frontend table builders can import
+`DatatableRuntimeManifest`, `datatablePerPageCap()`, and
+`datatableExportRowsCap()` instead of copying these limits. Runtime manifest
+export requires `max_per_page` and `max_export_rows` to stay within JavaScript's
+safe integer range; `0` remains the documented unlimited sentinel for each cap.
+
+Queued email exports return `DatatableExportAccepted` with a
+`DatatableExportStatus` status field, serialized as `"queued"` for JSON clients.
 
 That keeps model tables and grouped report tables on the same framework path end-to-end.

@@ -1,0 +1,6 @@
+error: `#[serde(deny_unknown_fields)]` cannot be combined with `#[serde(flatten)]`; remove one of the attributes or split the DTO so the strict request shape has explicit fields
+  --> tests/ui/derive/fail_deny_unknown_flatten_api_schema.rs:9:5
+   |
+ 9 | /     #[serde(flatten)]
+10 | |     child: FlattenedChild,
+   | |_________________________^

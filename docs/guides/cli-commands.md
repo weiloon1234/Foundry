@@ -37,11 +37,50 @@ cargo run -- greet
 # Hello from Foundry!
 ```
 
+`types:export` writes registered CLI commands to `CommandManifest.ts`, including
+each command id, name, descriptions, argument names, argument metadata (`kind`,
+`help`, `longHelp`, `required`, `repeatable`, `valueNames`, `valueHint`,
+`defaultValues`, and `possibleValues`), positional argument names, non-positional
+option names, value-taking option names, flag names, subcommand names, and
+counts. Use `CommandManifest`, `CommandIds`, `commandEntries()`,
+`commandNames()`, `commandNameOrNull()`, `isCommandArgumentName()`,
+`commandArgumentNameOrNull()`,
+`isCommandPositionalArgumentName()`, `commandPositionalArgumentNameOrNull()`,
+`isCommandOptionName()`, `commandOptionNameOrNull()`,
+`isCommandValueOptionName()`, `commandValueOptionNameOrNull()`,
+`isCommandFlagName()`, `commandFlagNameOrNull()`,
+`isCommandSubcommandName()`, `commandSubcommandNameOrNull()`,
+`commandArguments()`, `commandArgumentMetadata()`,
+`commandArgumentMetadataForArgumentOrNull()`,
+`commandArgumentHelp()`, `commandArgumentValueNames()`,
+`commandArgumentDefaultValues()`, `commandArgumentPossibleValues()`,
+`commandVisibleArgumentPossibleValueNames()`, `commandRequiredArgumentNames()`,
+`commandRepeatableArgumentNames()`, `commandDefaultedArgumentNames()`,
+`commandArgumentNamesWithPossibleValues()`,
+`commandPositionalArguments()`, `commandOptions()`, `commandOptionSwitches()`,
+`commandOptionTokens()`, `commandPreferredOptionTokenOrNull()`,
+`commandValueOptions()`, `commandFlags()`, `commandSubcommands()`,
+`commandNamesWithArgument()`, `commandNamesWithPositionalArgument()`,
+`commandNamesWithOption()`, `commandNamesWithValueOption()`,
+`commandNamesWithFlag()`, `commandNamesWithSubcommand()`,
+`commandsWithArguments()`, `commandsWithPositionalArguments()`,
+`commandsWithOptions()`, `commandsWithValueOptions()`, `commandsWithFlags()`,
+and `commandsWithSubcommands()` in admin or dev tooling instead of copying
+command strings or scraping Clap output. Nullable first selectors such as
+`commandFirstEntryOrNull()`, `firstCommandWithArgumentOrNull(...)`, and
+`firstCommandWithSubcommandsOrNull()` keep empty command groups explicit without
+local `... ?? null` wrappers. Generated command constants are frozen at
+runtime, while command selector helpers return cloned command entries plus
+argument metadata/default-value/possible-value arrays, positional argument,
+option, option-switch, value-option, flag, and subcommand arrays for local
+dev-tool annotations.
+
 ---
 
 ## Defining Commands
 
-Every command needs three things: a `CommandId`, a `clap::Command` definition, and an async handler.
+Every command needs three things: a `CommandId`, a Clap `Command` definition
+from `foundry::prelude::*`, and an async handler.
 
 ### Simple Command (No Arguments)
 
@@ -283,10 +322,17 @@ These are available automatically — no registration needed:
 | `db:rollback` | Rollback last migration batch; accepts `--lock-timeout-ms <MS>` |
 | `db:seed` | Run seeders |
 | `seed:countries` | Seed 250 countries |
-| `make:migration` | Create a migration file |
+| `make:migration` | Create a raw SQL migration file |
 | `make:seeder` | Create a seeder file |
-| `make:model` | Create a model file; accepts `--path <DIR>` |
+| `make:ids` | Create a typed app IDs file; accepts `--path <DIR>` |
+| `make:model` | Create a typed model file; accepts `--path <DIR>` |
+| `make:request` | Create a typed request DTO file; accepts `--path <DIR>` |
+| `make:response` | Create a typed response DTO file; accepts `--path <DIR>` |
+| `make:guard` | Create an auth guard authenticator file; accepts `--path <DIR>` |
+| `make:policy` | Create an auth policy file; accepts `--path <DIR>` |
 | `make:job` | Create a job file; accepts `--path <DIR>` |
+| `make:event` | Create a typed event file; accepts `--path <DIR>` |
+| `make:notification` | Create a typed notification file; accepts `--path <DIR>` |
 | `make:command` | Create a command file; accepts `--path <DIR>` |
 | `down` | Enter maintenance mode |
 | `up` | Exit maintenance mode |
@@ -303,15 +349,78 @@ These are available automatically — no registration needed:
 only the compiled binary and built assets. It uses the server's existing `.env`, checks config,
 database, runtime backend, cache roundtrip, readiness probes, and migration drift, then exits
 non-zero only when a check fails. Warnings, such as an intentionally unconfigured database or a
-Redis cache driver without Redis configured, are reported but do not block the command.
+Redis cache driver without Redis configured, are reported but do not block the command. Pending
+migrations are reported as a warning so deploy tooling can inspect a package before applying
+migrations.
 
 Use `doctor --deploy --strict` as a production readiness gate. Strict mode exits non-zero when
-any warning is reported, and text output ends with a `Production readiness: ...` verdict.
+any warning is reported, including pending migrations, and text output ends with a
+`Production readiness: ...` verdict.
 
-`make:model`, `make:job`, and `make:command` default to the legacy `src/app/*` directories. Pass
-`--path <DIR>` to target split app layouts such as `src/domain/models`, `src/domain/jobs`, or
-`src/commands`. Relative paths are resolved from the current working directory; absolute paths are
-used as-is.
+`make:ids`, `make:model`, `make:request`, `make:response`, `make:guard`,
+`make:policy`, `make:job`, `make:event`, `make:notification`, and
+`make:command` default to the legacy `src/app/*` directories. Pass
+`--path <DIR>` to target split app layouts such as `src/domain`,
+`src/domain/models`, `src/http/requests`, `src/http/responses`, `src/domain/guards`,
+`src/domain/policies`, `src/domain/jobs`, `src/domain/events`,
+`src/domain/notifications`, or `src/commands`. Relative paths are resolved from
+the current working directory; absolute paths are used as-is.
+
+`make:model` scaffolds `serde::Serialize`, `foundry::ts_rs::TS`, `ApiSchema`,
+and `Model`, so newly generated models are immediately eligible for
+`types:export` and OpenAPI route docs when used as response contracts. The
+scaffold expects the same `serde` dependency used by generated jobs, but does
+not require a direct `ts-rs` dependency. `make:migration` remains a raw SQL
+scaffold; edit the `ctx.raw_execute(...)` calls directly. New migration,
+seeder, guard, policy, and job scaffolds use `#[foundry::async_trait]`, so they
+do not require a direct `async-trait` dependency.
+
+`make:ids` scaffolds a starter `ids.rs` with `FoundryId` guard and route enums
+plus an `AppEnum` ability enum backed by `PermissionId`, so app-owned semantic
+ids live in one backend module and ability values can be exported to TypeScript.
+
+`make:request` scaffolds `serde::Deserialize`, `foundry::ts_rs::TS`,
+`ApiSchema`, and `Validate`, so newly generated request DTOs are immediately
+usable with `JsonValidated<T>` / `Validated<T>` and eligible for generated
+TypeScript route helpers and OpenAPI validation metadata.
+
+`make:response` scaffolds `serde::Serialize`, `foundry::ts_rs::TS`, and
+`ApiSchema`, so newly generated response DTOs are immediately usable with
+`route.response::<T>(status)`, `types:export`, and OpenAPI route docs without a
+direct `ts-rs` dependency.
+
+`make:guard` scaffolds a backend-owned `GuardId`, a `register(...)` helper, and
+a `BearerAuthenticator` implementation that rejects by default until you fill in
+`authenticate(...)`. A trailing `Guard` suffix is removed from the generated id,
+so `ApiGuard` registers `GuardId::new("api")`. After registration,
+`types:export` includes the guard id in `AuthManifest.ts` / `AuthGuardIds`.
+
+`make:policy` scaffolds a backend-owned `PolicyId`, a `register(...)` helper,
+and a `Policy` implementation that denies by default until you fill in
+`evaluate(...)`. After registration, `types:export` includes the policy id in
+`AuthManifest.ts` / `AuthPolicyIds` without copying the id into frontend code.
+
+`make:job` scaffolds `serde::Serialize`, `serde::Deserialize`,
+`foundry::ts_rs::TS`, and `foundry::TS`, so the job payload type is exportable
+by `types:export`. Register `TsJobPayload` after registering the job when
+dashboards or tooling need `JobPayloadMap` to point at that payload type.
+
+`make:event` scaffolds `serde::Serialize`, `serde::Deserialize`,
+`foundry::ts_rs::TS`, `foundry::TS`, `ApiSchema`, `Event`, and a
+`TsEventPayload` registration, so the event payload is immediately exportable
+through `EventManifest.ts`. The generated event id uses dot notation, for
+example `OrderPlaced` becomes `order.placed`.
+
+`make:notification` scaffolds `serde::Serialize`, `serde::Deserialize`,
+`foundry::ts_rs::TS`, `foundry::TS`, `ApiSchema`, `Notification`, and a
+`TsNotification` registration. It defaults to database and broadcast channels,
+serializes the notification struct as both payloads, and uses dot notation for
+the notification type, for example `OrderShipped` becomes `order.shipped`.
+
+`make:command` uses the prelude-exported `Command`, so generated commands do
+not need a direct `clap` dependency. Existing generated command files can either
+keep `clap` in the app's `Cargo.toml` or replace `clap::Command::new(...)` with
+`Command::new(...)` when they already import `foundry::prelude::*`.
 
 `config:publish` writes grouped `config/*.toml` files by default. Foundry loads those files in
 lexical filename order, merges them in memory, then applies `.env` overrides. Use

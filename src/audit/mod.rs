@@ -7,7 +7,37 @@ use serde::{Deserialize, Serialize};
 use crate::database::{DbRecord, DbType, DbValue, Model, Query, QueryExecutor};
 use crate::foundation::{Error, Result};
 
-#[derive(Debug, Serialize, Deserialize, crate::Model)]
+pub const AUDIT_EVENT_CREATED: &str = "created";
+pub const AUDIT_EVENT_UPDATED: &str = "updated";
+pub const AUDIT_EVENT_SOFT_DELETED: &str = "soft_deleted";
+pub const AUDIT_EVENT_RESTORED: &str = "restored";
+pub const AUDIT_EVENT_DELETED: &str = "deleted";
+pub const AUDIT_EVENT_TYPES: &[&str] = &[
+    AUDIT_EVENT_CREATED,
+    AUDIT_EVENT_UPDATED,
+    AUDIT_EVENT_SOFT_DELETED,
+    AUDIT_EVENT_RESTORED,
+    AUDIT_EVENT_DELETED,
+];
+pub const AUDIT_REDACTED_VALUE: &str = "[redacted]";
+pub const AUDIT_SENSITIVE_FIELD_SEGMENTS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "credential",
+    "authorization",
+];
+
+#[derive(
+    Debug,
+    Serialize,
+    Deserialize,
+    ts_rs::TS,
+    foundry_macros::TS,
+    foundry_macros::ApiSchema,
+    crate::Model,
+)]
 #[foundry(table = "audit_logs", audit = false)]
 pub struct AuditLog {
     pub id: crate::ModelId<AuditLog>,
@@ -39,11 +69,11 @@ pub(crate) enum AuditEventType {
 impl AuditEventType {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::Created => "created",
-            Self::Updated => "updated",
-            Self::SoftDeleted => "soft_deleted",
-            Self::Restored => "restored",
-            Self::Deleted => "deleted",
+            Self::Created => AUDIT_EVENT_CREATED,
+            Self::Updated => AUDIT_EVENT_UPDATED,
+            Self::SoftDeleted => AUDIT_EVENT_SOFT_DELETED,
+            Self::Restored => AUDIT_EVENT_RESTORED,
+            Self::Deleted => AUDIT_EVENT_DELETED,
         }
     }
 }
@@ -60,16 +90,6 @@ struct AuditRedactionPolicy {
     sensitive: BTreeSet<String>,
     redact_sensitive: bool,
 }
-
-const REDACTED_AUDIT_VALUE: &str = "[redacted]";
-const SENSITIVE_FIELD_SEGMENTS: &[&str] = &[
-    "password",
-    "passwd",
-    "secret",
-    "token",
-    "credential",
-    "authorization",
-];
 
 impl AuditRedactionPolicy {
     fn new(excluded_fields: &[&str], config: &crate::config::AuditConfig) -> Self {
@@ -102,14 +122,14 @@ impl AuditRedactionPolicy {
         }
 
         let padded = format!("_{normalized}_");
-        SENSITIVE_FIELD_SEGMENTS
+        AUDIT_SENSITIVE_FIELD_SEGMENTS
             .iter()
             .any(|segment| padded.contains(&format!("_{segment}_")))
     }
 
     fn value(&self, field: &str, value: &DbValue) -> serde_json::Value {
         if self.sensitive(field) {
-            serde_json::Value::String(REDACTED_AUDIT_VALUE.to_string())
+            serde_json::Value::String(AUDIT_REDACTED_VALUE.to_string())
         } else {
             db_value_to_json(value)
         }
@@ -413,7 +433,7 @@ fn record_to_json(record: &DbRecord, redaction: &AuditRedactionPolicy) -> serde_
     serde_json::Value::Object(values)
 }
 
-fn normalize_audit_field_name(field: &str) -> String {
+pub(crate) fn normalize_audit_field_name(field: &str) -> String {
     let mut normalized = String::new();
     let mut previous_was_separator = true;
     let mut previous_was_lower_or_digit = false;
@@ -561,7 +581,7 @@ fn db_value_to_string(value: &DbValue) -> Result<String> {
 mod tests {
     use super::{
         build_payload, record_with_assignments, AuditEventType, AuditRedactionPolicy,
-        REDACTED_AUDIT_VALUE,
+        AUDIT_REDACTED_VALUE,
     };
     use crate::config::AuditConfig;
     use crate::{ColumnRef, DbRecord, DbType, DbValue, Expr};
@@ -700,8 +720,8 @@ mod tests {
         let after_data = payload.after_data.unwrap();
 
         assert_eq!(after_data["title"], "Visible");
-        assert_eq!(after_data["password_hash"], REDACTED_AUDIT_VALUE);
-        assert_eq!(after_data["refreshToken"], REDACTED_AUDIT_VALUE);
+        assert_eq!(after_data["password_hash"], AUDIT_REDACTED_VALUE);
+        assert_eq!(after_data["refreshToken"], AUDIT_REDACTED_VALUE);
         assert!(!after_data.to_string().contains("hash-secret"));
         assert!(!after_data.to_string().contains("token-secret"));
     }
@@ -725,8 +745,8 @@ mod tests {
         );
         let changes = payload.changes.unwrap();
 
-        assert_eq!(changes["api_key"]["before"], REDACTED_AUDIT_VALUE);
-        assert_eq!(changes["api_key"]["after"], REDACTED_AUDIT_VALUE);
+        assert_eq!(changes["api_key"]["before"], AUDIT_REDACTED_VALUE);
+        assert_eq!(changes["api_key"]["after"], AUDIT_REDACTED_VALUE);
         assert!(!changes.to_string().contains("old-key"));
         assert!(!changes.to_string().contains("new-key"));
     }

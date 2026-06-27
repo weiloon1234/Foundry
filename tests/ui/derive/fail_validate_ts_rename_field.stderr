@@ -1,0 +1,5 @@
+error: Foundry contract derives use serde names as the single wire-name source; `#[ts(rename = "...")]` on public field would make generated TypeScript disagree with JSON, OpenAPI, or validation metadata. Use `#[serde(rename = "...")]` or `#[serde(rename_all = "...")]` instead
+ --> tests/ui/derive/fail_validate_ts_rename_field.rs:3:19
+  |
+3 |     #[ts(rename = "emailAddress")]
+  |                   ^^^^^^^^^^^^^^

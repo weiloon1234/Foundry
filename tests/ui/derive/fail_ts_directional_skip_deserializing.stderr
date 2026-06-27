@@ -1,0 +1,6 @@
+error: Foundry cannot represent `#[serde(skip_deserializing)]` in a single TypeScript/OpenAPI contract; use separate request/response DTOs, or use `#[serde(skip)]` / `#[ts(skip)]` when the field is never public
+ --> tests/ui/derive/fail_ts_directional_skip_deserializing.rs:6:5
+  |
+6 | /     #[serde(skip_deserializing)]
+7 | |     server_only: String,
+  | |_______________________^

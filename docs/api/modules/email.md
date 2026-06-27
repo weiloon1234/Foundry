@@ -14,9 +14,11 @@ struct EmailManager
   fn default_mailer_name(&self) -> &str
   fn from_address(&self) -> &EmailFromConfig
   fn configured_mailers(&self) -> Vec<String>
+  fn descriptors(&self) -> Vec<EmailMailerDescriptor>
   async fn send(&self, message: EmailMessage) -> Result<()>
   async fn queue(&self, message: EmailMessage) -> Result<()>
   async fn queue_later( &self, message: EmailMessage, run_at_millis: i64, ) -> Result<()>
+struct EmailMailerDescriptor
 ```
 
 ## foundry::email::address
@@ -163,5 +165,5 @@ struct TemplateRenderer
 - Built-in HTTP mailers use `timeout_secs = 30` by default; `0` disables the reqwest timeout for local debugging.
 - `EmailConfig.max_attachment_bytes` and `max_total_attachment_bytes` bound resolved attachment payloads before provider delivery; `0` disables each cap.
 - The built-in SES driver uses the SES SendEmail API and rejects attachments clearly instead of silently dropping them.
+- `types:export` writes `EmailManifest.ts` from `EmailManager::descriptors()` and browser-safe `EmailConfig`, including mailer names, driver keys, default mailer metadata, outbound queue, and attachment byte caps; provider endpoints, sender settings, templates, and credentials stay server-side.
 - Provider error bodies are truncated and obvious secret fields are redacted before they are returned or logged.
-

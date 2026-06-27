@@ -1,8 +1,12 @@
 use std::{collections::VecDeque, future::Future, marker::PhantomData, pin::Pin};
 
-use serde::Serialize;
+use axum::extract::{FromRef, FromRequestParts};
+use axum::http::request::Parts;
+use axum::response::{IntoResponse, Response};
+use serde::{Deserialize, Serialize};
 
 use crate::audit::{record_with_assignments, write_model_audit, AuditEventType};
+use crate::config::DatabaseConfig;
 use crate::events::{Event, EventOrigin};
 use crate::foundation::{AppContext, Error, Result};
 use crate::logging::{
@@ -38,13 +42,24 @@ use super::relation::{
 };
 use super::runtime::{DbRecord, DbRecordStream, QueryExecutionOptions, QueryExecutor};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, foundry_macros::TS)]
 pub struct Pagination {
     pub page: u64,
     pub per_page: u64,
 }
 
+#[derive(Default, Deserialize)]
+struct PaginationFields {
+    #[serde(default)]
+    page: Option<u64>,
+    #[serde(default)]
+    per_page: Option<u64>,
+}
+
 impl Pagination {
+    pub const DEFAULT_PAGE: u64 = 1;
+    pub const DEFAULT_PER_PAGE: u64 = 15;
+
     pub fn new(page: u64, per_page: u64) -> Self {
         Self {
             page: page.max(1),
@@ -52,8 +67,152 @@ impl Pagination {
         }
     }
 
+    pub fn from_config(config: &DatabaseConfig, page: Option<u64>, per_page: Option<u64>) -> Self {
+        Self::from_options_with_default_per_page(page, per_page, config.default_per_page)
+    }
+
+    pub fn from_options_with_default_per_page(
+        page: Option<u64>,
+        per_page: Option<u64>,
+        default_per_page: u64,
+    ) -> Self {
+        Self::new(
+            page.unwrap_or(Self::DEFAULT_PAGE),
+            per_page.unwrap_or(default_per_page),
+        )
+    }
+
     pub fn offset(&self) -> u64 {
         (self.page - 1) * self.per_page
+    }
+}
+
+impl Default for Pagination {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_PAGE, Self::DEFAULT_PER_PAGE)
+    }
+}
+
+impl<'de> Deserialize<'de> for Pagination {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = PaginationFields::deserialize(deserializer)?;
+        Ok(Self::from_options_with_default_per_page(
+            fields.page,
+            fields.per_page,
+            Self::DEFAULT_PER_PAGE,
+        ))
+    }
+}
+
+impl<S> FromRequestParts<S> for Pagination
+where
+    S: Send + Sync,
+    AppContext: FromRef<S>,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let app = AppContext::from_ref(state);
+        let database = app
+            .config()
+            .database()
+            .map_err(|error| error.into_response())?;
+
+        pagination_from_query(parts.uri.query(), database.default_per_page)
+            .map_err(|error| error.into_response())
+    }
+}
+
+fn pagination_from_query(query: Option<&str>, default_per_page: u64) -> Result<Pagination> {
+    let mut fields = PaginationFields::default();
+    let Some(query) = query else {
+        return Ok(Pagination::from_options_with_default_per_page(
+            fields.page,
+            fields.per_page,
+            default_per_page,
+        ));
+    };
+
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "page" => fields.page = Some(parse_pagination_query_value("page", &value)?),
+            "per_page" => {
+                fields.per_page = Some(parse_pagination_query_value("per_page", &value)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Pagination::from_options_with_default_per_page(
+        fields.page,
+        fields.per_page,
+        default_per_page,
+    ))
+}
+
+fn parse_pagination_query_value(field: &'static str, value: &str) -> Result<u64> {
+    value.parse::<u64>().map_err(|_| {
+        Error::http_with_code(
+            400,
+            format!(
+                "invalid pagination query parameter `{field}`: expected unsigned integer, got `{value}`"
+            ),
+            "invalid_pagination",
+        )
+    })
+}
+
+impl ts_rs::TS for Pagination {
+    type WithoutGenerics = Self;
+
+    fn ident() -> String {
+        "Pagination".to_string()
+    }
+
+    fn name() -> String {
+        "Pagination".to_string()
+    }
+
+    fn decl() -> String {
+        "type Pagination = { page?: number, per_page?: number, };".to_string()
+    }
+
+    fn decl_concrete() -> String {
+        Self::decl()
+    }
+
+    fn inline() -> String {
+        "{ page?: number, per_page?: number }".to_string()
+    }
+
+    fn inline_flattened() -> String {
+        Self::inline()
+    }
+
+    fn output_path() -> Option<&'static std::path::Path> {
+        Some(std::path::Path::new("Pagination.ts"))
+    }
+}
+
+impl crate::openapi::ApiSchema for Pagination {
+    fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "page": { "type": "integer" },
+                "per_page": { "type": "integer" }
+            }
+        })
+    }
+
+    fn schema_name() -> &'static str {
+        "Pagination"
     }
 }
 
@@ -71,22 +230,57 @@ pub struct PaginatedResponse<T: Serialize> {
     pub links: PaginationLinks,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(
+    Clone, Debug, Serialize, PartialEq, Eq, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct PaginationMeta {
+    #[ts(type = "number")]
     pub current_page: u64,
+    #[ts(type = "number")]
     pub per_page: u64,
+    #[ts(type = "number")]
     pub total: u64,
+    #[ts(type = "number")]
     pub last_page: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(
+    Clone, Debug, Serialize, PartialEq, Eq, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct PaginationLinks {
     pub next: Option<String>,
     pub prev: Option<String>,
 }
 
-impl<T: Serialize> Paginated<T> {
-    pub fn to_response(&self, base_url: &str) -> PaginatedResponse<&T> {
+impl<T> crate::openapi::ApiSchema for PaginatedResponse<T>
+where
+    T: Serialize + crate::openapi::ApiSchema,
+{
+    fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "x-foundry-wrapper-schema": "PaginatedResponse",
+            "x-foundry-data-schema": T::schema_name(),
+            "properties": {
+                "data": {
+                    "type": "array",
+                    "items": T::schema(),
+                    "x-foundry-item-schema": T::schema_name(),
+                },
+                "meta": <PaginationMeta as crate::openapi::ApiSchema>::schema(),
+                "links": <PaginationLinks as crate::openapi::ApiSchema>::schema(),
+            },
+            "required": ["data", "meta", "links"],
+        })
+    }
+
+    fn schema_name() -> &'static str {
+        "PaginatedResponse"
+    }
+}
+
+impl<T> Paginated<T> {
+    pub fn meta(&self) -> PaginationMeta {
         let per_page = self.pagination.per_page;
         let current_page = self.pagination.page;
         let last_page = if self.total == 0 {
@@ -95,34 +289,97 @@ impl<T: Serialize> Paginated<T> {
             self.total.div_ceil(per_page)
         };
 
-        let next = if current_page < last_page {
-            Some(format!(
-                "{base_url}?page={}&per_page={per_page}",
-                current_page + 1
-            ))
-        } else {
-            None
-        };
-
-        let prev = if current_page > 1 {
-            Some(format!(
-                "{base_url}?page={}&per_page={per_page}",
-                current_page - 1
-            ))
-        } else {
-            None
-        };
-
-        PaginatedResponse {
-            data: self.data.iter().collect(),
-            meta: PaginationMeta {
-                current_page,
-                per_page,
-                total: self.total,
-                last_page,
-            },
-            links: PaginationLinks { next, prev },
+        PaginationMeta {
+            current_page,
+            per_page,
+            total: self.total,
+            last_page,
         }
+    }
+
+    pub fn links(&self, base_url: &str) -> PaginationLinks {
+        let (_, links) = self.response_meta_and_links(base_url);
+        links
+    }
+
+    pub fn map_response<R: Serialize>(
+        &self,
+        base_url: &str,
+        map_item: impl FnMut(&T) -> R,
+    ) -> PaginatedResponse<R> {
+        let (meta, links) = self.response_meta_and_links(base_url);
+        let data = self.data.iter().map(map_item).collect();
+
+        PaginatedResponse { data, meta, links }
+    }
+
+    fn response_meta_and_links(&self, base_url: &str) -> (PaginationMeta, PaginationLinks) {
+        let meta = self.meta();
+        let links = pagination_links_from_meta(&meta, base_url);
+
+        (meta, links)
+    }
+}
+
+impl<T: Serialize> Paginated<T> {
+    pub fn to_response(&self, base_url: &str) -> PaginatedResponse<&T> {
+        let (meta, links) = self.response_meta_and_links(base_url);
+        let data = self.data.iter().collect();
+
+        PaginatedResponse { data, meta, links }
+    }
+}
+
+fn pagination_links_from_meta(meta: &PaginationMeta, base_url: &str) -> PaginationLinks {
+    let next = if meta.current_page < meta.last_page {
+        Some(pagination_link(
+            base_url,
+            meta.current_page + 1,
+            meta.per_page,
+        ))
+    } else {
+        None
+    };
+
+    let prev = if meta.current_page > 1 {
+        Some(pagination_link(
+            base_url,
+            meta.current_page - 1,
+            meta.per_page,
+        ))
+    } else {
+        None
+    };
+
+    PaginationLinks { next, prev }
+}
+
+fn pagination_link(base_url: &str, page: u64, per_page: u64) -> String {
+    let (base_without_fragment, fragment) = base_url
+        .split_once('#')
+        .map_or((base_url, None), |(base, fragment)| (base, Some(fragment)));
+    let (path, query) = base_without_fragment
+        .split_once('?')
+        .map_or((base_without_fragment, ""), |(path, query)| (path, query));
+    let mut params = query
+        .split('&')
+        .filter(|part| {
+            if part.is_empty() {
+                return false;
+            }
+            let key = part.split_once('=').map_or(*part, |(key, _)| key);
+            key != "page" && key != "per_page"
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    params.push(format!("page={page}"));
+    params.push(format!("per_page={per_page}"));
+
+    let query = params.join("&");
+    match fragment {
+        Some(fragment) => format!("{path}?{query}#{fragment}"),
+        None => format!("{path}?{query}"),
     }
 }
 
@@ -162,17 +419,49 @@ pub struct CursorPaginated<T: Serialize> {
     pub cursors: CursorInfo,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(
+    Clone, Debug, Serialize, PartialEq, Eq, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct CursorMeta {
     pub has_next: bool,
     pub has_prev: bool,
+    #[ts(type = "number")]
     pub per_page: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(
+    Clone, Debug, Serialize, PartialEq, Eq, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
+)]
 pub struct CursorInfo {
     pub next: Option<String>,
     pub prev: Option<String>,
+}
+
+impl<T> crate::openapi::ApiSchema for CursorPaginated<T>
+where
+    T: Serialize + crate::openapi::ApiSchema,
+{
+    fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "x-foundry-wrapper-schema": "CursorPaginated",
+            "x-foundry-data-schema": T::schema_name(),
+            "properties": {
+                "data": {
+                    "type": "array",
+                    "items": T::schema(),
+                    "x-foundry-item-schema": T::schema_name(),
+                },
+                "meta": <CursorMeta as crate::openapi::ApiSchema>::schema(),
+                "cursors": <CursorInfo as crate::openapi::ApiSchema>::schema(),
+            },
+            "required": ["data", "meta", "cursors"],
+        })
+    }
+
+    fn schema_name() -> &'static str {
+        "CursorPaginated"
+    }
 }
 
 impl<T: Serialize> CursorPaginated<T> {
@@ -5236,16 +5525,165 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        CreateManyModel, CreateRow, InsertSource, ModelQuery, PostgresCompiler, ProjectionQuery,
-        Query, QueryBody, Sql,
+        pagination_from_query, CreateManyModel, CreateRow, InsertSource, ModelQuery, Paginated,
+        Pagination, PaginationLinks, PaginationMeta, PostgresCompiler, ProjectionQuery, Query,
+        QueryBody, Sql,
     };
+    use crate::config::DatabaseConfig;
     use crate::database::{
         has_many, ColumnRef, DbRecord, DbValue, Expr, Loaded, QueryExecutionOptions, QueryExecutor,
         RelationDef,
     };
     use crate::foundation::{Error, Result};
     use crate::support::sync::lock_unpoisoned;
+    use crate::support::Collection;
     use crate::{Model, ModelId};
+
+    #[test]
+    fn pagination_deserializes_defaults_and_exports_query_contract() {
+        let empty: Pagination = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty, Pagination::default());
+
+        let zero: Pagination =
+            serde_json::from_value(serde_json::json!({ "page": 0, "per_page": 0 })).unwrap();
+        assert_eq!(zero, Pagination::new(1, 1));
+
+        let custom: Pagination =
+            serde_json::from_value(serde_json::json!({ "page": 3, "per_page": 25 })).unwrap();
+        assert_eq!(custom, Pagination::new(3, 25));
+        assert_eq!(
+            <Pagination as ts_rs::TS>::decl(),
+            "type Pagination = { page?: number, per_page?: number, };"
+        );
+        assert_eq!(
+            <Pagination as crate::openapi::ApiSchema>::schema(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "page": { "type": "integer" },
+                    "per_page": { "type": "integer" }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn pagination_config_helpers_use_database_default_per_page() {
+        let config = DatabaseConfig {
+            default_per_page: 50,
+            ..DatabaseConfig::default()
+        };
+
+        assert_eq!(
+            Pagination::from_config(&config, None, None),
+            Pagination::new(1, 50)
+        );
+        assert_eq!(
+            Pagination::from_config(&config, Some(3), None),
+            Pagination::new(3, 50)
+        );
+        assert_eq!(
+            Pagination::from_config(&config, Some(3), Some(25)),
+            Pagination::new(3, 25)
+        );
+    }
+
+    #[test]
+    fn pagination_query_parser_uses_configured_default_and_rejects_invalid_values() {
+        assert_eq!(
+            pagination_from_query(None, 40).unwrap(),
+            Pagination::new(1, 40)
+        );
+        assert_eq!(
+            pagination_from_query(Some("search=active&page=2"), 40).unwrap(),
+            Pagination::new(2, 40)
+        );
+        assert_eq!(
+            pagination_from_query(Some("page=0&per_page=0"), 40).unwrap(),
+            Pagination::new(1, 1)
+        );
+
+        let error = pagination_from_query(Some("page=soon"), 40).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid pagination query parameter `page`: expected unsigned integer, got `soon`"
+        );
+    }
+
+    #[test]
+    fn paginated_meta_and_links_are_framework_owned() {
+        let paginated = Paginated {
+            data: Collection::from_vec(vec![1, 2]),
+            pagination: Pagination::new(2, 10),
+            total: 25,
+        };
+
+        assert_eq!(
+            paginated.meta(),
+            PaginationMeta {
+                current_page: 2,
+                per_page: 10,
+                total: 25,
+                last_page: 3,
+            }
+        );
+        assert_eq!(
+            paginated.links("/users"),
+            PaginationLinks {
+                next: Some("/users?page=3&per_page=10".to_string()),
+                prev: Some("/users?page=1&per_page=10".to_string()),
+            }
+        );
+        assert_eq!(
+            paginated.links("/users?search=active&sort=name&page=2&per_page=25#results"),
+            PaginationLinks {
+                next: Some("/users?search=active&sort=name&page=3&per_page=10#results".to_string()),
+                prev: Some("/users?search=active&sort=name&page=1&per_page=10#results".to_string()),
+            }
+        );
+
+        let empty = Paginated {
+            data: Collection::<i32>::new(),
+            pagination: Pagination::new(1, 10),
+            total: 0,
+        };
+
+        assert_eq!(
+            empty.meta(),
+            PaginationMeta {
+                current_page: 1,
+                per_page: 10,
+                total: 0,
+                last_page: 1,
+            }
+        );
+        assert_eq!(
+            empty.links("/users"),
+            PaginationLinks {
+                next: None,
+                prev: None,
+            }
+        );
+
+        let response = paginated.map_response("/users", |value| format!("user-{value}"));
+        assert_eq!(response.data, vec!["user-1", "user-2"]);
+        assert_eq!(
+            response.meta,
+            PaginationMeta {
+                current_page: 2,
+                per_page: 10,
+                total: 25,
+                last_page: 3,
+            }
+        );
+        assert_eq!(
+            response.links,
+            PaginationLinks {
+                next: Some("/users?page=3&per_page=10".to_string()),
+                prev: Some("/users?page=1&per_page=10".to_string()),
+            }
+        );
+    }
 
     #[test]
     fn insert_builder_switches_from_select_source_to_values_without_panicking() {

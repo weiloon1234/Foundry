@@ -7,7 +7,10 @@ use std::ops::Deref;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use ts_rs::TS;
 use uuid::Uuid;
+
+use crate::openapi::ApiSchema;
 
 macro_rules! typed_identifier {
     ($name:ident) => {
@@ -46,6 +49,44 @@ macro_rules! typed_identifier {
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str(self.as_str())
+            }
+        }
+
+        impl TS for $name {
+            type WithoutGenerics = Self;
+
+            fn ident() -> String {
+                "string".to_string()
+            }
+
+            fn name() -> String {
+                "string".to_string()
+            }
+
+            fn inline() -> String {
+                "string".to_string()
+            }
+
+            fn inline_flattened() -> String {
+                panic!("{} cannot be flattened", Self::name())
+            }
+
+            fn decl() -> String {
+                panic!("{} cannot be declared", Self::name())
+            }
+
+            fn decl_concrete() -> String {
+                panic!("{} cannot be declared", Self::name())
+            }
+        }
+
+        impl ApiSchema for $name {
+            fn schema() -> serde_json::Value {
+                serde_json::json!({"type": "string"})
+            }
+
+            fn schema_name() -> &'static str {
+                stringify!($name)
             }
         }
     };
@@ -145,6 +186,44 @@ impl<M> fmt::Debug for ModelId<M> {
 impl<M> fmt::Display for ModelId<M> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.value, formatter)
+    }
+}
+
+impl<M> TS for ModelId<M> {
+    type WithoutGenerics = ModelId<ts_rs::Dummy>;
+
+    fn ident() -> String {
+        "string".to_string()
+    }
+
+    fn name() -> String {
+        "string".to_string()
+    }
+
+    fn inline() -> String {
+        "string".to_string()
+    }
+
+    fn inline_flattened() -> String {
+        panic!("{} cannot be flattened", Self::name())
+    }
+
+    fn decl() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+
+    fn decl_concrete() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+}
+
+impl<M> ApiSchema for ModelId<M> {
+    fn schema() -> serde_json::Value {
+        serde_json::json!({"type": "string", "format": "uuid"})
+    }
+
+    fn schema_name() -> &'static str {
+        "ModelId"
     }
 }
 
