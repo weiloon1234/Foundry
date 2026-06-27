@@ -18,4 +18,11 @@ pub trait FromMultipart: Send + Sized {
     /// The implementation iterates over all fields, matching by name, and
     /// populates the struct fields accordingly.
     async fn from_multipart(multipart: &mut axum::extract::Multipart) -> Result<Self>;
+
+    /// Remove temporary files owned by this multipart value.
+    ///
+    /// Generated implementations override this for DTOs containing
+    /// `UploadedFile` fields so extractors can clean uploads when validation
+    /// fails before the handler receives the value.
+    async fn cleanup_multipart_files(&self) {}
 }

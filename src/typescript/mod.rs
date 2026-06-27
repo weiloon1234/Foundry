@@ -19,8 +19,14 @@ use std::sync::Arc;
 
 use crate::app_enum::{EnumKey, EnumKeyKind, EnumMeta};
 use crate::cli::CommandRegistrar;
+use crate::contract::{
+    ContractAction, ContractHttpBody, ContractManifest, ContractSchema, ContractTransport,
+    ContractValidationAttribute, ContractValidationField, ContractValidationMessage,
+    ContractValidationRule, ContractValidationSchema, ContractValueKind,
+};
 use crate::foundation::{Error, Result};
 use crate::http::{HttpRegistrar, RouteManifestEntry, RouteRegistrar};
+use crate::openapi::ApiSchemaDefinition;
 use crate::support::generated_manifest::{
     clean_manifest_files as clean_generated_manifest_files, safe_manifest_path_with_extension,
     write_generated_file, write_manifest,
@@ -30,8 +36,13 @@ use crate::support::CommandId;
 const TYPES_EXPORT_COMMAND: CommandId = CommandId::new("types:export");
 const TYPES_EXPORT_MANIFEST: &str = ".foundry-types-manifest.json";
 const TYPE_FILE_HEADER: &str = "// Auto-generated from Foundry types. Do not edit.";
+const CONTRACT_MANIFEST_FILE: &str = "FoundryContractManifest.json";
 const ENDPOINT_RUNTIME_FILE: &str = "FoundryEndpoint.ts";
+const ERROR_RUNTIME_FILE: &str = "FoundryErrors.ts";
+const SDK_RUNTIME_FILE: &str = "FoundrySdk.ts";
+const SDK_CLIENT_FILE: &str = "FoundryClient.ts";
 const ROUTE_HELPER_DIR: &str = "routes";
+const SDK_ACTION_DIR: &str = "sdk";
 
 /// A registered TypeScript type exporter.
 pub struct TsType {
@@ -68,6 +79,7 @@ pub struct TsValidationSchema {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TsValidationField {
     pub name: String,
+    pub value_kind: ContractValueKind,
     pub rules: Vec<TsValidationRule>,
 }
 
@@ -690,6 +702,14 @@ struct PlannedRouteHelper<'a> {
     file: String,
 }
 
+#[derive(Debug)]
+struct PlannedSdkAction<'a> {
+    action: &'a ContractAction,
+    name: String,
+    function_name: String,
+    file: String,
+}
+
 fn to_pascal_case_identifier_with_context(value: &str, context: &str) -> Result<String> {
     let mut words = Vec::new();
     let mut current = String::new();
@@ -737,6 +757,19 @@ fn to_pascal_case_identifier_with_context(value: &str, context: &str) -> Result<
     Ok(identifier)
 }
 
+fn to_lower_camel_case_identifier(value: &str, context: &str) -> Result<String> {
+    let pascal = to_pascal_case_identifier_with_context(value, context)?;
+    let mut chars = pascal.chars();
+    let Some(first) = chars.next() else {
+        return Err(Error::message(format!(
+            "{context} requires a non-empty identifier"
+        )));
+    };
+    let mut identifier = first.to_ascii_lowercase().to_string();
+    identifier.push_str(chars.as_str());
+    Ok(identifier)
+}
+
 fn planned_route_helpers(routes: &[RouteManifestEntry]) -> Result<Vec<PlannedRouteHelper<'_>>> {
     let mut helpers = Vec::new();
     let mut names = BTreeMap::<String, &str>::new();
@@ -766,6 +799,69 @@ fn planned_route_helpers(routes: &[RouteManifestEntry]) -> Result<Vec<PlannedRou
     }
 
     Ok(helpers)
+}
+
+fn planned_sdk_actions(manifest: &ContractManifest) -> Result<Vec<PlannedSdkAction<'_>>> {
+    let mut actions = Vec::new();
+    let mut names = BTreeMap::<String, &str>::new();
+    let mut functions = BTreeMap::<String, &str>::new();
+    let mut files = BTreeMap::<String, &str>::new();
+
+    for action in manifest
+        .actions
+        .iter()
+        .filter(|action| action.client_export)
+    {
+        let name = if is_ts_identifier(&action.action_name) {
+            action.action_name.clone()
+        } else {
+            to_pascal_case_identifier_with_context(
+                &action.action_name,
+                "SDK action TypeScript export",
+            )?
+        };
+        if let Some(existing) = names.insert(name.clone(), action.id.as_str()) {
+            return Err(Error::message(format!(
+                "SDK action TypeScript export has actions `{existing}` and `{}` that both normalize to `{name}`",
+                action.id
+            )));
+        }
+
+        let function_name = if is_ts_identifier(&action.action_name) {
+            let mut chars = action.action_name.chars();
+            let first = chars
+                .next()
+                .expect("validated TypeScript identifier should be non-empty");
+            let mut identifier = first.to_ascii_lowercase().to_string();
+            identifier.push_str(chars.as_str());
+            identifier
+        } else {
+            to_lower_camel_case_identifier(&action.action_name, "SDK action function export")?
+        };
+        if let Some(existing) = functions.insert(function_name.clone(), action.id.as_str()) {
+            return Err(Error::message(format!(
+                "SDK action TypeScript export has actions `{existing}` and `{}` that both normalize to function `{function_name}`",
+                action.id
+            )));
+        }
+
+        let file = format!("{SDK_ACTION_DIR}/{name}.ts");
+        if let Some(existing) = files.insert(file.clone(), action.id.as_str()) {
+            return Err(Error::message(format!(
+                "SDK action TypeScript export has actions `{existing}` and `{}` that both write `{file}`",
+                action.id
+            )));
+        }
+
+        actions.push(PlannedSdkAction {
+            action,
+            name,
+            function_name,
+            file,
+        });
+    }
+
+    Ok(actions)
 }
 
 fn render_endpoint_runtime() -> String {
@@ -806,8 +902,26 @@ export type FoundryValidationRule = {
   readonly rules?: readonly FoundryValidationRule[];
 };
 
+export type FoundryContractValueKind =
+  | "unknown"
+  | "scalar"
+  | "array"
+  | "object"
+  | "file"
+  | "file_list"
+  | "date"
+  | "date_time"
+  | "local_date_time"
+  | "time"
+  | "decimal"
+  | "uuid"
+  | "json"
+  | "page"
+  | "error";
+
 export type FoundryValidationField<Field extends string = string> = {
   readonly name: Field;
+  readonly valueKind?: FoundryContractValueKind;
   readonly rules: readonly FoundryValidationRule[];
 };
 
@@ -1272,6 +1386,226 @@ export abstract class FoundryEndpoint<
     .to_string()
 }
 
+fn render_error_runtime() -> String {
+    r#"// Auto-generated Foundry error runtime. Do not edit.
+
+export type FoundryErrorCode =
+  | "validation_failed"
+  | "unauthorized"
+  | "forbidden"
+  | "not_found"
+  | "internal_error"
+  | string;
+
+export type FoundryFieldError = {
+  field: string;
+  code?: string;
+  message: string;
+  params?: Record<string, string>;
+};
+
+export type FoundryValidationErrors = FoundryFieldError[] | Record<string, string[]>;
+
+export type FoundryErrorResponse = {
+  message: string;
+  status?: number;
+  code?: FoundryErrorCode;
+  errors?: FoundryValidationErrors;
+};
+
+export class FoundrySdkError extends Error {
+  readonly status: number | null;
+  readonly code: FoundryErrorCode | null;
+  readonly errors: FoundryValidationErrors | null;
+  readonly response: unknown;
+  readonly cause: unknown;
+
+  constructor(response: FoundryErrorResponse, cause?: unknown) {
+    super(response.message || "Foundry request failed");
+    this.name = "FoundrySdkError";
+    this.status = response.status ?? null;
+    this.code = response.code ?? null;
+    this.errors = response.errors ?? null;
+    this.response = response;
+    this.cause = cause;
+  }
+
+  static from(error: unknown): FoundrySdkError {
+    if (error instanceof FoundrySdkError) {
+      return error;
+    }
+
+    const transportResponse = (error as { response?: { status?: number; data?: unknown } })?.response;
+    const data = transportResponse?.data;
+    if (data && typeof data === "object") {
+      const response = data as FoundryErrorResponse;
+      return new FoundrySdkError(
+        {
+          message: typeof response.message === "string" ? response.message : "Foundry request failed",
+          status: response.status ?? transportResponse?.status,
+          code: response.code,
+          errors: response.errors,
+        },
+        error,
+      );
+    }
+
+    return new FoundrySdkError(
+      {
+        message: error instanceof Error ? error.message : "Foundry request failed",
+        status: transportResponse?.status,
+      },
+      error,
+    );
+  }
+}
+"#
+    .to_string()
+}
+
+fn render_sdk_runtime() -> String {
+    r#"// Auto-generated Foundry SDK runtime. Do not edit.
+
+import { FoundrySdkError } from "./FoundryErrors";
+import { routeUrl, type RouteName, type RouteParamValue, type RouteUrlOptions } from "./RouteManifest";
+
+export type FoundrySdkHttpMethod = "get" | "post" | "put" | "patch" | "delete" | "head" | "options";
+export type FoundrySdkHeaders = Record<string, string>;
+export type FoundrySdkBodyKind = "none" | "json" | "multipart" | "unknown";
+
+export type FoundrySdkRequestConfig = {
+  url?: string;
+  method?: FoundrySdkHttpMethod | string;
+  data?: unknown;
+  params?: Record<string, unknown>;
+  headers?: FoundrySdkHeaders;
+  [key: string]: unknown;
+};
+
+export type FoundrySdkResponse<T> = {
+  data: T;
+  status?: number;
+  headers?: unknown;
+};
+
+export type FoundrySdkTransport = {
+  request<T = unknown>(config: FoundrySdkRequestConfig): Promise<FoundrySdkResponse<T>>;
+};
+
+export type FoundryActionOptions<TParams extends Record<string, RouteParamValue>> = {
+  params?: TParams;
+  url?: string;
+  route?: RouteUrlOptions;
+  headers?: FoundrySdkHeaders;
+  request?: Omit<FoundrySdkRequestConfig, "url" | "method" | "data">;
+};
+
+export type FoundryActionDefinition<TParams extends Record<string, RouteParamValue>> = {
+  routeName: RouteName;
+  method: FoundrySdkHttpMethod | string;
+  body: FoundrySdkBodyKind;
+};
+
+function routeUrlUntyped(name: RouteName, params: Record<string, RouteParamValue>, options: RouteUrlOptions): string {
+  return (routeUrl as (name: RouteName, params?: Record<string, RouteParamValue>, options?: RouteUrlOptions) => string)(
+    name,
+    params,
+    options,
+  );
+}
+
+function hasFileLike(value: unknown): boolean {
+  const fileCtor = typeof File === "undefined" ? undefined : File;
+  const blobCtor = typeof Blob === "undefined" ? undefined : Blob;
+
+  if (fileCtor && value instanceof fileCtor) {
+    return true;
+  }
+  if (blobCtor && value instanceof blobCtor) {
+    return true;
+  }
+  if (Array.isArray(value)) {
+    return value.some(hasFileLike);
+  }
+  if (value && typeof value === "object" && !(value instanceof Date)) {
+    return Object.values(value as Record<string, unknown>).some(hasFileLike);
+  }
+  return false;
+}
+
+function appendFormValue(form: FormData, key: string, value: unknown): void {
+  if (value === null || value === undefined) {
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      appendFormValue(form, key, item);
+    }
+    return;
+  }
+  const fileCtor = typeof File === "undefined" ? undefined : File;
+  const blobCtor = typeof Blob === "undefined" ? undefined : Blob;
+  if ((fileCtor && value instanceof fileCtor) || (blobCtor && value instanceof blobCtor)) {
+    form.append(key, value);
+    return;
+  }
+  if (value instanceof Date) {
+    form.append(key, value.toISOString());
+    return;
+  }
+  if (typeof value === "object") {
+    form.append(key, JSON.stringify(value));
+    return;
+  }
+  form.append(key, String(value));
+}
+
+function toFormData(data: Record<string, unknown>): FormData {
+  const form = new FormData();
+  for (const [key, value] of Object.entries(data)) {
+    appendFormValue(form, key, value);
+  }
+  return form;
+}
+
+function actionData<TRequest>(body: FoundrySdkBodyKind, data: TRequest | undefined): unknown {
+  if (data === undefined || body === "none") {
+    return undefined;
+  }
+  if (body === "multipart" || (body === "json" && hasFileLike(data))) {
+    return toFormData(data as Record<string, unknown>);
+  }
+  return data;
+}
+
+export async function sendFoundryAction<
+  TRequest,
+  TResponse,
+  TParams extends Record<string, RouteParamValue>,
+>(
+  transport: FoundrySdkTransport,
+  definition: FoundryActionDefinition<TParams>,
+  data: TRequest | undefined,
+  options: FoundryActionOptions<TParams> = {},
+): Promise<TResponse> {
+  const url = options.url ?? routeUrlUntyped(definition.routeName, options.params ?? {}, options.route ?? {});
+  try {
+    const response = await transport.request<TResponse>({
+      ...(options.request ?? {}),
+      method: definition.method,
+      url,
+      data: actionData(definition.body, data),
+      headers: { ...(options.request?.headers as FoundrySdkHeaders | undefined), ...(options.headers ?? {}) },
+    });
+    return response.data;
+  } catch (error) {
+    throw FoundrySdkError.from(error);
+  }
+}
+"#
+    .to_string()
+}
+
 fn render_validation_rule(rule: &TsValidationRule) -> String {
     let mut parts = vec![format!("code: {}", json_string(&rule.code))];
 
@@ -1315,6 +1649,50 @@ fn render_validation_rule(rule: &TsValidationRule) -> String {
     }
 
     format!("{{ {} }}", parts.join(", "))
+}
+
+fn contract_value_kind_literal(kind: ContractValueKind) -> &'static str {
+    match kind {
+        ContractValueKind::Unknown => "unknown",
+        ContractValueKind::Scalar => "scalar",
+        ContractValueKind::Array => "array",
+        ContractValueKind::Object => "object",
+        ContractValueKind::File => "file",
+        ContractValueKind::FileList => "file_list",
+        ContractValueKind::Date => "date",
+        ContractValueKind::DateTime => "date_time",
+        ContractValueKind::LocalDateTime => "local_date_time",
+        ContractValueKind::Time => "time",
+        ContractValueKind::Decimal => "decimal",
+        ContractValueKind::Uuid => "uuid",
+        ContractValueKind::Json => "json",
+        ContractValueKind::Page => "page",
+        ContractValueKind::Error => "error",
+    }
+}
+
+fn render_validation_field(field: &TsValidationField) -> String {
+    let rules = field
+        .rules
+        .iter()
+        .map(render_validation_rule)
+        .collect::<Vec<_>>();
+    let mut parts = vec![
+        format!("name: {}", json_string(&field.name)),
+        format!("rules: [{}]", rules.join(", ")),
+    ];
+
+    if field.value_kind != ContractValueKind::Scalar {
+        parts.insert(
+            1,
+            format!(
+                "valueKind: {}",
+                json_string(contract_value_kind_literal(field.value_kind))
+            ),
+        );
+    }
+
+    format!("    {{ {} }}", parts.join(", "))
 }
 
 fn render_validation_rule_remark(rule: &TsValidationRule) -> String {
@@ -1602,18 +1980,7 @@ fn render_validation_schema(schema: Option<&TsValidationSchema>, request_type: &
     let fields = schema
         .fields
         .iter()
-        .map(|field| {
-            let rules = field
-                .rules
-                .iter()
-                .map(render_validation_rule)
-                .collect::<Vec<_>>();
-            format!(
-                "    {{ name: {}, rules: [{}] }}",
-                json_string(&field.name),
-                rules.join(", ")
-            )
-        })
+        .map(render_validation_field)
         .collect::<Vec<_>>();
     let messages = schema
         .messages
@@ -1653,6 +2020,83 @@ fn validation_schemas() -> BTreeMap<&'static str, TsValidationSchema> {
         schemas.insert(validation.name, (validation.schema_fn)());
     }
     schemas
+}
+
+fn contract_validation_rule(rule: &TsValidationRule) -> ContractValidationRule {
+    ContractValidationRule {
+        code: rule.code.clone(),
+        params: rule.params.clone(),
+        values: rule.values.clone(),
+        message: rule.message.clone(),
+        server_only: rule.server_only,
+        rules: rule.rules.iter().map(contract_validation_rule).collect(),
+    }
+}
+
+fn contract_validation_schema(name: &str, schema: &TsValidationSchema) -> ContractValidationSchema {
+    ContractValidationSchema {
+        name: name.to_string(),
+        fields: schema
+            .fields
+            .iter()
+            .map(|field| ContractValidationField {
+                name: field.name.clone(),
+                value_kind: field.value_kind,
+                rules: field.rules.iter().map(contract_validation_rule).collect(),
+            })
+            .collect(),
+        messages: schema
+            .messages
+            .iter()
+            .map(|message| ContractValidationMessage {
+                field: message.field.clone(),
+                rule: message.rule.clone(),
+                message: message.message.clone(),
+            })
+            .collect(),
+        attributes: schema
+            .attributes
+            .iter()
+            .map(|attribute| ContractValidationAttribute {
+                field: attribute.field.clone(),
+                name: attribute.name.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn contract_schemas() -> Result<Vec<ContractSchema>> {
+    let mut schemas = BTreeMap::<String, serde_json::Value>::new();
+    for schema in inventory::iter::<ApiSchemaDefinition> {
+        let value = (schema.schema_fn)();
+        if let Some(existing) = schemas.insert(schema.name.to_string(), value.clone()) {
+            if existing != value {
+                return Err(Error::message(format!(
+                    "ApiSchema export contains duplicate schema name `{}` with different definitions",
+                    schema.name
+                )));
+            }
+        }
+    }
+
+    Ok(schemas
+        .into_iter()
+        .map(|(name, schema)| ContractSchema { name, schema })
+        .collect())
+}
+
+fn contract_manifest(
+    routes: &[RouteManifestEntry],
+    validations: &BTreeMap<&'static str, TsValidationSchema>,
+) -> Result<ContractManifest> {
+    let validation_schemas = validations
+        .iter()
+        .map(|(name, schema)| contract_validation_schema(name, schema))
+        .collect::<Vec<_>>();
+
+    Ok(ContractManifest::from_http_routes(routes)?
+        .with_schemas(contract_schemas()?)
+        .with_validation_schemas(validation_schemas))
 }
 
 fn route_type_name(helper_name: &str, suffix: &str) -> String {
@@ -1700,6 +2144,29 @@ fn route_response_type(
     }
 }
 
+fn action_response_type(
+    action: &ContractAction,
+    exported_types: &BTreeMap<String, String>,
+    imports: &mut BTreeSet<String>,
+) -> String {
+    let mut responses = action
+        .responses
+        .iter()
+        .filter(|response| (200..300).contains(&response.status))
+        .map(|response| {
+            schema_type_reference(Some(&response.schema), exported_types, imports, "unknown")
+        })
+        .collect::<Vec<_>>();
+    responses.sort();
+    responses.dedup();
+
+    match responses.as_slice() {
+        [] => "unknown".to_string(),
+        [one] => one.clone(),
+        many => many.join(" | "),
+    }
+}
+
 fn render_route_params_type(route: &RouteManifestEntry) -> String {
     if route.params.is_empty() {
         return "Record<never, never>".to_string();
@@ -1720,6 +2187,59 @@ fn route_helper_module_specifier(file: &str) -> Result<String> {
         ))
     })?;
     Ok(format!("../{module}"))
+}
+
+fn sdk_action_module_specifier(file: &str) -> Result<String> {
+    let module = file.strip_suffix(".ts").ok_or_else(|| {
+        Error::message(format!(
+            "TypeScript SDK action import path `{file}` must end with .ts"
+        ))
+    })?;
+    Ok(format!("./{module}"))
+}
+
+fn action_body_kind(action: &ContractAction) -> ContractHttpBody {
+    match &action.transport {
+        ContractTransport::Http(http) => http.body,
+        ContractTransport::WebSocket(_) => ContractHttpBody::Unknown,
+    }
+}
+
+fn action_accepts_request_body(action: &ContractAction) -> bool {
+    action.request.is_some() && action_body_kind(action) != ContractHttpBody::None
+}
+
+fn action_method(action: &ContractAction) -> &str {
+    match &action.transport {
+        ContractTransport::Http(http) => http.method.as_deref().unwrap_or("get"),
+        ContractTransport::WebSocket(_) => "get",
+    }
+}
+
+fn action_params_type(action: &ContractAction) -> String {
+    match &action.transport {
+        ContractTransport::Http(http) if http.path_params.is_empty() => {
+            "Record<never, never>".to_string()
+        }
+        ContractTransport::Http(http) => {
+            let fields = http
+                .path_params
+                .iter()
+                .map(|param| format!("{}: RouteParamValue", json_string(param)))
+                .collect::<Vec<_>>();
+            format!("{{ {} }}", fields.join("; "))
+        }
+        ContractTransport::WebSocket(_) => "Record<never, never>".to_string(),
+    }
+}
+
+fn sdk_body_kind_literal(kind: ContractHttpBody) -> &'static str {
+    match kind {
+        ContractHttpBody::None => "none",
+        ContractHttpBody::Json => "json",
+        ContractHttpBody::Multipart => "multipart",
+        ContractHttpBody::Unknown => "unknown",
+    }
 }
 
 fn render_route_helper(
@@ -1792,6 +2312,131 @@ fn render_route_helper(
     ))
 }
 
+fn render_sdk_action(
+    action: &PlannedSdkAction<'_>,
+    exported_types: &BTreeMap<String, String>,
+) -> Result<String> {
+    let name = &action.name;
+    let action_name = route_type_name(name, "Action");
+    let request_alias = route_type_name(name, "SdkRequest");
+    let response_alias = route_type_name(name, "SdkResponse");
+    let params_alias = route_type_name(name, "SdkParams");
+    let definition_const = route_type_name(name, "ActionDefinition");
+    let factory_name = format!("create{name}Action");
+
+    let mut imports = BTreeSet::new();
+    let request_type = schema_type_reference(
+        action
+            .action
+            .request
+            .as_ref()
+            .map(|request| request.schema.as_str()),
+        exported_types,
+        &mut imports,
+        "Record<string, never>",
+    );
+    let response_type = action_response_type(action.action, exported_types, &mut imports);
+    let params_type = action_params_type(action.action);
+    let import_lines = imports
+        .iter()
+        .filter_map(|import| {
+            exported_types.get(import).map(|file| {
+                route_helper_module_specifier(file).map(|module| {
+                    format!("import type {{ {import} }} from {};", json_string(&module))
+                })
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let body = sdk_body_kind_literal(action_body_kind(action.action));
+    let method = action_method(action.action);
+    let route_id = &action.action.id;
+
+    let accepts_request_body = action_accepts_request_body(action.action);
+
+    let action_signature = if accepts_request_body {
+        format!(
+            "(request: {request_alias}, options?: FoundryActionOptions<{params_alias}>) => Promise<{response_alias}>"
+        )
+    } else {
+        format!("(options?: FoundryActionOptions<{params_alias}>) => Promise<{response_alias}>")
+    };
+
+    let action_body = if accepts_request_body {
+        format!(
+            "  return (request, options = {{}}) => sendFoundryAction<{request_alias}, {response_alias}, {params_alias}>(transport, {definition_const}, request, options);\n"
+        )
+    } else {
+        format!(
+            "  return (options = {{}}) => sendFoundryAction<{request_alias}, {response_alias}, {params_alias}>(transport, {definition_const}, undefined, options);\n"
+        )
+    };
+
+    Ok(format!(
+        "// Auto-generated from Foundry contract action `{}`. Do not edit.\n\n\
+         import {{ sendFoundryAction, type FoundryActionDefinition, type FoundryActionOptions, type FoundrySdkTransport }} from \"../FoundrySdk\";\n\
+         import type {{ RouteName, RouteParamValue }} from \"../RouteManifest\";\n\
+         {}\n\
+         export type {request_alias} = {request_type};\n\
+         export type {response_alias} = {response_type};\n\
+         export type {params_alias} = {params_type};\n\
+         export type {action_name} = {action_signature};\n\n\
+         export const {definition_const} = {{\n\
+           routeName: {} as RouteName,\n\
+           method: {},\n\
+           body: {},\n\
+         }} as const satisfies FoundryActionDefinition<{params_alias}>;\n\n\
+         export function {factory_name}(transport: FoundrySdkTransport): {action_name} {{\n\
+         {action_body}\
+         }}\n",
+        route_id,
+        import_lines.join("\n"),
+        json_string(route_id),
+        json_string(method),
+        json_string(body),
+    ))
+}
+
+fn render_sdk_client(actions: &[PlannedSdkAction<'_>]) -> Result<String> {
+    let mut imports =
+        vec!["import type { FoundrySdkTransport } from \"./FoundrySdk\";".to_string()];
+    for action in actions {
+        let module = sdk_action_module_specifier(&action.file)?;
+        imports.push(format!(
+            "import {{ create{}Action }} from {};",
+            action.name,
+            json_string(&module)
+        ));
+    }
+
+    let entries = actions
+        .iter()
+        .map(|action| {
+            format!(
+                "    {}: create{}Action(transport)",
+                action.function_name, action.name
+            )
+        })
+        .collect::<Vec<_>>();
+    let client_entries = if entries.is_empty() {
+        String::new()
+    } else {
+        format!("{},\n", entries.join(",\n"))
+    };
+
+    Ok(format!(
+        "// Auto-generated Foundry SDK client. Do not edit.\n\n\
+         {}\n\n\
+         export function createFoundryClient(transport: FoundrySdkTransport) {{\n\
+           return {{\n{}\
+           }} as const;\n\
+         }}\n\n\
+         export type FoundryClient = ReturnType<typeof createFoundryClient>;\n",
+        imports.join("\n"),
+        client_entries,
+    ))
+}
+
 /// Export all registered TypeScript types to a directory.
 pub fn export_all(dir: &Path) -> Result<()> {
     export_all_with_routes(dir, &[])
@@ -1804,9 +2449,12 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
     let ts_types: Vec<&TsType> = inventory::iter::<TsType>.into_iter().collect();
     let app_enums: Vec<&TsAppEnum> = inventory::iter::<TsAppEnum>.into_iter().collect();
     let ts_type_files = planned_ts_type_files(&ts_types)?;
-    let route_helpers = planned_route_helpers(routes)?;
-    let output_files = planned_output_files(&ts_type_files, &app_enums, &route_helpers);
     let validations = validation_schemas();
+    let contract = contract_manifest(routes, &validations)?;
+    let route_helpers = planned_route_helpers(routes)?;
+    let sdk_actions = planned_sdk_actions(&contract)?;
+    let output_files =
+        planned_output_files(&ts_type_files, &app_enums, &route_helpers, &sdk_actions);
     clean_manifest_files(dir, &output_files)?;
 
     let mut type_exports = BTreeMap::new();
@@ -1856,6 +2504,12 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
         render_route_manifest(routes)?,
     )?;
     write_generated_file(&dir.join(ENDPOINT_RUNTIME_FILE), render_endpoint_runtime())?;
+    write_generated_file(&dir.join(ERROR_RUNTIME_FILE), render_error_runtime())?;
+    write_generated_file(&dir.join(SDK_RUNTIME_FILE), render_sdk_runtime())?;
+    write_generated_file(
+        &dir.join(CONTRACT_MANIFEST_FILE),
+        serde_json::to_string_pretty(&contract).map_err(Error::other)?,
+    )?;
 
     if !route_helpers.is_empty() {
         std::fs::create_dir_all(dir.join(ROUTE_HELPER_DIR)).map_err(Error::other)?;
@@ -1866,6 +2520,16 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
             render_route_helper(helper, &exported_types, &validations)?,
         )?;
     }
+    if !sdk_actions.is_empty() {
+        std::fs::create_dir_all(dir.join(SDK_ACTION_DIR)).map_err(Error::other)?;
+    }
+    for action in &sdk_actions {
+        write_generated_file(
+            &dir.join(&action.file),
+            render_sdk_action(action, &exported_types)?,
+        )?;
+    }
+    write_generated_file(&dir.join(SDK_CLIENT_FILE), render_sdk_client(&sdk_actions)?)?;
 
     let mut barrel = String::from("// Auto-generated barrel. Do not edit.\n");
     for name in &names {
@@ -1890,10 +2554,22 @@ pub fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Resu
         "export { RouteManifest, RouteIds, createRouteUrlBuilder, routeUrl, type RouteName, type RouteParams, type RouteParamValue, type RouteUrlOptions } from \"./RouteManifest\";\n",
     );
     barrel.push_str(
-        "export { FoundryEndpoint, FoundryValidationClientError, type FoundryFieldErrors, type FoundryHttpClient, type FoundryHttpHeaders, type FoundryHttpMethod, type FoundryHttpRequestConfig, type FoundryHttpResponse, type FoundrySubmitOptions, type FoundryValidationAttribute, type FoundryValidationField, type FoundryValidationMessage, type FoundryValidationRule, type FoundryValidationSchema } from \"./FoundryEndpoint\";\n",
+        "export { FoundryEndpoint, FoundryValidationClientError, type FoundryContractValueKind, type FoundryFieldErrors, type FoundryHttpClient, type FoundryHttpHeaders, type FoundryHttpMethod, type FoundryHttpRequestConfig, type FoundryHttpResponse, type FoundrySubmitOptions, type FoundryValidationAttribute, type FoundryValidationField, type FoundryValidationMessage, type FoundryValidationRule, type FoundryValidationSchema } from \"./FoundryEndpoint\";\n",
+    );
+    barrel.push_str(
+        "export { FoundrySdkError, type FoundryErrorCode, type FoundryErrorResponse, type FoundryFieldError, type FoundryValidationErrors } from \"./FoundryErrors\";\n",
+    );
+    barrel
+        .push_str("export { createFoundryClient, type FoundryClient } from \"./FoundryClient\";\n");
+    barrel.push_str(
+        "export { sendFoundryAction, type FoundryActionDefinition, type FoundryActionOptions, type FoundrySdkBodyKind, type FoundrySdkHeaders, type FoundrySdkHttpMethod, type FoundrySdkRequestConfig, type FoundrySdkResponse, type FoundrySdkTransport } from \"./FoundrySdk\";\n",
     );
     for helper in &route_helpers {
         let module = ts_module_specifier(&helper.file)?;
+        barrel.push_str(&format!("export * from \"{module}\";\n"));
+    }
+    for action in &sdk_actions {
+        let module = ts_module_specifier(&action.file)?;
         barrel.push_str(&format!("export * from \"{module}\";\n"));
     }
     write_generated_file(&dir.join("index.ts"), barrel)?;
@@ -1924,6 +2600,7 @@ fn planned_output_files(
     ts_type_files: &BTreeMap<&'static str, String>,
     app_enums: &[&TsAppEnum],
     route_helpers: &[PlannedRouteHelper<'_>],
+    sdk_actions: &[PlannedSdkAction<'_>],
 ) -> BTreeSet<String> {
     let mut files = BTreeSet::new();
     for file in ts_type_files.values() {
@@ -1932,10 +2609,17 @@ fn planned_output_files(
     for app_enum in app_enums {
         files.insert(format!("{}.ts", app_enum.name));
     }
+    files.insert(CONTRACT_MANIFEST_FILE.to_string());
     files.insert("RouteManifest.ts".to_string());
     files.insert(ENDPOINT_RUNTIME_FILE.to_string());
+    files.insert(ERROR_RUNTIME_FILE.to_string());
+    files.insert(SDK_RUNTIME_FILE.to_string());
+    files.insert(SDK_CLIENT_FILE.to_string());
     for helper in route_helpers {
         files.insert(helper.file.clone());
+    }
+    for action in sdk_actions {
+        files.insert(action.file.clone());
     }
     files.insert("index.ts".to_string());
     files
@@ -1980,8 +2664,18 @@ fn clean_manifest_files(dir: &Path, output_files: &BTreeSet<String>) -> Result<(
         TYPES_EXPORT_MANIFEST,
         output_files,
         "foundry.typescript",
-        |file| safe_manifest_path_with_extension(file, "ts", true),
+        safe_typescript_manifest_path,
     )
+}
+
+fn safe_typescript_manifest_path(file: &str) -> Option<PathBuf> {
+    safe_manifest_path_with_extension(file, "ts", true).or_else(|| {
+        if file == CONTRACT_MANIFEST_FILE {
+            safe_manifest_path_with_extension(file, "json", false)
+        } else {
+            None
+        }
+    })
 }
 
 fn write_export_manifest(dir: &Path, output_files: &BTreeSet<String>) -> Result<()> {
@@ -2153,6 +2847,13 @@ mod tests {
         }
     }
 
+    fn contract_schema<'a>(manifest: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        manifest["schemas"]
+            .as_array()
+            .and_then(|schemas| schemas.iter().find(|schema| schema["name"] == name))
+            .unwrap_or_else(|| panic!("expected contract schema `{name}` in manifest:\n{manifest}"))
+    }
+
     #[test]
     fn exports_framework_typescript_helpers() {
         let dir = tempdir().unwrap();
@@ -2169,8 +2870,12 @@ mod tests {
             "TokenPair.ts",
             "TokenResponse.ts",
             "WsTokenResponse.ts",
+            "FoundryContractManifest.json",
             "RouteManifest.ts",
             "FoundryEndpoint.ts",
+            "FoundryErrors.ts",
+            "FoundrySdk.ts",
+            "FoundryClient.ts",
             "MinimalExportAppEnumDto.ts",
             "MinimalLoginRequest.ts",
             "MinimalLoginResponse.ts",
@@ -2412,9 +3117,23 @@ mod tests {
         );
         assert!(
             index.contains(
-                "export { FoundryEndpoint, FoundryValidationClientError, type FoundryFieldErrors, type FoundryHttpClient"
+                "export { FoundryEndpoint, FoundryValidationClientError, type FoundryContractValueKind, type FoundryFieldErrors, type FoundryHttpClient"
             ),
             "expected index.ts to re-export endpoint runtime:\n{index}"
+        );
+        assert!(
+            index.contains(
+                "export { createFoundryClient, type FoundryClient } from \"./FoundryClient\";"
+            ),
+            "expected index.ts to re-export SDK client:\n{index}"
+        );
+        assert!(
+            index.contains("export { FoundrySdkError, type FoundryErrorCode"),
+            "expected index.ts to re-export SDK errors:\n{index}"
+        );
+        assert!(
+            index.contains("export { sendFoundryAction, type FoundryActionDefinition"),
+            "expected index.ts to re-export SDK runtime:\n{index}"
         );
 
         let route_manifest = fs::read_to_string(dir.path().join("RouteManifest.ts")).unwrap();
@@ -2425,6 +3144,44 @@ mod tests {
         assert!(
             route_manifest.contains("export const RouteIds = {} as const;"),
             "expected empty route ids when no routes were exported:\n{route_manifest}"
+        );
+
+        let contract_manifest =
+            fs::read_to_string(dir.path().join("FoundryContractManifest.json")).unwrap();
+        let contract_json: serde_json::Value = serde_json::from_str(&contract_manifest).unwrap();
+        assert!(
+            contract_manifest.contains("\"version\": 1"),
+            "expected contract manifest version:\n{contract_manifest}"
+        );
+        let login_schema = contract_schema(&contract_json, "MinimalLoginRequest");
+        assert_eq!(login_schema["schema"]["type"], "object");
+        assert_eq!(
+            login_schema["schema"]["properties"]["email"]["format"],
+            "email"
+        );
+        assert_eq!(
+            login_schema["schema"]["properties"]["password"]["minLength"],
+            8
+        );
+        let app_enum_schema = contract_schema(&contract_json, "MinimalExportStatus");
+        assert_eq!(app_enum_schema["schema"]["type"], "string");
+        assert_eq!(
+            app_enum_schema["schema"]["enum"],
+            serde_json::json!(["pending", "completed"])
+        );
+        assert!(
+            contract_manifest.contains("\"validation_schemas\""),
+            "expected contract manifest validation schemas:\n{contract_manifest}"
+        );
+        assert!(
+            contract_manifest.contains("\"code\": \"validation_failed\""),
+            "expected standard contract errors:\n{contract_manifest}"
+        );
+
+        let errors = fs::read_to_string(dir.path().join("FoundryErrors.ts")).unwrap();
+        assert!(
+            errors.contains("export class FoundrySdkError extends Error"),
+            "expected generated SDK error class:\n{errors}"
         );
     }
 
@@ -2466,6 +3223,12 @@ mod tests {
         assert!(manifest.iter().any(|file| file == "index.ts"));
         assert!(manifest.iter().any(|file| file == "RouteManifest.ts"));
         assert!(manifest.iter().any(|file| file == "FoundryEndpoint.ts"));
+        assert!(manifest.iter().any(|file| file == "FoundryErrors.ts"));
+        assert!(manifest.iter().any(|file| file == "FoundrySdk.ts"));
+        assert!(manifest.iter().any(|file| file == "FoundryClient.ts"));
+        assert!(manifest
+            .iter()
+            .any(|file| file == "FoundryContractManifest.json"));
     }
 
     #[cfg(unix)]
@@ -2545,6 +3308,24 @@ mod tests {
         assert!(
             index.contains("export * from \"./routes/AdminUsersShow\";"),
             "expected route endpoint helper barrel export:\n{index}"
+        );
+
+        let sdk_action = fs::read_to_string(dir.path().join("sdk/AdminUsersShow.ts")).unwrap();
+        assert!(
+            sdk_action.contains("body: \"none\""),
+            "expected GET SDK action to preserve bodyless transport:\n{sdk_action}"
+        );
+        assert!(
+            sdk_action.contains(
+                "export type AdminUsersShowAction = (options?: FoundryActionOptions<AdminUsersShowSdkParams>) => Promise<AdminUsersShowSdkResponse>"
+            ),
+            "expected bodyless SDK action to omit dropped request argument:\n{sdk_action}"
+        );
+        assert!(
+            sdk_action.contains(
+                "sendFoundryAction<AdminUsersShowSdkRequest, AdminUsersShowSdkResponse, AdminUsersShowSdkParams>(transport, AdminUsersShowActionDefinition, undefined, options)"
+            ),
+            "expected bodyless SDK action to pass undefined data:\n{sdk_action}"
         );
     }
 
@@ -2630,6 +3411,53 @@ mod tests {
             index.contains("export * from \"./routes/UserPortalLogin\";"),
             "expected route helper barrel export:\n{index}"
         );
+        assert!(
+            index.contains("export * from \"./sdk/UserPortalLogin\";"),
+            "expected SDK action barrel export:\n{index}"
+        );
+
+        let sdk_action = fs::read_to_string(dir.path().join("sdk/UserPortalLogin.ts")).unwrap();
+        assert!(
+            sdk_action.contains("export type UserPortalLoginAction ="),
+            "expected SDK action type:\n{sdk_action}"
+        );
+        assert!(
+            sdk_action.contains("export function createUserPortalLoginAction"),
+            "expected SDK action factory:\n{sdk_action}"
+        );
+        assert!(
+            sdk_action.contains(
+                "sendFoundryAction<UserPortalLoginSdkRequest, UserPortalLoginSdkResponse"
+            ),
+            "expected SDK action transport call:\n{sdk_action}"
+        );
+
+        let sdk_client = fs::read_to_string(dir.path().join("FoundryClient.ts")).unwrap();
+        assert!(
+            sdk_client.contains("userPortalLogin: createUserPortalLoginAction(transport)"),
+            "expected SDK client business action:\n{sdk_client}"
+        );
+
+        let contract_manifest =
+            fs::read_to_string(dir.path().join("FoundryContractManifest.json")).unwrap();
+        let contract_json: serde_json::Value = serde_json::from_str(&contract_manifest).unwrap();
+        assert!(
+            contract_manifest.contains("\"action_name\": \"UserPortalLogin\""),
+            "expected contract action name:\n{contract_manifest}"
+        );
+        assert_eq!(
+            contract_schema(&contract_json, "MinimalLoginResponse")["schema"]["properties"]
+                ["token"]["type"],
+            "string"
+        );
+        assert!(
+            contract_manifest.contains("\"body\": \"json\""),
+            "expected JSON body contract:\n{contract_manifest}"
+        );
+        assert!(
+            contract_manifest.contains("\"validation\": \"MinimalLoginRequest\""),
+            "expected validation schema reference:\n{contract_manifest}"
+        );
 
         let manifest: Vec<String> = serde_json::from_str(
             &fs::read_to_string(dir.path().join(TYPES_EXPORT_MANIFEST)).unwrap(),
@@ -2640,6 +3468,10 @@ mod tests {
                 .iter()
                 .any(|file| file == "routes/UserPortalLogin.ts"),
             "expected generated manifest to track route helper files: {manifest:?}"
+        );
+        assert!(
+            manifest.iter().any(|file| file == "sdk/UserPortalLogin.ts"),
+            "expected generated manifest to track SDK action files: {manifest:?}"
         );
     }
 
@@ -2652,6 +3484,10 @@ mod tests {
             !dir.path().join("routes/UserPortalLogin.ts").exists(),
             "did not expect opt-out route helper to be written"
         );
+        assert!(
+            !dir.path().join("sdk/UserPortalLogin.ts").exists(),
+            "did not expect opt-out SDK action to be written"
+        );
 
         let route_manifest = fs::read_to_string(dir.path().join("RouteManifest.ts")).unwrap();
         assert!(
@@ -2663,6 +3499,10 @@ mod tests {
         assert!(
             !index.contains("routes/UserPortalLogin"),
             "did not expect opt-out route helper in barrel:\n{index}"
+        );
+        assert!(
+            !index.contains("sdk/UserPortalLogin"),
+            "did not expect opt-out SDK action in barrel:\n{index}"
         );
     }
 

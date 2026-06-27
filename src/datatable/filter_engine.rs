@@ -462,8 +462,12 @@ fn text_to_db_value(text: &str, db_type: DbType) -> Result<DbValue> {
 
 fn number_to_db_value(n: i64, db_type: DbType) -> Result<DbValue> {
     match db_type {
-        DbType::Int16 => Ok(DbValue::Int16(n as i16)),
-        DbType::Int32 => Ok(DbValue::Int32(n as i32)),
+        DbType::Int16 => i16::try_from(n)
+            .map(DbValue::Int16)
+            .map_err(|_| Error::message(format!("integer '{n}' is out of range for int16"))),
+        DbType::Int32 => i32::try_from(n)
+            .map(DbValue::Int32)
+            .map_err(|_| Error::message(format!("integer '{n}' is out of range for int32"))),
         DbType::Int64 => Ok(DbValue::Int64(n)),
         DbType::Float32 => Ok(DbValue::Float32(n as f32)),
         DbType::Float64 => Ok(DbValue::Float64(n as f64)),
@@ -528,6 +532,12 @@ mod tests {
 
         let value = number_to_db_value(12, DbType::Numeric).unwrap();
         assert_eq!(value, DbValue::Numeric(Numeric::new("12").unwrap()));
+
+        let value = number_to_db_value(i64::from(i16::MAX), DbType::Int16).unwrap();
+        assert_eq!(value, DbValue::Int16(i16::MAX));
+
+        let value = number_to_db_value(i64::from(i32::MIN), DbType::Int32).unwrap();
+        assert_eq!(value, DbValue::Int32(i32::MIN));
     }
 
     #[test]
@@ -535,6 +545,21 @@ mod tests {
         let error = text_to_db_value("12.5.0", DbType::Numeric).unwrap_err();
         assert!(
             error.to_string().contains("invalid numeric '12.5.0'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_integer_number_filters() {
+        let error = number_to_db_value(i64::from(i16::MAX) + 1, DbType::Int16).unwrap_err();
+        assert!(
+            error.to_string().contains("out of range for int16"),
+            "unexpected error: {error}"
+        );
+
+        let error = number_to_db_value(i64::from(i32::MIN) - 1, DbType::Int32).unwrap_err();
+        assert!(
+            error.to_string().contains("out of range for int32"),
             "unexpected error: {error}"
         );
     }

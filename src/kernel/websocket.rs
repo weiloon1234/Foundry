@@ -1130,50 +1130,53 @@ async fn process_client_message(
                 .await?;
         }
         ClientAction::Unsubscribe => {
-            // Invoke on_leave lifecycle hook.
-            if let Some(ref on_leave) = channel.options.on_leave {
-                let actors = state.hub.actors(connection_id).await.unwrap_or_default();
-                let ctx = WebSocketContext::new(
-                    state.app.clone(),
-                    connection_id,
-                    actor_for_channel(&actors, channel),
-                    message.channel.clone(),
-                    message.room.clone(),
-                );
-                if let Err(e) = on_leave(ctx).await {
-                    tracing::warn!(target: "foundry.websocket", error = %e, "on_leave hook failed");
-                }
-            }
-
-            // Clean up presence entries for this subscription before unsubscribing.
-            let entries = state
-                .hub
-                .take_presence_entries_for_subscription(
-                    connection_id,
-                    &message.channel,
-                    &message.room,
-                )
-                .await;
-            for entry in &entries {
-                let _ = state.backend.srem(&entry.key, &entry.member_value).await;
-            }
-
-            for entry in entries {
-                let leave_msg = ServerMessage {
-                    channel: entry.channel,
-                    event: PRESENCE_LEAVE_EVENT,
-                    room: entry.room,
-                    payload: serde_json::json!({
-                        "actor_id": entry.actor_id,
-                    }),
-                };
-                state.broadcast(&leave_msg).await;
-            }
-
-            state
+            let was_subscribed = state
                 .hub
                 .unsubscribe(connection_id, &message.channel, message.room.clone())
                 .await;
+
+            if was_subscribed {
+                // Invoke on_leave lifecycle hook.
+                if let Some(ref on_leave) = channel.options.on_leave {
+                    let actors = state.hub.actors(connection_id).await.unwrap_or_default();
+                    let ctx = WebSocketContext::new(
+                        state.app.clone(),
+                        connection_id,
+                        actor_for_channel(&actors, channel),
+                        message.channel.clone(),
+                        message.room.clone(),
+                    );
+                    if let Err(e) = on_leave(ctx).await {
+                        tracing::warn!(target: "foundry.websocket", error = %e, "on_leave hook failed");
+                    }
+                }
+
+                // Clean up presence entries for this subscription.
+                let entries = state
+                    .hub
+                    .take_presence_entries_for_subscription(
+                        connection_id,
+                        &message.channel,
+                        &message.room,
+                    )
+                    .await;
+                for entry in &entries {
+                    let _ = state.backend.srem(&entry.key, &entry.member_value).await;
+                }
+
+                for entry in entries {
+                    let leave_msg = ServerMessage {
+                        channel: entry.channel,
+                        event: PRESENCE_LEAVE_EVENT,
+                        room: entry.room,
+                        payload: serde_json::json!({
+                            "actor_id": entry.actor_id,
+                        }),
+                    };
+                    state.broadcast(&leave_msg).await;
+                }
+            }
+
             state
                 .send(
                     connection_id,
@@ -1899,7 +1902,7 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use axum::body::to_bytes;
 
@@ -2435,6 +2438,62 @@ mod tests {
             Error::Http { status, .. } if *status == 429
         ));
         assert_eq!(error.to_string(), "websocket subscription limit exceeded");
+    }
+
+    #[tokio::test]
+    async fn websocket_unsubscribe_without_subscription_does_not_run_on_leave() {
+        let leave_count = Arc::new(AtomicUsize::new(0));
+        let hook_count = leave_count.clone();
+        let mut registrar = WebSocketRegistrar::new();
+        registrar
+            .channel_with_options(
+                ChannelId::new("chat"),
+                |_context: WebSocketContext, _payload: serde_json::Value| async { Ok(()) },
+                crate::websocket::WebSocketChannelOptions::new().on_leave(move |_ctx| {
+                    let hook_count = hook_count.clone();
+                    async move {
+                        hook_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+            )
+            .unwrap();
+        let state = websocket_state(registrar.into_channels(), "ws-unsubscribe-leave-gate");
+        let (connection_id, mut outbound, _last_pong) =
+            state.hub.register(ConnectionIdentity::default()).await;
+
+        process_client_message(
+            &state,
+            connection_id,
+            serde_json::json!({
+                "action": "unsubscribe",
+                "channel": "chat",
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let unsubscribed = next_json(&mut outbound).await;
+        assert_eq!(unsubscribed.event, UNSUBSCRIBED_EVENT);
+        assert_eq!(leave_count.load(Ordering::SeqCst), 0);
+
+        subscribe(&state, connection_id, &mut outbound, "chat").await;
+        process_client_message(
+            &state,
+            connection_id,
+            serde_json::json!({
+                "action": "unsubscribe",
+                "channel": "chat",
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let unsubscribed = next_json(&mut outbound).await;
+        assert_eq!(unsubscribed.event, UNSUBSCRIBED_EVENT);
+        assert_eq!(leave_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -130,6 +130,13 @@ fn expand_struct(
                 #name_str
             }
         }
+
+        ::foundry::inventory::submit! {
+            ::foundry::openapi::ApiSchemaDefinition {
+                name: #name_str,
+                schema_fn: <#name as ::foundry::openapi::ApiSchema>::schema,
+            }
+        }
     })
 }
 
@@ -164,6 +171,13 @@ fn expand_enum(
 
             fn schema_name() -> &'static str {
                 #name_str
+            }
+        }
+
+        ::foundry::inventory::submit! {
+            ::foundry::openapi::ApiSchemaDefinition {
+                name: #name_str,
+                schema_fn: <#name as ::foundry::openapi::ApiSchema>::schema,
             }
         }
     })
@@ -300,13 +314,13 @@ fn parse_validate_constraints(attrs: &[syn::Attribute]) -> syn::Result<Vec<Valid
                     "email" => constraints.push(ValidateConstraint::Email),
                     "url" => constraints.push(ValidateConstraint::Url),
                     "uuid" => constraints.push(ValidateConstraint::UuidFormat),
-                    "min_length" => {
+                    "min" | "min_length" => {
                         let content;
                         syn::parenthesized!(content in input);
                         let expr: syn::Expr = content.parse()?;
                         constraints.push(ValidateConstraint::MinLength(expr));
                     }
-                    "max_length" => {
+                    "max" | "max_length" => {
                         let content;
                         syn::parenthesized!(content in input);
                         let expr: syn::Expr = content.parse()?;

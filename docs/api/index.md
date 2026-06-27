@@ -17,13 +17,14 @@ For import stability and compatibility expectations, see [Public API Contract](p
 | [cache](modules/cache.md) | In-memory and Redis-backed caching (CacheManager) | 32L |
 | [cli](modules/cli.md) | CLI command registration (CommandRegistry) | 19L |
 | [config](modules/config.md) | TOML-based configuration (ConfigRepository, AppConfig, etc.) | 106L |
+| [contract](modules/contract.md) | Normalized contract manifest for generated SDKs, OpenAPI, validation, and realtime | 41L |
 | [countries](modules/countries.md) | Built-in country data (250 countries) | 27L |
 | [database](modules/database.md) | AST-first query system: models, relations, projections, compiler | 786L |
 | [datatable](modules/datatable.md) | Server-side datatables: filtering, sorting, pagination, XLSX export | 217L |
-| [email](modules/email.md) | Multi-driver email: SMTP, Mailgun, Postmark, Resend, SES | 167L |
+| [email](modules/email.md) | Multi-driver email: SMTP, Mailgun, Postmark, Resend, SES | 168L |
 | [events](modules/events.md) | Domain event bus with typed listeners | 31L |
 | [foundation](modules/foundation.md) | Core: App, AppBuilder, AppContext, AppTransaction, Error, ServiceProvider | 137L |
-| [http](modules/http.md) | HTTP: routes, middleware (CORS, CSRF, rate limit, etc.), cookies, resources | 306L |
+| [http](modules/http.md) | HTTP: routes, middleware (CORS, CSRF, rate limit, etc.), cookies, resources | 310L |
 | [i18n](modules/i18n.md) | Internationalization: locale extraction, translation catalogs | 28L |
 | [imaging](modules/imaging.md) | Image processing pipeline (resize, crop, rotate, format conversion) | 36L |
 | [jobs](modules/jobs.md) | Background job queue with leased at-least-once delivery | 60L |
@@ -31,7 +32,7 @@ For import stability and compatibility expectations, see [Public API Contract](p
 | [logging](modules/logging.md) | Structured logging, observability, health probes, diagnostics | 89L |
 | [metadata](modules/metadata.md) | Key-value metadata for models (HasMetadata) | 21L |
 | [notifications](modules/notifications.md) | Multi-channel notifications: email, database, broadcast | 35L |
-| [openapi](modules/openapi.md) | OpenAPI 3.1.0 spec generation (ApiSchema, RouteDoc) | 38L |
+| [openapi](modules/openapi.md) | OpenAPI 3.1.0 spec generation (ApiSchema, RouteDoc) | 40L |
 | [plugin](modules/plugin.md) | Compile-time plugin system with dependency validation | 98L |
 | [public](modules/public.md) |  | 67L |
 | [redis](modules/redis.md) | Namespaced Redis wrapper (RedisManager, RedisConnection) | 41L |
@@ -41,8 +42,8 @@ For import stability and compatibility expectations, see [Public API Contract](p
 | [support](modules/support.md) | Utilities: typed IDs, datetime/clock, Collection<T>, crypto, hashing, locks | 216L |
 | [testing](modules/testing.md) | Test infrastructure: TestApp, TestClient, Factory | 40L |
 | [translations](modules/translations.md) | Model field translations across locales (HasTranslations) | 42L |
-| [typescript](modules/typescript.md) |  | 14L |
+| [typescript](modules/typescript.md) |  | 21L |
 | [validation](modules/validation.md) | Validation: 38+ rules, custom rules, request validation extractor | 149L |
-| [websocket](modules/websocket.md) | Channel-based WebSocket with presence and typed messages | 68L |
+| [websocket](modules/websocket.md) | Channel-based WebSocket with presence and typed messages | 74L |
 
-**Total: 35 modules, 3529 lines across all files.**
+**Total: 36 modules, 3590 lines across all files.**

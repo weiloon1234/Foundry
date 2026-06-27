@@ -47,6 +47,8 @@ struct HttpRouteBuilder
   fn authorize<F, Fut>(&mut self, f: F) -> &mut Self
   fn middleware(&mut self, config: MiddlewareConfig) -> &mut Self
   fn middleware_group(&mut self, name: impl Into<String>) -> &mut Self
+  fn client_export(&mut self, enabled: bool) -> &mut Self
+  fn without_client_export(&mut self) -> &mut Self
   fn audit_area(&mut self, area: &str) -> &mut Self
   fn audit_disabled(&mut self) -> &mut Self
   fn rate_limit(&mut self, rate_limit: RateLimit) -> &mut Self
@@ -64,6 +66,8 @@ struct HttpRouteOptions
   fn authorize<F, Fut>(self, f: F) -> Self
   fn middleware(self, config: MiddlewareConfig) -> Self
   fn allow_mfa_pending_token(self) -> Self
+  fn client_export(self, enabled: bool) -> Self
+  fn without_client_export(self) -> Self
   fn audit_area(self, area: &str) -> Self
   fn audit_disabled(self) -> Self
   fn middleware_group(self, name: impl Into<String>) -> Self

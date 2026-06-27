@@ -11,6 +11,7 @@ use crate::foundation::{AppContext, Error, Result};
 use crate::logging::{
     catch_future_panic, catch_sync_panic, panic_payload_message, RuntimeDiagnostics,
 };
+use crate::openapi::{ApiSchema, SchemaRef};
 use crate::support::runtime::RuntimeBackend;
 use crate::support::{ChannelEventId, ChannelId, GuardId, PermissionId};
 
@@ -329,6 +330,26 @@ pub type AuthorizeCallback = Arc<
         + Sync,
 >;
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSocketEventDirection {
+    Incoming,
+    Outgoing,
+}
+
+#[derive(Clone)]
+pub(crate) struct WebSocketChannelEventContract {
+    pub direction: WebSocketEventDirection,
+    pub event: ChannelEventId,
+    pub payload: Option<SchemaRef>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WebSocketChannelEventDescriptor {
+    pub event: ChannelEventId,
+    pub payload: Option<&'static str>,
+}
+
 #[derive(Clone, Default)]
 pub struct WebSocketChannelOptions {
     pub access: AccessScope,
@@ -338,6 +359,7 @@ pub struct WebSocketChannelOptions {
     pub(crate) on_join: Option<LifecycleCallback>,
     pub(crate) on_leave: Option<LifecycleCallback>,
     pub(crate) replay_count: u32,
+    pub(crate) event_contracts: Vec<WebSocketChannelEventContract>,
 }
 
 impl WebSocketChannelOptions {
@@ -431,6 +453,60 @@ impl WebSocketChannelOptions {
     /// Set to `0` (the default) to disable replay.
     pub fn replay(mut self, count: u32) -> Self {
         self.replay_count = count;
+        self
+    }
+
+    /// Declare a client-to-server event and its payload schema for frontend contracts.
+    pub fn incoming_event<I, T>(mut self, event: I) -> Self
+    where
+        I: Into<ChannelEventId>,
+        T: ApiSchema,
+    {
+        self.event_contracts.push(WebSocketChannelEventContract {
+            direction: WebSocketEventDirection::Incoming,
+            event: event.into(),
+            payload: Some(SchemaRef::of::<T>()),
+        });
+        self
+    }
+
+    /// Declare a client-to-server event that does not send a payload.
+    pub fn incoming_event_without_payload<I>(mut self, event: I) -> Self
+    where
+        I: Into<ChannelEventId>,
+    {
+        self.event_contracts.push(WebSocketChannelEventContract {
+            direction: WebSocketEventDirection::Incoming,
+            event: event.into(),
+            payload: None,
+        });
+        self
+    }
+
+    /// Declare a server-to-client event and its payload schema for frontend contracts.
+    pub fn outgoing_event<I, T>(mut self, event: I) -> Self
+    where
+        I: Into<ChannelEventId>,
+        T: ApiSchema,
+    {
+        self.event_contracts.push(WebSocketChannelEventContract {
+            direction: WebSocketEventDirection::Outgoing,
+            event: event.into(),
+            payload: Some(SchemaRef::of::<T>()),
+        });
+        self
+    }
+
+    /// Declare a server-to-client event that does not send a payload.
+    pub fn outgoing_event_without_payload<I>(mut self, event: I) -> Self
+    where
+        I: Into<ChannelEventId>,
+    {
+        self.event_contracts.push(WebSocketChannelEventContract {
+            direction: WebSocketEventDirection::Outgoing,
+            event: event.into(),
+            payload: None,
+        });
         self
     }
 
@@ -573,10 +649,18 @@ pub struct WebSocketChannelDescriptor {
     pub requires_auth: bool,
     pub guard: Option<GuardId>,
     pub permissions: Vec<PermissionId>,
+    pub incoming: Vec<WebSocketChannelEventDescriptor>,
+    pub outgoing: Vec<WebSocketChannelEventDescriptor>,
 }
 
 impl From<&RegisteredChannel> for WebSocketChannelDescriptor {
     fn from(channel: &RegisteredChannel) -> Self {
+        let event_descriptor =
+            |contract: &WebSocketChannelEventContract| WebSocketChannelEventDescriptor {
+                event: contract.event.clone(),
+                payload: contract.payload.as_ref().map(|schema| schema.name),
+            };
+
         Self {
             id: channel.id.clone(),
             presence: channel.options.presence,
@@ -585,6 +669,20 @@ impl From<&RegisteredChannel> for WebSocketChannelDescriptor {
             requires_auth: channel.options.requires_auth(),
             guard: channel.options.guard_id().cloned(),
             permissions: channel.options.permissions_set().into_iter().collect(),
+            incoming: channel
+                .options
+                .event_contracts
+                .iter()
+                .filter(|contract| contract.direction == WebSocketEventDirection::Incoming)
+                .map(event_descriptor)
+                .collect(),
+            outgoing: channel
+                .options
+                .event_contracts
+                .iter()
+                .filter(|contract| contract.direction == WebSocketEventDirection::Outgoing)
+                .map(event_descriptor)
+                .collect(),
         }
     }
 }
@@ -633,8 +731,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ChannelId, GuardId, PermissionId, WebSocketChannelOptions, WebSocketChannelRegistry,
-        WebSocketRegistrar, WebSocketRouteRegistrar,
+        ChannelEventId, ChannelId, GuardId, PermissionId, WebSocketChannelOptions,
+        WebSocketChannelRegistry, WebSocketRegistrar, WebSocketRouteRegistrar,
     };
     use crate::auth::Actor;
     use crate::config::ConfigRepository;
@@ -778,7 +876,11 @@ mod tests {
                     .replay(25)
                     .allow_client_events(true)
                     .guard(GuardId::new("api"))
-                    .permissions([PermissionId::new("chat:read")]),
+                    .permissions([PermissionId::new("chat:read")])
+                    .incoming_event::<_, String>(ChannelEventId::new("send"))
+                    .incoming_event_without_payload(ChannelEventId::new("typing"))
+                    .outgoing_event::<_, String>(ChannelEventId::new("message"))
+                    .outgoing_event_without_payload(ChannelEventId::new("pong")),
             )
             .unwrap();
 
@@ -794,6 +896,16 @@ mod tests {
         assert!(descriptor.requires_auth);
         assert_eq!(descriptor.guard.as_ref(), Some(&GuardId::new("api")));
         assert_eq!(descriptor.permissions, vec![PermissionId::new("chat:read")]);
+        assert_eq!(descriptor.incoming.len(), 2);
+        assert_eq!(descriptor.incoming[0].event, ChannelEventId::new("send"));
+        assert_eq!(descriptor.incoming[0].payload, Some("String"));
+        assert_eq!(descriptor.incoming[1].event, ChannelEventId::new("typing"));
+        assert_eq!(descriptor.incoming[1].payload, None);
+        assert_eq!(descriptor.outgoing.len(), 2);
+        assert_eq!(descriptor.outgoing[0].event, ChannelEventId::new("message"));
+        assert_eq!(descriptor.outgoing[0].payload, Some("String"));
+        assert_eq!(descriptor.outgoing[1].event, ChannelEventId::new("pong"));
+        assert_eq!(descriptor.outgoing[1].payload, None);
 
         assert!(registry.find(&ChannelId::new("chat")).is_some());
         assert!(registry.find(&ChannelId::new("missing")).is_none());

@@ -603,6 +603,13 @@ mod file_validation {
         pub photo: Option<foundry::storage::UploadedFile>,
     }
 
+    #[derive(Debug, Deserialize, Validate)]
+    pub struct CleanupUpload {
+        pub avatar: foundry::storage::UploadedFile,
+        pub optional: Option<foundry::storage::UploadedFile>,
+        pub gallery: Vec<foundry::storage::UploadedFile>,
+    }
+
     #[tokio::test]
     async fn derive_allowed_extensions_rejects_wrong_ext() {
         let app = test_app();
@@ -624,6 +631,47 @@ mod file_validation {
         let mut validator = Validator::new(app);
         input.validate(&mut validator).await.unwrap();
         assert!(validator.finish().is_ok());
+    }
+
+    fn make_cleanup_file(field_name: &str, content: &[u8]) -> foundry::storage::UploadedFile {
+        let temp_dir = std::env::temp_dir().join("foundry/uploads");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let temp_path = temp_dir.join(format!("foundry-upload-{}", uuid::Uuid::now_v7()));
+        std::fs::write(&temp_path, content).unwrap();
+
+        foundry::storage::UploadedFile {
+            field_name: field_name.to_string(),
+            original_name: Some(format!("{field_name}.txt")),
+            content_type: Some("text/plain".to_string()),
+            size: content.len() as u64,
+            temp_path,
+        }
+    }
+
+    #[tokio::test]
+    async fn derive_multipart_cleanup_removes_owned_uploaded_files() {
+        let avatar = make_cleanup_file("avatar", b"avatar");
+        let optional = make_cleanup_file("optional", b"optional");
+        let gallery_one = make_cleanup_file("gallery", b"one");
+        let gallery_two = make_cleanup_file("gallery", b"two");
+        let paths = vec![
+            avatar.temp_path.clone(),
+            optional.temp_path.clone(),
+            gallery_one.temp_path.clone(),
+            gallery_two.temp_path.clone(),
+        ];
+
+        let input = CleanupUpload {
+            avatar,
+            optional: Some(optional),
+            gallery: vec![gallery_one, gallery_two],
+        };
+
+        foundry::validation::FromMultipart::cleanup_multipart_files(&input).await;
+
+        for path in paths {
+            assert!(!path.exists(), "expected {} to be removed", path.display());
+        }
     }
 
     // --- Text-only struct still gets FromMultipart ---

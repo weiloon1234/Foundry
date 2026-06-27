@@ -7,6 +7,7 @@ OpenAPI 3.1.0 spec generation (ApiSchema, RouteDoc)
 ## foundry::openapi
 
 ```rust
+struct ApiSchemaDefinition
 struct RouteDoc
   fn new() -> Self
   fn method(self, m: &str) -> Self
@@ -34,5 +35,6 @@ trait ApiSchema
 ```rust
 struct DocumentedRoute
 fn generate_openapi_spec( title: &str, version: &str, routes: &[DocumentedRoute], ) -> Value
+fn generate_openapi_spec_from_contract( title: &str, version: &str, manifest: &ContractManifest, ) -> Value
 ```
 

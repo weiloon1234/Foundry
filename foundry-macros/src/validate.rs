@@ -134,16 +134,13 @@ fn last_segment_is(ty: &Type, name: &str) -> bool {
         .is_some_and(|s| s.ident == name)
 }
 
-/// Check if a type is `UploadedFile`, `Option<UploadedFile>`, or `Vec<UploadedFile>`.
-fn is_or_wraps_uploaded_file(ty: &Type) -> bool {
-    // Direct UploadedFile
+fn contains_uploaded_file(ty: &Type) -> bool {
     if last_segment_is(ty, "UploadedFile") {
         return true;
     }
-    // Option<UploadedFile> or Vec<UploadedFile>
     for wrapper in &["Option", "Vec"] {
         if let Some(inner) = type_argument_if_last_segment_ident(ty, wrapper) {
-            if last_segment_is(inner, "UploadedFile") {
+            if contains_uploaded_file(inner) {
                 return true;
             }
         }
@@ -151,8 +148,49 @@ fn is_or_wraps_uploaded_file(ty: &Type) -> bool {
     false
 }
 
+fn is_uploaded_file_field(ty: &Type) -> bool {
+    last_segment_is(ty, "UploadedFile")
+        || type_argument_if_last_segment_ident(ty, "Option")
+            .is_some_and(|inner| last_segment_is(inner, "UploadedFile"))
+}
+
+fn is_vec_uploaded_file_field(ty: &Type) -> bool {
+    type_argument_if_last_segment_ident(ty, "Vec")
+        .is_some_and(|inner| last_segment_is(inner, "UploadedFile"))
+}
+
 fn is_json_value_type(ty: &Type) -> bool {
     type_path_last_segment_matches(ty, "Value")
+}
+
+fn contract_value_kind_for_field(field: &FieldInfo) -> TokenStream {
+    if field.is_vec_uploaded_file {
+        quote!(::foundry::contract::ContractValueKind::FileList)
+    } else if field.is_uploaded_file {
+        quote!(::foundry::contract::ContractValueKind::File)
+    } else if field.is_vec {
+        quote!(::foundry::contract::ContractValueKind::Array)
+    } else if is_json_value_type(&field.ty) {
+        quote!(::foundry::contract::ContractValueKind::Json)
+    } else if type_path_last_segment_matches(&field.ty, "Date") {
+        quote!(::foundry::contract::ContractValueKind::Date)
+    } else if type_path_last_segment_matches(&field.ty, "DateTime") {
+        quote!(::foundry::contract::ContractValueKind::DateTime)
+    } else if type_path_last_segment_matches(&field.ty, "LocalDateTime") {
+        quote!(::foundry::contract::ContractValueKind::LocalDateTime)
+    } else if type_path_last_segment_matches(&field.ty, "Time") {
+        quote!(::foundry::contract::ContractValueKind::Time)
+    } else if type_path_last_segment_matches(&field.ty, "Uuid")
+        || type_argument_if_last_segment_ident(&field.ty, "ModelId").is_some()
+    {
+        quote!(::foundry::contract::ContractValueKind::Uuid)
+    } else if type_path_last_segment_matches(&field.ty, "Decimal")
+        || type_path_last_segment_matches(&field.ty, "Numeric")
+    {
+        quote!(::foundry::contract::ContractValueKind::Decimal)
+    } else {
+        quote!(::foundry::contract::ContractValueKind::Scalar)
+    }
 }
 
 fn generate_parse_text_value(
@@ -187,13 +225,14 @@ fn parse_field_validations(
         let field_ty = &field.ty;
         let is_option = type_argument_if_last_segment_ident(field_ty, "Option").is_some();
         let is_vec = type_argument_if_last_segment_ident(field_ty, "Vec").is_some();
-        let is_uploaded_file = is_or_wraps_uploaded_file(field_ty);
-
-        // Check for Vec<UploadedFile>
-        let is_vec_uploaded_file = is_vec
-            && type_argument_if_last_segment_ident(field_ty, "Vec")
-                .map(|inner| type_argument_if_last_segment_ident(inner, "UploadedFile").is_some())
-                .unwrap_or(false);
+        let is_uploaded_file = is_uploaded_file_field(field_ty);
+        let is_vec_uploaded_file = is_vec_uploaded_file_field(field_ty);
+        if contains_uploaded_file(field_ty) && !is_uploaded_file && !is_vec_uploaded_file {
+            return Err(syn::Error::new(
+                field_ident.span(),
+                "UploadedFile fields must use UploadedFile, Option<UploadedFile>, or Vec<UploadedFile>",
+            ));
+        }
 
         all_fields.push(FieldInfo {
             ident: field_ident.clone(),
@@ -414,7 +453,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
 
     let from_multipart_impl = generate_from_multipart_impl(&ident, &all_fields)?;
     let ts_validation_registration =
-        generate_ts_validation_registration(&ident, &field_validations, &args)?;
+        generate_ts_validation_registration(&ident, &all_fields, &field_validations, &args)?;
 
     Ok(quote! {
         #[::foundry::__reexports::async_trait]
@@ -440,18 +479,25 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
 
 fn generate_ts_validation_registration(
     ident: &Ident,
+    all_fields: &[FieldInfo],
     field_validations: &[FieldValidation],
     args: &ValidateArgs,
 ) -> syn::Result<TokenStream> {
     let name = ident.to_string();
-    let fields = field_validations
+    let fields = all_fields
         .iter()
         .map(|field| {
-            let field_name = &field.field_name;
-            let rules = generate_ts_validation_rules(&field.rules)?;
+            let field_name = &field.name;
+            let rules = field_validations
+                .iter()
+                .find(|validation| validation.field_name == field.name)
+                .map(|validation| generate_ts_validation_rules(&validation.rules))
+                .unwrap_or_else(|| Ok(Vec::new()))?;
+            let value_kind = contract_value_kind_for_field(field);
             Ok(quote! {
                 ::foundry::typescript::TsValidationField {
                     name: #field_name.to_string(),
+                    value_kind: #value_kind,
                     rules: vec![#(#rules),*],
                 }
             })
@@ -1338,6 +1384,7 @@ fn generate_from_multipart_impl(
     let mut match_arms = Vec::new();
     let mut field_assignments = Vec::new();
     let mut cleanup_uploads = Vec::new();
+    let mut cleanup_self_uploads = Vec::new();
 
     for fi in all_fields {
         let ident = &fi.ident;
@@ -1351,6 +1398,9 @@ fn generate_from_multipart_impl(
             });
             cleanup_uploads.push(quote! {
                 ::foundry::storage::upload::cleanup_uploaded_files(#var_name.iter()).await;
+            });
+            cleanup_self_uploads.push(quote! {
+                ::foundry::storage::upload::cleanup_uploaded_files(self.#ident.iter()).await;
             });
 
             match_arms.push(quote! {
@@ -1380,6 +1430,17 @@ fn generate_from_multipart_impl(
                     ::foundry::storage::upload::remove_uploaded_temp_file(__file).await;
                 }
             });
+            if fi.is_option {
+                cleanup_self_uploads.push(quote! {
+                    if let Some(__file) = self.#ident.as_ref() {
+                        ::foundry::storage::upload::remove_uploaded_temp_file(__file).await;
+                    }
+                });
+            } else {
+                cleanup_self_uploads.push(quote! {
+                    ::foundry::storage::upload::remove_uploaded_temp_file(&self.#ident).await;
+                });
+            }
 
             match_arms.push(quote! {
                 #name => {
@@ -1544,6 +1605,10 @@ fn generate_from_multipart_impl(
                 })();
 
                 #build_result_handling
+            }
+
+            async fn cleanup_multipart_files(&self) {
+                #(#cleanup_self_uploads)*
             }
         }
     })

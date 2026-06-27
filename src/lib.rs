@@ -61,6 +61,7 @@ pub mod auth;
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod contract;
 pub mod countries;
 pub mod database;
 pub mod datatable;

@@ -23,9 +23,16 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 - The WebSocket pub/sub task now resubscribes with exponential backoff when its backend subscription ends or fails, instead of going permanently silent while publishes keep succeeding; dropping the server also aborts the task instead of leaking it.
 - Scheduler leadership state uses acquire/release atomic ordering, and dropping the scheduler or a schedule overlap-lock guard outside a Tokio runtime now logs a warning instead of silently leaving the lock to lapse via TTL.
 - Image dimension validation streams the upload from disk on the blocking thread pool instead of reading the entire file into memory on the async runtime.
+- Bodyless contract actions that still expose request metadata (for example path/query params on `GET`) no longer emit an OpenAPI `requestBody`, and generated SDK actions no longer require a payload argument that would be dropped at runtime.
+- Multipart `Validated<T>` extraction now removes framework-owned uploaded temp files when validation fails before the handler receives the DTO.
+- `#[derive(Validate)]` now generates multipart cleanup hooks for `UploadedFile`, `Option<UploadedFile>`, and `Vec<UploadedFile>` fields, and rejects unsupported nested upload wrappers with a clear derive error.
+- Datatable numeric filters now reject out-of-range `Int16`/`Int32` number values instead of wrapping them during downcast.
+- WebSocket `on_leave` hooks and presence leave cleanup now run only when an `unsubscribe` actually removed an active subscription, so forged/unmatched unsubscribe frames cannot trigger leave-side effects.
 
 ### Added
 
+- Contract-first frontend generation foundation: `types:export` now emits `FoundryContractManifest.json`, `FoundryErrors.ts`, `FoundrySdk.ts`, `FoundryClient.ts`, and per-action `sdk/*.ts` modules. The manifest normalizes route actions, transport body kind, permissions, request/response DTO JSON schemas, validation schemas, standard errors, and realtime channel contracts; new frontend code can use `createFoundryClient(...)` business actions instead of endpoint helpers.
+- Consumer update path for generated frontend clients: after upgrading, run `types:export`, import `createFoundryClient` from the configured generated TypeScript barrel, pass the existing Axios-compatible transport, and call generated business actions such as `api.userPortalLogin(payload, { params })`. Catch `FoundrySdkError` for normalized validation and HTTP failures. Existing `FoundryEndpoint` route helpers remain available for form-state screens, while `without_client_export()` / `client_export(false)` now opts a route out of both helper and SDK action output. File/file-list request fields automatically generate multipart SDK actions.
 - TypeScript route endpoint helpers: `types:export` now emits a headless `FoundryEndpoint` base runtime plus per-route helper files with path/method constants, request/response aliases, typed `validateForm()`/`submitForm()`, busy/error state, and validation metadata from `#[derive(Validate)]`. Generated DTO files now include a Foundry do-not-edit header, and validated DTO fields include validation-rule comments. Routes can opt out with `without_client_export()` or `client_export(false)`.
 - Datatable relation filters: model datatables can opt in to typed relation-backed filters with `Datatable::relation_filters()`, `DatatableRelationFilter`, and `DatatableRelationColumn`.
 - Datatable relation filter coverage for belongs-to, has-many, many-to-many, legacy hyphen aliases, and `LikeAny` search across declared relation columns.
@@ -37,6 +44,7 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 - HTTP request latency histograms on `/_foundry/runtime` and `/_foundry/metrics` via `foundry_http_request_duration_ms_bucket`, `_sum`, and `_count`, which can be used to compute p50/p95/p99 in Prometheus-compatible backends.
 - `AppContext::websocket_channels()` accessor returning the registered channel registry.
 - `WebSocketChannelDescriptor` and `WebSocketChannelRegistry` public types exposing registered WebSocket channels.
+- `WebSocketChannelOptions::incoming_event`, `incoming_event_without_payload`, `outgoing_event`, and `outgoing_event_without_payload` for declaring typed realtime contracts alongside channel registration.
 - Configurable TTL on WebSocket replay history (`websocket.history_ttl_seconds`, default 7 days). Every publish refreshes the TTL on `ws:history:<channel>`, so active channels never expire; channels idle past the window are auto-reaped by Redis. Set to `0` to disable.
 - WebSocket hardening config: `websocket.outbound_buffer_size`, `websocket.allowed_origins`, and `websocket.history_buffer_size`.
 - WebSocket protocol/lifecycle acceptance coverage for raw JSON actions, subscription enforcement, room routing, client events, ack success/error, socket-close cleanup, and force-disconnect cleanup.

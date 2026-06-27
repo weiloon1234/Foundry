@@ -874,5 +874,12 @@ fn generate_api_schema_impl(
                 #name_str
             }
         }
+
+        ::foundry::inventory::submit! {
+            ::foundry::openapi::ApiSchemaDefinition {
+                name: #name_str,
+                schema_fn: <#ident as ::foundry::openapi::ApiSchema>::schema,
+            }
+        }
     }
 }

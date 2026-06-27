@@ -202,6 +202,13 @@ route endpoint helper was generated. Route id groups are camelCased for
 TypeScript property access, so `admin.audit_logs.index` becomes
 `RouteIds.admin.auditLogs.index`.
 
+`types:export` also writes `FoundryContractManifest.json`, the normalized
+contract artifact used by newer generators. It contains action metadata,
+transport kind, request/response DTO names, DTO JSON schemas, validation schemas,
+permissions, and realtime contract slots. OpenAPI and TypeScript SDK generation
+should use this manifest layer rather than reading scattered route or macro
+metadata.
+
 Route params support Axum `{id}` / `{*path}` patterns and legacy `:id` patterns.
 The helper URL-encodes substituted params and throws a clear runtime error if a
 required param is missing.
@@ -260,6 +267,40 @@ import type {
   UserPortalLoginRequest,
   UserPortalLoginResponse,
 } from "@shared/types/generated";
+```
+
+### Pure SDK Client
+
+Foundry also generates a transport-bound SDK that exposes business actions
+without passing an HTTP client at every call site:
+
+```typescript
+import { createFoundryClient } from "@shared/types/generated";
+
+const api = createFoundryClient(axios);
+
+const response = await api.userPortalLogin({
+  email: "me@example.com",
+  password: "secret-password",
+  password_confirmation: "secret-password",
+});
+```
+
+The SDK runtime owns route URL generation, method selection, JSON vs multipart
+body handling, response unwrapping, and typed error normalization through
+`FoundrySdkError`. `FoundryEndpoint` remains available as a headless form-state
+adapter, but the pure SDK is the preferred core layer for new frontend code.
+
+```typescript
+import { FoundrySdkError } from "@shared/types/generated";
+
+try {
+  await api.userPortalLogin(credentials);
+} catch (error) {
+  if (error instanceof FoundrySdkError && error.code === "validation_failed") {
+    console.log(error.errors);
+  }
+}
 ```
 
 Request DTO files are also marked as generated and include validation remarks
@@ -365,8 +406,13 @@ Datatable exports now keep JSON-facing numeric fields as `number` and include th
 ```
 frontend/shared/types/generated/
 ├── index.ts                    ← barrel (auto-generated)
+├── FoundryContractManifest.json ← normalized contract manifest
+├── FoundrySdk.ts                ← pure SDK runtime
+├── FoundryClient.ts             ← transport-bound business action client
 ├── FoundryEndpoint.ts          ← headless endpoint base runtime
 ├── RouteManifest.ts            ← route URL helpers and metadata
+├── sdk/
+│   └── UserPortalLogin.ts      ← pure SDK action factory
 ├── routes/
 │   └── UserPortalLogin.ts      ← route helper class + route DTO aliases
 ├── CreateOrderRequest.ts       ← from project
@@ -397,7 +443,10 @@ export type { TokenPair } from "./TokenPair";
 export type { TokenResponse } from "./TokenResponse";
 export type { WsTokenResponse } from "./WsTokenResponse";
 export { RouteManifest, RouteIds, createRouteUrlBuilder, routeUrl, type RouteName, type RouteParams, type RouteParamValue, type RouteUrlOptions } from "./RouteManifest";
+export { createFoundryClient, type FoundryClient } from "./FoundryClient";
+export { sendFoundryAction, type FoundryActionOptions, type FoundrySdkTransport } from "./FoundrySdk";
 export { FoundryEndpoint, FoundryValidationClientError, type FoundryHttpClient, type FoundryValidationSchema, type FoundryValidationRule } from "./FoundryEndpoint";
+export * from "./sdk/UserPortalLogin";
 export * from "./routes/UserPortalLogin";
 ```
 

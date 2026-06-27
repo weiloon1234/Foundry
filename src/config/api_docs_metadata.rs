@@ -11,6 +11,9 @@ pub(crate) fn module_description(stem: &str) -> &'static str {
         "cache" => "In-memory and Redis-backed caching (CacheManager)",
         "cli" => "CLI command registration (CommandRegistry)",
         "config" => "TOML-based configuration (ConfigRepository, AppConfig, etc.)",
+        "contract" => {
+            "Normalized contract manifest for generated SDKs, OpenAPI, validation, and realtime"
+        }
         "countries" => "Built-in country data (250 countries)",
         "database" => "AST-first query system: models, relations, projections, compiler",
         "datatable" => "Server-side datatables: filtering, sorting, pagination, XLSX export",
@@ -141,6 +144,10 @@ mod tests {
         assert_eq!(
             module_description("audit"),
             "Built-in audit logging with automatic model mutation tracking and redaction"
+        );
+        assert_eq!(
+            module_description("contract"),
+            "Normalized contract manifest for generated SDKs, OpenAPI, validation, and realtime"
         );
     }
 

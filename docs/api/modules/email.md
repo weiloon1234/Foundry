@@ -115,7 +115,7 @@ struct EmailMessage
   fn reply_to(self, addr: impl Into<EmailAddress>) -> Self
   fn text_body(self, body: impl Into<String>) -> Self
   fn html_body(self, body: impl Into<String>) -> Self
-  fn template( self, template_name: &str, template_path: &str, variables: Value, ) -> Result<Self>
+  async fn template( self, template_name: &str, template_path: &str, variables: Value, ) -> Result<Self>
   fn header(self, key: impl Into<String>, value: impl Into<String>) -> Self
   fn attach(self, attachment: EmailAttachment) -> Self
 ```
@@ -155,6 +155,7 @@ struct RenderedTemplate
 struct TemplateRenderer
   fn new(base_path: impl Into<PathBuf>) -> Self
   fn render( &self, template_name: &str, variables: &Value, ) -> Result<RenderedTemplate>
+  async fn render_async( &self, template_name: &str, variables: &Value, ) -> Result<RenderedTemplate>
   fn exists(&self, template_name: &str) -> bool
 ```
 

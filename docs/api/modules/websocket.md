@@ -18,10 +18,12 @@ pub type AuthorizeCallback = Arc<dyn Fn(WebSocketContext, ChannelId, Option<Stri
 pub type LifecycleCallback = Arc<dyn Fn(WebSocketContext) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 pub type WebSocketRouteRegistrar = Arc<dyn Fn(&mut WebSocketRegistrar) -> Result<()> + Send + Sync>;
 enum ClientAction { Subscribe, Unsubscribe, Message, ClientEvent }
+enum WebSocketEventDirection { Incoming, Outgoing }
 struct ClientMessage
 struct PresenceInfo
 struct ServerMessage
 struct WebSocketChannelDescriptor
+struct WebSocketChannelEventDescriptor
 struct WebSocketChannelOptions
   fn new() -> Self
   fn presence(self, enabled: bool) -> Self
@@ -33,6 +35,10 @@ struct WebSocketChannelOptions
   fn on_join<F, Fut>(self, f: F) -> Self
   fn on_leave<F, Fut>(self, f: F) -> Self
   fn replay(self, count: u32) -> Self
+  fn incoming_event<I, T>(self, event: I) -> Self
+  fn incoming_event_without_payload<I>(self, event: I) -> Self
+  fn outgoing_event<I, T>(self, event: I) -> Self
+  fn outgoing_event_without_payload<I>(self, event: I) -> Self
 struct WebSocketChannelRegistry
   fn from_registrar(registrar: WebSocketRegistrar) -> Self
   fn descriptors(&self) -> Vec<WebSocketChannelDescriptor>

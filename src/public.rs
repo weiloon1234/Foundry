@@ -32,6 +32,13 @@ pub use crate::auth::{
 };
 pub use crate::cache::{CacheManager, CacheStore};
 pub use crate::cli::{CommandInvocation, CommandRegistry};
+pub use crate::contract::{
+    ContractAction, ContractAuth, ContractHttpBody, ContractHttpTransport, ContractManifest,
+    ContractPayload, ContractRealtimeChannel, ContractRealtimeEvent, ContractResponse,
+    ContractSchema, ContractTransport, ContractValidationAttribute, ContractValidationField,
+    ContractValidationMessage, ContractValidationRule, ContractValidationSchema, ContractValueKind,
+    ContractWebSocketTransport, CONTRACT_MANIFEST_VERSION,
+};
 pub use crate::countries::Country;
 pub use crate::database::{
     belongs_to, has_many, has_one, many_to_many, AggregateExpr, AggregateFn, AggregateNode,
@@ -113,7 +120,9 @@ pub use crate::notifications::{
     Notifiable, Notification, NotificationChannel, NotificationChannelRegistry, NOTIFY_BROADCAST,
     NOTIFY_DATABASE, NOTIFY_EMAIL,
 };
-pub use crate::openapi::spec::{generate_openapi_spec, DocumentedRoute};
+pub use crate::openapi::spec::{
+    generate_openapi_spec, generate_openapi_spec_from_contract, DocumentedRoute,
+};
 pub use crate::openapi::{ApiSchema, RouteDoc, SchemaRef};
 pub use crate::plugin::{
     Plugin, PluginAsset, PluginAssetKind, PluginDependency, PluginInstallOptions, PluginManifest,
@@ -147,8 +156,8 @@ pub use crate::validation::{
 };
 pub use crate::websocket::{
     ChannelHandler, ClientAction, ClientMessage, PresenceInfo, ServerMessage,
-    WebSocketChannelDescriptor, WebSocketChannelOptions, WebSocketChannelRegistry,
-    WebSocketContext, WebSocketPublisher, WebSocketRegistrar, ACK_EVENT, ERROR_EVENT,
-    PRESENCE_JOIN_EVENT, PRESENCE_LEAVE_EVENT, SUBSCRIBED_EVENT, SYSTEM_CHANNEL,
-    UNSUBSCRIBED_EVENT,
+    WebSocketChannelDescriptor, WebSocketChannelEventDescriptor, WebSocketChannelOptions,
+    WebSocketChannelRegistry, WebSocketContext, WebSocketEventDirection, WebSocketPublisher,
+    WebSocketRegistrar, ACK_EVENT, ERROR_EVENT, PRESENCE_JOIN_EVENT, PRESENCE_LEAVE_EVENT,
+    SUBSCRIBED_EVENT, SYSTEM_CHANNEL, UNSUBSCRIBED_EVENT,
 };

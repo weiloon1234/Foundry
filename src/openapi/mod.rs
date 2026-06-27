@@ -9,6 +9,14 @@ pub trait ApiSchema {
     fn schema_name() -> &'static str;
 }
 
+/// A compile-time registered API schema for contract and documentation export.
+pub struct ApiSchemaDefinition {
+    pub name: &'static str,
+    pub schema_fn: fn() -> Value,
+}
+
+inventory::collect!(ApiSchemaDefinition);
+
 // Built-in impls for common types
 
 impl ApiSchema for String {
