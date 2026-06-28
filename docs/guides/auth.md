@@ -514,7 +514,12 @@ remember_ttl_days = 30              # "remember me" duration
 ## Multi-Factor Authentication (TOTP)
 
 Foundry ships a first-party TOTP baseline with built-in handlers for enroll, confirm, verify,
-disable, and recovery-code rotation. Publish the framework migrations before turning it on:
+disable, and recovery-code rotation. TOTP uses RFC 6238-compatible HMAC-SHA1 so codes verify
+with mainstream authenticator apps. If you are upgrading from an older Foundry build that
+enrolled HMAC-SHA256 factors, those existing factors must be re-enrolled because their
+generated codes will change.
+
+Publish the framework migrations before turning it on:
 
 ```bash
 cargo run -- migrate:publish

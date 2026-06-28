@@ -24,6 +24,7 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 - Scheduler leadership state uses acquire/release atomic ordering, and dropping the scheduler or a schedule overlap-lock guard outside a Tokio runtime now logs a warning instead of silently leaving the lock to lapse via TTL.
 - Image dimension validation streams the upload from disk on the blocking thread pool instead of reading the entire file into memory on the async runtime.
 - Bodyless contract actions that still expose request metadata (for example path/query params on `GET`) no longer emit an OpenAPI `requestBody`, and generated SDK actions no longer require a payload argument that would be dropped at runtime.
+- Generated `FoundryEndpoint.applyServerErrors` now safely ignores malformed or non-object error payloads before reading `.errors`, so unusual transport/client errors no longer mask the original failure with a runtime crash.
 - Multipart `Validated<T>` extraction now removes framework-owned uploaded temp files when validation fails before the handler receives the DTO.
 - `#[derive(Validate)]` now generates multipart cleanup hooks for `UploadedFile`, `Option<UploadedFile>`, and `Vec<UploadedFile>` fields, and rejects unsupported nested upload wrappers with a clear derive error.
 - Datatable numeric filters now reject out-of-range `Int16`/`Int32` number values instead of wrapping them during downcast.
@@ -37,6 +38,7 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 - Datatable relation filters: model datatables can opt in to typed relation-backed filters with `Datatable::relation_filters()`, `DatatableRelationFilter`, and `DatatableRelationColumn`.
 - Datatable relation filter coverage for belongs-to, has-many, many-to-many, legacy hyphen aliases, and `LikeAny` search across declared relation columns.
 - Consumer-facing datatable request examples for direct filters, relation filters, legacy query params, and multi-column relation search.
+- Generated TypeScript files and `foundry-build` generated Rust registries now start with an explicit `DO NOT EDIT` warning that names the generator and says the file will be overwritten.
 - Release infrastructure: GitHub Actions CI, release-readiness workflow, release checklist, and local package dry-run verification.
 - Consumer documentation: root README, contributing guide, and a first-class plugin example.
 - WebSocket observability dashboard endpoints: `GET /_foundry/ws/channels`, `GET /_foundry/ws/presence/:channel`, `GET /_foundry/ws/history/:channel`, and `GET /_foundry/ws/stats`. History payloads are redacted by default; set `observability.websocket.include_payloads = true` to include them.

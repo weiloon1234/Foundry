@@ -274,7 +274,7 @@ max_blocking_threads = 0  # 0 = Tokio default blocking pool cap
 
 [jobs]
 queue = "default"              # default queue name
-max_retries = 5                # global retry limit
+max_retries = 5                # global total attempt limit (1 = no retry)
 poll_interval_ms = 100         # how often to check for jobs
 lease_ttl_ms = 30000           # lease duration before requeue
 max_concurrent_jobs = 0        # 0 = unlimited

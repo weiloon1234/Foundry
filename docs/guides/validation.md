@@ -97,7 +97,7 @@ validator
 
 | Rule | Code | Description |
 |------|------|-------------|
-| `.numeric()` | `numeric` | Must be a numeric string (digits, optional `.`, `-`, `+`) |
+| `.numeric()` | `numeric` | Must parse as a finite number; scientific notation is accepted, malformed numbers and `NaN`/infinity are rejected |
 | `.integer()` | `integer` | Must parse as a valid integer (`i64`) |
 | `.min_numeric(n)` | `min_numeric` | Parsed number must be at least `n` |
 | `.max_numeric(n)` | `max_numeric` | Parsed number must be at most `n` |
