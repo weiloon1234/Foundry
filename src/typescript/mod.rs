@@ -1434,6 +1434,13 @@ function routeUrlUntyped(name: RouteName, params: Record<string, RouteParamValue
   );
 }
 
+function objectField(value: unknown, field: string): unknown {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  return (value as Record<string, unknown>)[field];
+}
+
 function isEmptyValue(value: unknown): boolean {
   if (value === null || value === undefined) {
     return true;
@@ -1808,8 +1815,8 @@ export abstract class FoundryEndpoint<
   }
 
   private applyServerErrors(error: unknown): void {
-    const responseData = (error as { response?: { data?: unknown } }).response?.data;
-    const serverErrors = (responseData as { errors?: unknown }).errors;
+    const responseData = objectField(objectField(error, "response"), "data");
+    const serverErrors = objectField(responseData, "errors");
 
     if (!serverErrors || typeof serverErrors !== "object") {
       return;
@@ -4087,6 +4094,16 @@ mod tests {
         assert!(
             runtime.contains("validateForm"),
             "expected endpoint runtime validation helper:\n{runtime}"
+        );
+        assert!(
+            runtime.contains(
+                "const responseData = objectField(objectField(error, \"response\"), \"data\");"
+            ),
+            "expected endpoint runtime to guard non-object server error responses:\n{runtime}"
+        );
+        assert!(
+            runtime.contains("const serverErrors = objectField(responseData, \"errors\");"),
+            "expected endpoint runtime to guard missing validation error bags:\n{runtime}"
         );
 
         let helper = fs::read_to_string(dir.path().join("routes/UserPortalLogin.ts")).unwrap();
