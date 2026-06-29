@@ -43,6 +43,13 @@ impl HttpKernel {
         if let Some(options) = &self.observability {
             let obs_config = self.app.config().observability()?;
             if obs_config.enabled {
+                if options.is_public() && self.app.config().app()?.environment.is_production_like()
+                {
+                    tracing::warn!(
+                        base_path = %obs_config.base_path,
+                        "foundry: public observability diagnostics are enabled in a production-like environment"
+                    );
+                }
                 // Collect documented routes and publish OpenAPI spec
                 let documented = registrar.collect_documented_routes();
                 if !documented.is_empty() {

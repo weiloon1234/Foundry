@@ -713,28 +713,28 @@ impl AuthManager {
             )));
         };
 
-        let actor = match authenticator {
+        match authenticator {
             GuardAuthenticator::Bearer(bearer) => {
                 let token = self.extract_token(headers)?;
-                run_bearer_authenticator(&guard_id, bearer, &token)
+                let actor = run_bearer_authenticator(&guard_id, bearer, &token)
                     .await?
                     .ok_or_else(|| {
                         AuthError::unauthorized_code(AuthErrorCode::InvalidBearerToken)
-                    })?
+                    })?;
+                validate_actor_guard(actor, &guard_id, AuthErrorCode::InvalidBearerToken)
             }
             GuardAuthenticator::Session(session_manager) => {
                 let session_id = session_manager.extract_session_id(headers).ok_or_else(|| {
                     AuthError::unauthorized_code(AuthErrorCode::MissingSessionCookie)
                 })?;
-                session_manager
+                let actor = session_manager
                     .validate(&session_id)
                     .await
                     .map_err(|error| AuthError::internal(error.to_string()))?
-                    .ok_or_else(|| AuthError::unauthorized_code(AuthErrorCode::InvalidSession))?
+                    .ok_or_else(|| AuthError::unauthorized_code(AuthErrorCode::InvalidSession))?;
+                validate_actor_guard(actor, &guard_id, AuthErrorCode::InvalidSession)
             }
-        };
-
-        Ok(actor.with_guard(guard_id))
+        }
     }
 
     pub async fn authenticate_token(
@@ -758,7 +758,7 @@ impl AuthManager {
                         AuthErrorCode::InvalidBearerToken,
                     ));
                 };
-                Ok(actor.with_guard(guard_id))
+                validate_actor_guard(actor, &guard_id, AuthErrorCode::InvalidBearerToken)
             }
             GuardAuthenticator::Session(_) => Err(AuthError::internal(format!(
                 "guard `{guard_id}` uses session authentication; use a bearer token guard or authenticate via cookies instead"
@@ -846,6 +846,18 @@ impl Authorizer {
         };
 
         run_policy_evaluator(&policy, policy_handler, actor, &self.app).await
+    }
+}
+
+pub(crate) fn validate_actor_guard(
+    actor: Actor,
+    expected_guard: &GuardId,
+    code: AuthErrorCode,
+) -> std::result::Result<Actor, AuthError> {
+    if &actor.guard == expected_guard {
+        Ok(actor)
+    } else {
+        Err(AuthError::unauthorized_code(code))
     }
 }
 
@@ -1059,7 +1071,7 @@ mod tests {
     use axum::response::IntoResponse;
 
     use super::{
-        Actor, AuthConfig, AuthManager, AuthenticatableRegistryBuilder, Authorizer,
+        Actor, AuthConfig, AuthErrorCode, AuthManager, AuthenticatableRegistryBuilder, Authorizer,
         GuardRegistryBuilder, PermissionId, PolicyRegistryBuilder, StaticBearerAuthenticator,
     };
     use crate::config::ConfigRepository;
@@ -1148,7 +1160,7 @@ mod tests {
 
     #[tokio::test]
     async fn uses_default_guard_and_parses_bearer_header() {
-        let actor = Actor::new("user-1", GuardId::new("placeholder"));
+        let actor = Actor::new("user-1", GuardId::new("api"));
         let manager = AuthManager::new(
             AuthConfig::default(),
             HashMap::from([(
@@ -1165,6 +1177,41 @@ mod tests {
 
         assert_eq!(resolved.id, actor.id);
         assert_eq!(resolved.guard, GuardId::new("api"));
+    }
+
+    #[tokio::test]
+    async fn bearer_authentication_rejects_actor_guard_mismatch() {
+        let manager = AuthManager::new(
+            AuthConfig::default(),
+            HashMap::from([(
+                GuardId::new("admin"),
+                super::GuardAuthenticator::Bearer(Arc::new(
+                    StaticBearerAuthenticator::new()
+                        .token("user-token", Actor::new("user-1", GuardId::new("api"))),
+                )),
+            )]),
+        );
+
+        let error = manager
+            .authenticate_token("user-token", Some(&GuardId::new("admin")))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code(), Some(AuthErrorCode::InvalidBearerToken));
+    }
+
+    #[test]
+    fn session_guard_mismatch_uses_invalid_session_error() {
+        let error = super::validate_actor_guard(
+            Actor::new("user-1", GuardId::new("api")),
+            &GuardId::new("admin"),
+            AuthErrorCode::InvalidSession,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code(), Some(AuthErrorCode::InvalidSession));
     }
 
     #[tokio::test]

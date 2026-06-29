@@ -453,7 +453,7 @@ fn build_http_app(config_dir: &Path, probe: app::providers::ProbeBehavior) -> Ap
         .load_config_dir(config_dir)
         .register_provider(app::providers::HttpServiceProvider { probe })
         .register_routes(app::http::router)
-        .enable_observability()
+        .enable_public_observability()
 }
 
 fn build_websocket_app(config_dir: &Path) -> AppBuilder {
@@ -472,7 +472,7 @@ fn build_scheduler_app(config_dir: &Path) -> AppBuilder {
 #[tokio::test]
 async fn sql_observability_endpoint_exposes_typed_stats_contract() {
     let app = TestApp::builder()
-        .enable_observability()
+        .enable_public_observability()
         .build()
         .await
         .unwrap();
@@ -505,7 +505,7 @@ async fn observability_enabled_false_skips_foundry_routes() {
 
     let app = TestApp::builder()
         .load_config_dir(config_dir.path())
-        .enable_observability()
+        .enable_public_observability()
         .build()
         .await
         .unwrap();
@@ -528,7 +528,7 @@ async fn observability_capture_disabled_keeps_routes_with_empty_counters() {
 
     let app = TestApp::builder()
         .load_config_dir(config_dir.path())
-        .enable_observability()
+        .enable_public_observability()
         .build()
         .await
         .unwrap();
@@ -538,6 +538,38 @@ async fn observability_capture_disabled_keeps_routes_with_empty_counters() {
     let body: RuntimeSnapshot = response.json().unwrap();
     assert_eq!(body.http.requests_total, 0);
     assert_eq!(body.jobs.enqueued_total, 0);
+}
+
+#[tokio::test]
+async fn enable_observability_requires_auth_by_default() {
+    let config_dir = tempdir().unwrap();
+    write_http_config(
+        config_dir.path(),
+        free_port(),
+        &format!("observability-guarded-{}", free_port()),
+    );
+
+    let app = TestApp::builder()
+        .load_config_dir(config_dir.path())
+        .register_provider(app::providers::HttpServiceProvider {
+            probe: app::providers::ProbeBehavior::Healthy,
+        })
+        .enable_observability()
+        .build()
+        .await
+        .unwrap();
+
+    let unauthenticated = app.client().get("/_foundry/runtime").send().await.unwrap();
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let authenticated = app
+        .client()
+        .get("/_foundry/runtime")
+        .bearer_auth("viewer-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated.status(), reqwest::StatusCode::OK);
 }
 
 async fn wait_for_http_ready(base_url: &str) {
@@ -744,7 +776,7 @@ async fn jobs_observability_json_endpoints_have_typed_stable_contracts() {
 
     let app = TestApp::builder()
         .load_config_dir(config_dir.path())
-        .enable_observability()
+        .enable_public_observability()
         .build()
         .await
         .unwrap();

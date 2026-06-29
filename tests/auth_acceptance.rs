@@ -20,12 +20,14 @@ mod app {
         #[derive(Clone, Copy)]
         pub enum AuthGuard {
             Api,
+            Admin,
         }
 
         impl From<AuthGuard> for GuardId {
             fn from(value: AuthGuard) -> Self {
                 match value {
                     AuthGuard::Api => GuardId::new("api"),
+                    AuthGuard::Admin => GuardId::new("admin"),
                 }
             }
         }
@@ -73,6 +75,7 @@ mod app {
 
         pub const SECURE_CHAT_CHANNEL: ChannelId = ChannelId::new("secure_chat");
         pub const SECURE_PRESENCE_CHANNEL: ChannelId = ChannelId::new("secure_presence");
+        pub const ADMIN_ONLY_CHANNEL: ChannelId = ChannelId::new("admin_only");
         pub const ECHO_EVENT: ChannelEventId = ChannelEventId::new("echo");
     }
 
@@ -114,6 +117,13 @@ mod app {
                                     ids::Ability::WsChat,
                                 ]),
                         ),
+                )?;
+                registrar.register_guard(
+                    ids::AuthGuard::Admin,
+                    StaticBearerAuthenticator::new().token(
+                        "api-token-for-admin-guard",
+                        Actor::new("viewer-1", ids::AuthGuard::Api),
+                    ),
                 )?;
                 registrar.register_policy(ids::PolicyKey::IsAdmin, AdminPolicy)?;
                 Ok(())
@@ -193,6 +203,11 @@ mod app {
                     .presence(true)
                     .guard(ids::AuthGuard::Api)
                     .permission(ids::Ability::WsChat),
+            )?;
+            registrar.channel_with_options(
+                ids::ADMIN_ONLY_CHANNEL,
+                |_context: WebSocketContext, _payload: serde_json::Value| async move { Ok(()) },
+                WebSocketChannelOptions::new().guard(ids::AuthGuard::Admin),
             )?;
             Ok(())
         }
@@ -535,6 +550,51 @@ async fn guarded_websocket_channels_require_auth_and_permissions() {
     assert_eq!(echoed.event, app::ids::ECHO_EVENT);
     assert_eq!(echoed.payload["actor_id"], "viewer-1");
     assert_eq!(echoed.payload["body"], "hello");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn websocket_guard_only_channel_rejects_actor_from_different_guard() {
+    let config_dir = tempdir().unwrap();
+    let server_port = free_port();
+    let websocket_port = free_port();
+    write_auth_config(
+        config_dir.path(),
+        server_port,
+        websocket_port,
+        &format!("auth-ws-guard-mismatch-{websocket_port}"),
+    );
+
+    let server = tokio::spawn({
+        let builder = build_websocket_app(config_dir.path());
+        async move { builder.run_websocket_async().await.unwrap() }
+    });
+
+    let url = format!("ws://127.0.0.1:{websocket_port}/ws");
+    let mut socket = connect_websocket_with_token(&url, Some("api-token-for-admin-guard")).await;
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&ClientMessage {
+                action: ClientAction::Subscribe,
+                channel: app::ids::ADMIN_ONLY_CHANNEL,
+                room: None,
+                payload: None,
+                event: None,
+                ack_id: None,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let error = next_websocket_message(&mut socket).await;
+    assert_eq!(error.channel, SYSTEM_CHANNEL);
+    assert_eq!(error.event, ERROR_EVENT);
+    assert_eq!(error.payload["message"], "The bearer token is invalid.");
+    assert_eq!(error.payload["error_code"], "invalid_bearer_token");
+    assert_eq!(error.payload["message_key"], "auth.invalid_bearer_token");
 
     server.abort();
 }

@@ -52,7 +52,7 @@ async fn global_http_edge_config_applies_json_body_timeout_rejections_and_record
 
     let app = TestApp::builder()
         .load_config_dir(directory.path())
-        .enable_observability()
+        .enable_public_observability()
         .register_routes(edge_routes)
         .build()
         .await
@@ -119,7 +119,7 @@ async fn global_rate_limit_returns_json_429_and_records_observability() {
 
     let app = TestApp::builder()
         .load_config_dir(directory.path())
-        .enable_observability()
+        .enable_public_observability()
         .register_routes(edge_routes)
         .build()
         .await

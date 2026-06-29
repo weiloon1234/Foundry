@@ -38,6 +38,7 @@ struct AppBuilder
   fn register_error_reporter_instance( self, reporter: Arc<dyn ErrorReporter>, ) -> Self
   fn middleware_group( self, name: impl Into<String>, middlewares: Vec<MiddlewareConfig>, ) -> Self
   fn enable_observability(self) -> Self
+  fn enable_public_observability(self) -> Self
   fn enable_observability_with(self, options: ObservabilityOptions) -> Self
   fn run_http(self) -> Result<()>
   async fn run_http_async(self) -> Result<()>
@@ -134,4 +135,3 @@ trait ServiceProvider
   fn register<'life0, 'life1, 'async_trait>(
   fn boot<'life0, 'life1, 'async_trait>(
 ```
-

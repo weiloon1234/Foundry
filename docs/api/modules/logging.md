@@ -30,11 +30,14 @@ struct JobDeadLetteredReport
 struct LivenessReport
 struct ObservabilityOptions
   fn new() -> Self
+  fn public() -> Self
+  fn allow_public_access(self) -> Self
   fn guard<I>(self, guard: I) -> Self
   fn permission<I>(self, permission: I) -> Self
   fn permissions<I, P>(self, permissions: I) -> Self
   fn authorize<F, Fut>(self, f: F) -> Self
   fn access(&self) -> &AccessScope
+  fn is_public(&self) -> bool
 struct PanicReport
 struct ProbeResult
   fn healthy<I>(id: I) -> Self
@@ -86,4 +89,3 @@ fn init(config: &ConfigRepository) -> Result<()>
 - `ObservabilityConfig.enabled` controls `/_foundry/*` route registration; `capture_enabled` controls passive runtime capture while preserving route availability.
 - Runtime counters, HTTP samples, SQL slow queries, N+1 suspects, and WebSocket channel counters are bounded process memory and reset on restart.
 - `/_foundry/sql` returns slow-query stats, top-slowest ranking, and potential HTTP N+1 suspects while preserving the existing `slow_queries` key; SQL literals and comments are redacted by default.
-

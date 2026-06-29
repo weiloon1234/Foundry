@@ -126,6 +126,7 @@ fn register_validation_rule<I, R>(self, id: I, rule: R) -> Self
 fn register_middleware(self, config: MiddlewareConfig) -> Self
 fn middleware_group(self, name: &str, middlewares: Vec<MiddlewareConfig>) -> Self
 fn enable_observability(self) -> Self
+fn enable_public_observability(self) -> Self
 fn enable_observability_with(self, options: ObservabilityOptions) -> Self
 
 // Run (sync + async variants)
@@ -2258,11 +2259,18 @@ the persistent DB-backed observability store for job stats and failed jobs, prun
 
 ```rust
 fn new() -> Self
+fn public() -> Self
+fn allow_public_access(self) -> Self
 fn guard<I>(self, guard: I) -> Self
 fn permission<I>(self, permission: I) -> Self
 fn permissions<I, P>(self, permissions: I) -> Self
 fn access(&self) -> &AccessScope
+fn is_public(&self) -> bool
 ```
+
+`ObservabilityOptions::new()` is guarded by default using the app's default auth
+guard. Use `public()` / `allow_public_access()` only for deliberate public
+diagnostics, typically behind an external proxy or private network.
 
 ### Functions
 

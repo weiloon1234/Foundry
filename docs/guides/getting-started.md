@@ -65,7 +65,7 @@ double-underscore names, for example `DATABASE__URL`.
 ```rust
     .register_middleware(MiddlewareConfig::from(Compression))
     .middleware_group("api", vec![...])
-    .enable_observability()                  // health checks + OpenAPI
+    .enable_observability()                  // guarded health, diagnostics, and OpenAPI
     .serve_spa("frontend/dist")              // SPA fallback for client-side routing
 ```
 
@@ -404,6 +404,10 @@ pub fn builder() -> AppBuilder {
         .enable_observability()
 }
 ```
+
+`enable_observability()` protects `/_foundry/*` with the app's default auth guard.
+Use `enable_observability_with(...)` to require a specific guard/permission, or
+`enable_public_observability()` only when another layer already protects those routes.
 
 **src/bootstrap/cli.rs:**
 

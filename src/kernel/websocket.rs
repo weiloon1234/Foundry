@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
 
-use crate::auth::{Actor, AuthError, AuthErrorCode};
+use crate::auth::{validate_actor_guard, Actor, AuthError, AuthErrorCode};
 use crate::config::WebSocketConfig;
 use crate::foundation::{AppContext, Error, Result};
 use crate::logging::{
@@ -393,7 +393,15 @@ impl WebSocketServerState {
                 .map_err(|e| AuthError::internal(e.to_string()))
                 .inspect_err(|e| self.record_auth_outcome(auth_outcome_from_error(e)))?;
             match sessions.validate(&session_id).await {
-                Ok(Some(actor)) => actor.with_guard(guard_id.clone()),
+                Ok(Some(actor)) => {
+                    match validate_actor_guard(actor, &guard_id, AuthErrorCode::InvalidSession) {
+                        Ok(actor) => actor,
+                        Err(error) => {
+                            self.record_auth_outcome(auth_outcome_from_error(&error));
+                            return Err(error);
+                        }
+                    }
+                }
                 Ok(None) => {
                     let error = AuthError::unauthorized_code(AuthErrorCode::InvalidSession);
                     self.record_auth_outcome(auth_outcome_from_error(&error));

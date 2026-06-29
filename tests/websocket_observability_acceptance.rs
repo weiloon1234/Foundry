@@ -80,7 +80,7 @@ struct WebSocketChannelStatsContract {
 #[tokio::test]
 async fn ws_presence_endpoint_returns_members_for_presence_channel() {
     let app = TestApp::builder()
-        .enable_observability()
+        .enable_public_observability()
         .register_websocket_routes(|r| {
             r.channel_with_options(
                 ChannelId::new("team"),
@@ -116,7 +116,7 @@ async fn ws_presence_endpoint_returns_members_for_presence_channel() {
 #[tokio::test]
 async fn ws_presence_endpoint_returns_404_for_non_presence_channel() {
     let app = TestApp::builder()
-        .enable_observability()
+        .enable_public_observability()
         .register_websocket_routes(|r| {
             r.channel(ChannelId::new("public"), |_ctx, _payload| async { Ok(()) })?;
             Ok(())
@@ -137,7 +137,7 @@ async fn ws_presence_endpoint_returns_404_for_non_presence_channel() {
 #[tokio::test]
 async fn ws_presence_endpoint_returns_404_for_unregistered_channel() {
     let app = TestApp::builder()
-        .enable_observability()
+        .enable_public_observability()
         .register_websocket_routes(|_r| Ok(()))
         .build()
         .await
@@ -155,7 +155,7 @@ async fn ws_presence_endpoint_returns_404_for_unregistered_channel() {
 #[tokio::test]
 async fn ws_channels_endpoint_lists_registered_channels() {
     let app = TestApp::builder()
-        .enable_observability()
+        .enable_public_observability()
         .register_websocket_routes(|r| {
             r.channel_with_options(
                 ChannelId::new("chat"),
@@ -210,7 +210,7 @@ async fn ws_history_redacts_payloads_by_default() {
     use foundry::support::ChannelEventId;
 
     let app = TestApp::builder()
-        .enable_observability()
+        .enable_public_observability()
         .register_websocket_routes(|r| {
             r.channel(ChannelId::new("history-redact"), |_ctx, _payload| async {
                 Ok(())
@@ -270,7 +270,7 @@ include_payloads = true
 
     let app = TestApp::builder()
         .load_config_dir(tmp.path())
-        .enable_observability()
+        .enable_public_observability()
         .register_websocket_routes(|r| {
             r.channel(ChannelId::new("history-full"), |_ctx, _payload| async {
                 Ok(())
@@ -311,7 +311,7 @@ include_payloads = true
 #[tokio::test]
 async fn ws_history_returns_404_for_unregistered_channel() {
     let app = TestApp::builder()
-        .enable_observability()
+        .enable_public_observability()
         .register_websocket_routes(|_r| Ok(()))
         .build()
         .await
@@ -329,7 +329,7 @@ async fn ws_history_returns_404_for_unregistered_channel() {
 #[tokio::test]
 async fn ws_history_clamps_limit_to_buffer_size() {
     let app = TestApp::builder()
-        .enable_observability()
+        .enable_public_observability()
         .register_websocket_routes(|r| {
             r.channel(ChannelId::new("events"), |_ctx, _payload| async { Ok(()) })?;
             Ok(())
@@ -350,7 +350,7 @@ async fn ws_history_clamps_limit_to_buffer_size() {
 #[tokio::test]
 async fn ws_stats_exposes_global_and_per_channel_counters() {
     let app = TestApp::builder()
-        .enable_observability()
+        .enable_public_observability()
         .register_websocket_routes(|r| {
             r.channel(ChannelId::new("alpha"), |_ctx, _payload| async { Ok(()) })?;
             r.channel(ChannelId::new("idle"), |_ctx, _payload| async { Ok(()) })?;

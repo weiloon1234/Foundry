@@ -8,7 +8,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use super::metrics;
-use crate::auth::AccessScope;
+use crate::auth::{AccessScope, GuardedAccess};
 use crate::config::ObservabilityConfig;
 use crate::database::{DbValue, Expr, OrderBy, Query, Sql};
 use crate::foundation::{AppContext, Error, Result};
@@ -18,10 +18,18 @@ use crate::http::{
 use crate::openapi::spec::{generate_openapi_spec, DocumentedRoute};
 use crate::support::{GuardId, PermissionId};
 
-#[derive(Default)]
 pub struct ObservabilityOptions {
     access: AccessScope,
     authorize: Option<crate::http::HttpAuthorizeCallback>,
+}
+
+impl Default for ObservabilityOptions {
+    fn default() -> Self {
+        Self {
+            access: AccessScope::Guarded(GuardedAccess::default()),
+            authorize: None,
+        }
+    }
 }
 
 impl Clone for ObservabilityOptions {
@@ -59,9 +67,27 @@ impl ObservabilityOptions {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Build observability options that intentionally expose diagnostics without auth.
+    ///
+    /// Prefer [`ObservabilityOptions::new`] plus guard/permission configuration for
+    /// production dashboards. This constructor is for local development,
+    /// private networks, tests, or deployments that protect `/_foundry/*`
+    /// outside the application.
+    pub fn public() -> Self {
+        Self {
+            access: AccessScope::Public,
+            authorize: None,
+        }
+    }
 }
 
 impl ObservabilityOptions {
+    pub fn allow_public_access(mut self) -> Self {
+        self.access = AccessScope::Public;
+        self
+    }
+
     pub fn guard<I>(mut self, guard: I) -> Self
     where
         I: Into<GuardId>,
@@ -102,6 +128,10 @@ impl ObservabilityOptions {
 
     pub fn access(&self) -> &AccessScope {
         &self.access
+    }
+
+    pub fn is_public(&self) -> bool {
+        matches!(self.access, AccessScope::Public)
     }
 
     pub(crate) fn http_route_options(&self) -> HttpRouteOptions {

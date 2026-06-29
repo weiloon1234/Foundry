@@ -125,6 +125,11 @@ impl TestAppBuilder {
         self
     }
 
+    pub fn enable_public_observability(mut self) -> Self {
+        self.inner = self.inner.enable_public_observability();
+        self
+    }
+
     pub fn enable_observability_with(
         mut self,
         options: crate::logging::ObservabilityOptions,

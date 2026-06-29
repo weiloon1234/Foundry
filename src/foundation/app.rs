@@ -846,6 +846,11 @@ impl AppBuilder {
         self
     }
 
+    pub fn enable_public_observability(mut self) -> Self {
+        self.observability = Some(ObservabilityOptions::public());
+        self
+    }
+
     pub fn enable_observability_with(mut self, options: ObservabilityOptions) -> Self {
         self.observability = Some(options);
         self

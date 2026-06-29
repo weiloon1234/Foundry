@@ -68,6 +68,6 @@ fn main() -> Result<()> {
         .load_config_dir("config")
         .register_provider(app::providers::AppServiceProvider)
         .register_routes(app::portals::router)
-        .enable_observability()
+        .enable_public_observability()
         .run_http()
 }

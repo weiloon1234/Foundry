@@ -8,6 +8,8 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 
 ### Security
 
+- Auth now rejects actors whose stored guard does not match the requested guard instead of retagging them, preventing a user token/session from satisfying guard-only admin routes or WebSocket channels.
+- `enable_observability()` now protects `/_foundry/*` with the app's default auth guard by default; public diagnostics require the explicit `enable_public_observability()` / `ObservabilityOptions::public()` opt-in, and production-like public registration logs a warning.
 - TOTP MFA now uses HMAC-SHA1 per RFC 6238 so codes verify against mainstream authenticator apps (Google Authenticator, Authy, 1Password, etc.), which ignore the otpauth `algorithm` parameter and always compute SHA1. **TOTP factors enrolled on previous builds generate different codes and must be re-enrolled.**
 - `min_numeric`, `max_numeric`, and `between` validation rules now reject values that fail to parse as a number, as well as `NaN` and infinities; previously non-numeric input (including `"NaN"`, which defeats all numeric comparisons) silently passed bound checks. The `numeric` rule is now parse-based: malformed shapes like `"1.2.3"` are rejected, and scientific notation such as `"1e10"` is accepted.
 - The Postgres compiler now validates `EXTRACT` field names against the known date/time fields and restricts `Sql::op` custom operators to legal operator characters, closing a raw-SQL interpolation path if either was ever fed untrusted input.
