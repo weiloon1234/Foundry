@@ -74,11 +74,7 @@ async fn acquire_scheduler_leadership_redis(
     owner_id: &str,
     ttl: Duration,
 ) -> Result<bool> {
-    let mut conn = runtime
-        .client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(Error::other)?;
+    let mut conn = runtime.connection().await?;
     let result: Option<String> = ::redis::cmd("SET")
         .arg(leadership_key(runtime))
         .arg(owner_id)
@@ -96,11 +92,7 @@ async fn renew_scheduler_leadership_redis(
     owner_id: &str,
     ttl: Duration,
 ) -> Result<bool> {
-    let mut conn = runtime
-        .client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(Error::other)?;
+    let mut conn = runtime.connection().await?;
     let renewed: i64 = ::redis::cmd("EVAL")
         .arg(RENEW_LEADERSHIP_SCRIPT)
         .arg(1)
@@ -114,11 +106,7 @@ async fn renew_scheduler_leadership_redis(
 }
 
 async fn release_scheduler_leadership_redis(runtime: &RedisRuntime, owner_id: &str) -> Result<()> {
-    let mut conn = runtime
-        .client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(Error::other)?;
+    let mut conn = runtime.connection().await?;
     let _: i64 = ::redis::cmd("EVAL")
         .arg(RELEASE_LEADERSHIP_SCRIPT)
         .arg(1)

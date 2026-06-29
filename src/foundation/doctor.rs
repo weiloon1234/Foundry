@@ -256,7 +256,14 @@ async fn check_database(app: &AppContext) -> DoctorCheck {
     }
 
     match database.ping().await {
-        Ok(()) => DoctorCheck::ok("database", "database ping succeeded"),
+        Ok(()) => {
+            let target = if database.has_read_pool() {
+                "primary and read replica"
+            } else {
+                "primary"
+            };
+            DoctorCheck::ok("database", format!("database ping succeeded for {target}"))
+        }
         Err(error) => DoctorCheck::failed("database", error.to_string()),
     }
 }

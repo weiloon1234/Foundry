@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
+use ::redis::aio::MultiplexedConnection;
 use ::redis::AsyncCommands;
 use futures_util::StreamExt;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, OnceCell};
 use tokio::task::JoinHandle;
 
 use crate::config::ConfigRepository;
@@ -83,10 +84,10 @@ impl RuntimeBackend {
             return Ok(Self::Memory(shared_memory_runtime(&redis.namespace)));
         }
 
-        Ok(Self::Redis(RedisRuntime {
-            client: ::redis::Client::open(redis.url.as_str()).map_err(Error::other)?,
-            namespace: redis.namespace,
-        }))
+        Ok(Self::Redis(RedisRuntime::new(
+            ::redis::Client::open(redis.url.as_str()).map_err(Error::other)?,
+            redis.namespace,
+        )))
     }
 
     pub fn kind(&self) -> RuntimeBackendKind {
@@ -128,11 +129,7 @@ impl RuntimeBackend {
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 // Atomic INCR + conditional EXPIRE via Lua to prevent
                 // leaked keys if the process crashes between the two commands
                 let count: i64 = ::redis::cmd("EVAL")
@@ -173,11 +170,7 @@ impl RuntimeBackend {
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let _: () = conn.sadd(full_key, member).await.map_err(Error::other)?;
                 Ok(())
             }
@@ -196,11 +189,7 @@ impl RuntimeBackend {
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let _: () = conn.srem(full_key, member).await.map_err(Error::other)?;
                 Ok(())
             }
@@ -222,11 +211,7 @@ impl RuntimeBackend {
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let members: Vec<String> = conn.smembers(full_key).await.map_err(Error::other)?;
                 Ok(members)
             }
@@ -245,11 +230,7 @@ impl RuntimeBackend {
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let count: usize = conn.scard(full_key).await.map_err(Error::other)?;
                 Ok(count)
             }
@@ -268,11 +249,7 @@ impl RuntimeBackend {
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let exists: bool = ::redis::cmd("EXISTS")
                     .arg(&full_key)
                     .query_async(&mut conn)
@@ -298,11 +275,7 @@ impl RuntimeBackend {
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let deleted: i64 = ::redis::cmd("DEL")
                     .arg(&full_key)
                     .query_async(&mut conn)
@@ -323,11 +296,7 @@ impl RuntimeBackend {
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let value: Option<String> = ::redis::cmd("GET")
                     .arg(&full_key)
                     .query_async(&mut conn)
@@ -358,11 +327,7 @@ impl RuntimeBackend {
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let result: Option<String> = ::redis::cmd("SET")
                     .arg(&full_key)
                     .arg(value)
@@ -399,11 +364,7 @@ impl RuntimeBackend {
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let _: () = ::redis::cmd("SET")
                     .arg(&full_key)
                     .arg(value)
@@ -431,11 +392,7 @@ impl RuntimeBackend {
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let deleted: i64 = ::redis::cmd("EVAL")
                     .arg(
                         r#"
@@ -479,11 +436,7 @@ return 0
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let extended: i64 = ::redis::cmd("EVAL")
                     .arg(
                         r#"
@@ -530,11 +483,7 @@ return 0
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let _: () = conn.lpush(&full_key, value).await.map_err(Error::other)?;
                 let _: () = conn
                     .ltrim(&full_key, 0, max_len as isize - 1)
@@ -563,11 +512,7 @@ return 0
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let _: bool = conn
                     .expire(&full_key, ttl_seconds as i64)
                     .await
@@ -588,11 +533,7 @@ return 0
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let seconds: i64 = conn.ttl(&full_key).await.map_err(Error::other)?;
                 if seconds < 0 {
                     Ok(None)
@@ -614,11 +555,7 @@ return 0
         match self {
             Self::Redis(runtime) => {
                 let full_key = runtime.namespaced_key(key);
-                let mut conn = runtime
-                    .client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)?;
+                let mut conn = runtime.connection().await?;
                 let values: Vec<String> = conn
                     .lrange(&full_key, start as isize, stop as isize)
                     .await
@@ -654,11 +591,20 @@ return 0
 
 #[derive(Clone)]
 pub(crate) struct RedisRuntime {
-    pub(crate) client: ::redis::Client,
+    pub(crate) client: Arc<::redis::Client>,
     pub(crate) namespace: String,
+    cached_connection: Arc<OnceCell<MultiplexedConnection>>,
 }
 
 impl RedisRuntime {
+    pub(crate) fn new(client: ::redis::Client, namespace: String) -> Self {
+        Self {
+            client: Arc::new(client),
+            namespace,
+            cached_connection: Arc::new(OnceCell::new()),
+        }
+    }
+
     fn websocket_topic(&self, topic: &str) -> String {
         namespaced_value(&self.namespace, &format!("ws:{topic}"))
     }
@@ -668,12 +614,22 @@ impl RedisRuntime {
         namespaced_value(&self.namespace, suffix)
     }
 
+    pub(crate) async fn connection(&self) -> Result<MultiplexedConnection> {
+        let conn = self
+            .cached_connection
+            .get_or_try_init(|| async {
+                self.client
+                    .get_multiplexed_async_connection()
+                    .await
+                    .map_err(Error::other)
+            })
+            .await?;
+
+        Ok(conn.clone())
+    }
+
     async fn ping(&self) -> Result<()> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(Error::other)?;
+        let mut conn = self.connection().await?;
         let _: String = ::redis::cmd("PING")
             .query_async(&mut conn)
             .await
@@ -682,11 +638,7 @@ impl RedisRuntime {
     }
 
     async fn publish_ws(&self, topic: &str, payload: &str) -> Result<()> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(Error::other)?;
+        let mut conn = self.connection().await?;
         let redis_topic = self.websocket_topic(topic);
         let _: () = conn
             .publish(redis_topic, payload)

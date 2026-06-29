@@ -210,8 +210,14 @@ conn.publish(&foreign_channel, "ping").await?;
 # config/redis.toml
 [redis]
 url = "redis://127.0.0.1/"
+# url = "rediss://default:secret@redis.example.com:6379/"  # TLS Redis / serverless Redis
 # namespace = "my-app"    # auto-derived from app.name:app.environment if not set
 ```
+
+Foundry enables Tokio + rustls Redis support, so TLS `rediss://` endpoints work for providers
+that require encrypted Redis connections. `RedisManager` and the internal runtime backend reuse
+multiplexed Redis connections for ordinary commands to avoid connection churn; pub/sub uses its
+own subscription connection.
 
 ---
 

@@ -481,6 +481,10 @@ Environment variables override config using double-underscore notation:
 DATABASE__URL=postgres://... SERVER__PORT=8080 cargo run
 ```
 
+Database config supports primary/read endpoints (`DATABASE__URL` and `DATABASE__READ_URL`),
+per-pool overrides (`DATABASE__WRITE_POOL__MAX_CONNECTIONS`, `DATABASE__READ_POOL__MAX_CONNECTIONS`),
+and lazy pools (`DATABASE__CONNECT_LAZY=true`) for serverless Postgres or provider poolers.
+
 ## Redis
 
 ```rust
@@ -498,6 +502,8 @@ All keys are automatically namespaced. For cross-app access:
 ```rust
 let foreign_key = redis.key_in_namespace("analytics:prod", "daily:users");
 ```
+
+Redis config accepts both `redis://` and TLS `rediss://` endpoints.
 
 ## Service Providers
 

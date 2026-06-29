@@ -466,6 +466,65 @@ const DATABASE_FIELDS: &[PublishedField] = &[
         false,
         Some("Recycle connections after 30 min"),
     ),
+    field(
+        "connect_lazy",
+        "false",
+        "false",
+        false,
+        false,
+        Some("Create pools without opening a DB socket until first use"),
+    ),
+];
+
+const DATABASE_POOL_FIELDS: &[PublishedField] = &[
+    field(
+        "min_connections",
+        "0",
+        "0",
+        false,
+        false,
+        Some("Override database.min_connections for this pool"),
+    ),
+    field(
+        "max_connections",
+        "5",
+        "5",
+        false,
+        false,
+        Some("Override database.max_connections for this pool"),
+    ),
+    field(
+        "acquire_timeout_ms",
+        "5000",
+        "5000",
+        false,
+        false,
+        Some("Override database.acquire_timeout_ms for this pool"),
+    ),
+    field(
+        "idle_timeout_seconds",
+        "60",
+        "60",
+        false,
+        false,
+        Some("Override database.idle_timeout_seconds for this pool"),
+    ),
+    field(
+        "max_lifetime_seconds",
+        "300",
+        "300",
+        false,
+        false,
+        Some("Override database.max_lifetime_seconds for this pool"),
+    ),
+    field(
+        "connect_lazy",
+        "true",
+        "true",
+        false,
+        false,
+        Some("Override database.connect_lazy for this pool"),
+    ),
 ];
 
 const DATABASE_MODEL_FIELDS: &[PublishedField] = &[
@@ -1267,6 +1326,18 @@ const PUBLISHED_SECTIONS: &[PublishedSection] = &[
         "Database (PostgreSQL)",
         &[
             table(&["database"], None, false, DATABASE_FIELDS),
+            table(
+                &["database", "write_pool"],
+                Some("Database Write Pool Overrides"),
+                true,
+                DATABASE_POOL_FIELDS,
+            ),
+            table(
+                &["database", "read_pool"],
+                Some("Database Read Pool Overrides"),
+                true,
+                DATABASE_POOL_FIELDS,
+            ),
             table(
                 &["database", "models"],
                 Some("Database Model Defaults"),

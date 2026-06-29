@@ -167,12 +167,7 @@ impl Error {
 
 /// The standard JSON error response body.
 #[derive(
-    Debug,
-    Serialize,
-    serde::Deserialize,
-    ts_rs::TS,
-    foundry_macros::TS,
-    foundry_macros::ApiSchema,
+    Debug, Serialize, serde::Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
 )]
 pub struct ErrorResponse {
     pub message: String,

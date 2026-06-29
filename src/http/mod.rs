@@ -1098,7 +1098,13 @@ impl HttpRegistrar {
         H: Handler<T, AppContext>,
         T: 'static,
     {
-        self.register_method_route(name, path, axum::routing::patch(handler), "patch", configure)
+        self.register_method_route(
+            name,
+            path,
+            axum::routing::patch(handler),
+            "patch",
+            configure,
+        )
     }
 
     pub fn delete<I, H, T>(
@@ -1113,7 +1119,13 @@ impl HttpRegistrar {
         H: Handler<T, AppContext>,
         T: 'static,
     {
-        self.register_method_route(name, path, axum::routing::delete(handler), "delete", configure)
+        self.register_method_route(
+            name,
+            path,
+            axum::routing::delete(handler),
+            "delete",
+            configure,
+        )
     }
 
     pub fn scope(
@@ -1161,7 +1173,13 @@ impl HttpRegistrar {
             return self;
         }
 
-        self.route_named_resolved(name.into(), path, Some(method), method_router, route.finish());
+        self.route_named_resolved(
+            name.into(),
+            path,
+            Some(method),
+            method_router,
+            route.finish(),
+        );
         self
     }
 

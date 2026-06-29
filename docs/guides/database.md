@@ -1002,6 +1002,9 @@ url = "postgres://foundry:secret@127.0.0.1:5432/foundry"
 # min_connections = 1
 # max_connections = 10
 # acquire_timeout_ms = 5000
+# idle_timeout_seconds = 600
+# max_lifetime_seconds = 1800
+# connect_lazy = false             # create the pool without opening a socket until first use
 # log_queries = false              # log SQL shape to tracing
 # log_query_bindings = false       # include binding values when log_queries=true (dev only)
 # redact_sql_literals = true       # redact SQL literals/comments in logs and /_foundry/sql
@@ -1011,10 +1014,63 @@ url = "postgres://foundry:secret@127.0.0.1:5432/foundry"
 # n_plus_one_min_repeats = 10      # minimum repeats before retaining a suspect
 # n_plus_one_retention = 100       # retained N+1 suspect entries
 
+# Optional per-pool overrides. Omitted fields inherit from [database].
+# [database.write_pool]
+# min_connections = 0
+# max_connections = 5
+# connect_lazy = true
+
+# [database.read_pool]
+# min_connections = 0
+# max_connections = 10
+# acquire_timeout_ms = 3000
+# idle_timeout_seconds = 60
+# max_lifetime_seconds = 300
+# connect_lazy = true
+
 [database.models]
 # timestamps_default = true        # auto-manage created_at/updated_at
 # soft_deletes_default = false      # auto-manage deleted_at
 ```
+
+### Read/Write Endpoints
+
+When `read_url` is set, normal `SELECT`/stream queries use the read pool and all writes,
+transactions, migrations, and seeders use the primary `url` pool. Reads that must observe a
+just-committed write should stay inside the transaction or force primary:
+
+```rust
+let user = User::model_query()
+    .where_(User::EMAIL.eq(email))
+    .use_write_pool()
+    .first(&*db)
+    .await?;
+```
+
+`DatabaseManager::ping()` checks the primary and the read replica when `read_url` is configured.
+Use `ping_write()` or `ping_read()` for targeted diagnostics.
+
+### Serverless Pooling
+
+For serverless Postgres or provider poolers, prefer low per-process limits and lazy pools:
+
+```toml
+[database]
+url = "postgres://primary.example/app?sslmode=require"
+read_url = "postgres://replica.example/app?sslmode=require"
+min_connections = 0
+max_connections = 5
+connect_lazy = true
+idle_timeout_seconds = 60
+max_lifetime_seconds = 300
+
+[database.read_pool]
+max_connections = 10
+```
+
+Total possible DB sockets are roughly `instances * (write_pool.max_connections + read_pool.max_connections)`.
+Keep that below the database or pooler limit across HTTP, worker, scheduler, and WebSocket
+processes.
 
 `GET /_foundry/sql` exposes retained slow queries, a top-slowest ranking, and potential HTTP
 N+1 query suspects. N+1 detection groups repeated SQL fingerprints inside a single HTTP

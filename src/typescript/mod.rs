@@ -757,8 +757,16 @@ fn render_i18n_manifest(manifest: Option<&I18nTypeScriptManifest>) -> Result<Str
             format!(
                 "  {{ locale: {}, default: {}, fallback: {} }}",
                 json_string(locale),
-                if locale == default_locale { "true" } else { "false" },
-                if locale == fallback_locale { "true" } else { "false" },
+                if locale == default_locale {
+                    "true"
+                } else {
+                    "false"
+                },
+                if locale == fallback_locale {
+                    "true"
+                } else {
+                    "false"
+                },
             )
         })
         .collect::<Vec<_>>();
@@ -829,16 +837,11 @@ fn render_datatable_manifest(ids: &[String]) -> Result<String> {
 
     let mut groups = BTreeMap::<String, Vec<(String, String)>>::new();
     for id in &ids {
-        let (group, name) = id
-            .split_once('.')
-            .map(|(group, name)| (group, name))
-            .unwrap_or(("app", id.as_str()));
+        let (group, name) = id.split_once('.').unwrap_or(("app", id.as_str()));
         let group_property =
             to_camel_case_identifier_with_context(group, "Datatable ID group TypeScript export")?;
-        let name_property = to_camel_case_identifier_with_context(
-            name,
-            "Datatable ID TypeScript export",
-        )?;
+        let name_property =
+            to_camel_case_identifier_with_context(name, "Datatable ID TypeScript export")?;
         groups
             .entry(group_property)
             .or_default()
@@ -963,10 +966,8 @@ fn render_websocket_manifest(
     let channel_ids = channels
         .iter()
         .map(|channel| {
-            let property = to_lower_camel_case_identifier(
-                &channel.id,
-                "WebSocket channel TypeScript export",
-            )?;
+            let property =
+                to_lower_camel_case_identifier(&channel.id, "WebSocket channel TypeScript export")?;
             Ok(format!("  {property}: {},", json_string(&channel.id)))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2664,11 +2665,7 @@ fn schema_json_to_ts_type(
         return name;
     }
 
-    if schema_json
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        == Some("array")
-    {
+    if schema_json.get("type").and_then(serde_json::Value::as_str) == Some("array") {
         let item_type = schema_json
             .get("items")
             .map(|items| schema_json_to_ts_type(items, schema_exports, exported_types, imports))
@@ -2676,11 +2673,7 @@ fn schema_json_to_ts_type(
         return format!("{item_type}[]");
     }
 
-    if schema_json
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        == Some("object")
-    {
+    if schema_json.get("type").and_then(serde_json::Value::as_str) == Some("object") {
         let Some(properties) = schema_json
             .get("properties")
             .and_then(serde_json::Value::as_object)
@@ -2705,8 +2698,12 @@ fn schema_json_to_ts_type(
                 } else {
                     "?"
                 };
-                let field_type =
-                    schema_json_to_ts_type(property_schema, schema_exports, exported_types, imports);
+                let field_type = schema_json_to_ts_type(
+                    property_schema,
+                    schema_exports,
+                    exported_types,
+                    imports,
+                );
                 format!("{}{}: {}", json_string(name), optional, field_type)
             })
             .collect::<Vec<_>>();
@@ -4202,7 +4199,8 @@ mod tests {
 
         let sdk_client = fs::read_to_string(dir.path().join("FoundryClient.ts")).unwrap();
         assert!(
-            sdk_client.contains("userPortalLogin: createUserPortalLoginAction(transport, defaults)"),
+            sdk_client
+                .contains("userPortalLogin: createUserPortalLoginAction(transport, defaults)"),
             "expected SDK client business action:\n{sdk_client}"
         );
 

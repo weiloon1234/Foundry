@@ -417,11 +417,7 @@ async fn enqueue_job_redis(
     token: &str,
     payload: &str,
 ) -> Result<()> {
-    let mut conn = runtime
-        .client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(Error::other)?;
+    let mut conn = runtime.connection().await?;
     let _: () = ::redis::pipe()
         .atomic()
         .cmd("HSET")
@@ -446,11 +442,7 @@ async fn schedule_job_redis(
     payload: &str,
     run_at_millis: i64,
 ) -> Result<()> {
-    let mut conn = runtime
-        .client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(Error::other)?;
+    let mut conn = runtime.connection().await?;
     let _: () = ::redis::pipe()
         .atomic()
         .cmd("HSET")
@@ -481,11 +473,7 @@ async fn promote_due_jobs_redis(
             break;
         }
 
-        let mut conn = runtime
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(Error::other)?;
+        let mut conn = runtime.connection().await?;
         let count: i64 = ::redis::cmd("EVAL")
             .arg(PROMOTE_DUE_SCRIPT)
             .arg(3)
@@ -515,11 +503,7 @@ async fn requeue_expired_jobs_redis(
             break;
         }
 
-        let mut conn = runtime
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(Error::other)?;
+        let mut conn = runtime.connection().await?;
         let count: i64 = ::redis::cmd("EVAL")
             .arg(REQUEUE_EXPIRED_SCRIPT)
             .arg(3)
@@ -544,11 +528,7 @@ async fn claim_job_redis(
 ) -> Result<Option<ClaimedJobLease>> {
     let lease_expires_at = expires_at(lease_ttl);
     for queue in queues {
-        let mut conn = runtime
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(Error::other)?;
+        let mut conn = runtime.connection().await?;
         let result: Option<Vec<String>> = ::redis::cmd("EVAL")
             .arg(CLAIM_JOB_SCRIPT)
             .arg(3)
@@ -581,11 +561,7 @@ async fn renew_job_lease_redis(
     token: &str,
     lease_ttl: Duration,
 ) -> Result<bool> {
-    let mut conn = runtime
-        .client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(Error::other)?;
+    let mut conn = runtime.connection().await?;
     let renewed: i64 = ::redis::cmd("EVAL")
         .arg(RENEW_LEASE_SCRIPT)
         .arg(1)
@@ -606,11 +582,7 @@ async fn retry_job_redis(
     payload: &str,
     run_at_millis: i64,
 ) -> Result<bool> {
-    let mut conn = runtime
-        .client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(Error::other)?;
+    let mut conn = runtime.connection().await?;
     let rescheduled: i64 = ::redis::cmd("EVAL")
         .arg(RETRY_JOB_SCRIPT)
         .arg(3)
@@ -633,11 +605,7 @@ async fn dead_letter_job_redis(
     token: &str,
     payload: &str,
 ) -> Result<bool> {
-    let mut conn = runtime
-        .client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(Error::other)?;
+    let mut conn = runtime.connection().await?;
     let dead_lettered: i64 = ::redis::cmd("EVAL")
         .arg(DEAD_LETTER_JOB_SCRIPT)
         .arg(3)
@@ -677,11 +645,7 @@ async fn complete_successful_job_redis(
     let batch_id = effects.batch_id.as_deref().unwrap_or("");
     let batch_callback_token = effects.batch_callback_token.as_deref().unwrap_or("");
 
-    let mut conn = runtime
-        .client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(Error::other)?;
+    let mut conn = runtime.connection().await?;
     let result: Vec<i64> = ::redis::cmd("EVAL")
         .arg(COMPLETE_SUCCESSFUL_JOB_SCRIPT)
         .arg(2)
@@ -1096,11 +1060,7 @@ async fn dispatch_batch_redis(
     jobs: Vec<JobToEnqueue>,
 ) -> Result<usize> {
     let job_count = jobs.len();
-    let mut conn = runtime
-        .client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(Error::other)?;
+    let mut conn = runtime.connection().await?;
     let mut command = ::redis::cmd("EVAL");
     command
         .arg(DISPATCH_BATCH_SCRIPT)
@@ -1204,7 +1164,7 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_micros()
         );
-        let backend = RuntimeBackend::Redis(RedisRuntime { client, namespace });
+        let backend = RuntimeBackend::Redis(RedisRuntime::new(client, namespace));
         if let Err(error) = redis_ping(&backend).await {
             eprintln!("skipping redis backend test `{test_name}`: {error}");
             return None;

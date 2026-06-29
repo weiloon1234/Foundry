@@ -1566,8 +1566,7 @@ fn generate_from_multipart_impl(
             }
         } else if fi.is_vec {
             // Vec<T>: collect repeated text fields in request order
-            let inner_ty = vec_inner_type(&fi.ty)
-                .expect("Vec fields should expose an inner type");
+            let inner_ty = vec_inner_type(&fi.ty).expect("Vec fields should expose an inner type");
 
             var_decls.push(quote! {
                 let mut #var_name: Vec<String> = Vec::new();

@@ -651,13 +651,7 @@ pub(crate) struct RegisteredChannel {
 /// Emitted by the `/_foundry/ws/channels` dashboard endpoint and returned
 /// from [`AppContext::websocket_channels`](crate::foundation::AppContext::websocket_channels).
 #[derive(
-    Debug,
-    Clone,
-    Serialize,
-    Deserialize,
-    ts_rs::TS,
-    foundry_macros::TS,
-    foundry_macros::ApiSchema,
+    Debug, Clone, Serialize, Deserialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
 )]
 pub struct WebSocketChannelDescriptor {
     pub id: ChannelId,
@@ -676,7 +670,10 @@ impl From<&RegisteredChannel> for WebSocketChannelDescriptor {
         let event_descriptor =
             |contract: &WebSocketChannelEventContract| WebSocketChannelEventDescriptor {
                 event: contract.event.clone(),
-                payload: contract.payload.as_ref().map(|schema| schema.name.to_string()),
+                payload: contract
+                    .payload
+                    .as_ref()
+                    .map(|schema| schema.name.to_string()),
             };
 
         Self {

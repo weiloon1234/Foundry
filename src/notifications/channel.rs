@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use crate::foundation::{AppContext, Result};
 
 use super::{
-    callback, store_database_notification, Notifiable, Notification, NOTIFICATION_BROADCAST_CHANNEL,
-    NOTIFICATION_BROADCAST_EVENT,
+    callback, store_database_notification, Notifiable, Notification,
+    NOTIFICATION_BROADCAST_CHANNEL, NOTIFICATION_BROADCAST_EVENT,
 };
 
 /// Adapter trait for notification delivery channels.

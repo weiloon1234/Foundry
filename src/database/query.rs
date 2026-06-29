@@ -46,9 +46,7 @@ const fn default_per_page() -> u64 {
     15
 }
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pagination {
     #[serde(default = "default_page")]
     pub page: u64,
@@ -159,9 +157,7 @@ where
     }
 }
 
-#[derive(
-    Clone, Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
-)]
+#[derive(Clone, Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 pub struct PaginationMeta {
     #[ts(type = "number")]
     pub current_page: u64,
@@ -173,9 +169,7 @@ pub struct PaginationMeta {
     pub last_page: u64,
 }
 
-#[derive(
-    Clone, Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema,
-)]
+#[derive(Clone, Debug, Serialize, ts_rs::TS, foundry_macros::TS, foundry_macros::ApiSchema)]
 pub struct PaginationLinks {
     pub next: Option<String>,
     pub prev: Option<String>,

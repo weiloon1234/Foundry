@@ -128,9 +128,12 @@ struct DatabaseManager
   fn disabled() -> Self
   async fn from_config(config: &DatabaseConfig) -> Result<Self>
   fn is_configured(&self) -> bool
+  fn has_read_pool(&self) -> bool
   fn pool(&self) -> Result<&PgPool>
   fn register_type_adapter( &self, postgres_type_name: impl Into<String>, db_type: DbType, ) -> Result<()>
   fn registered_type_adapter( &self, postgres_type_name: &str, ) -> Result<Option<DbType>>
+  async fn ping_write(&self) -> Result<()>
+  async fn ping_read(&self) -> Result<()>
   async fn ping(&self) -> Result<()>
   async fn begin(&self) -> Result<DatabaseTransaction>
   async fn raw_query( &self, sql: &str, bindings: &[DbValue], ) -> Result<Vec<DbRecord>>
@@ -783,4 +786,3 @@ fn has_many<From, To, Key>( local_key: Column<From, Key>, foreign_key: Column<To
 fn has_one<From, To, Key>( local_key: Column<From, Key>, foreign_key: Column<To, Key>, parent_key: fn(&From) -> Key, attach: fn(&mut From, Option<To>), ) -> RelationDef<From, To>
 fn many_to_many<From, To, Pivot, LocalKey, TargetKey>( local_key: Column<From, LocalKey>, pivot_table: &'static str, pivot_local_key: &'static str, pivot_related_key: &'static str, target_key: Column<To, TargetKey>, parent_key: fn(&From) -> LocalKey, attach: fn(&mut From, Vec<To>), ) -> ManyToManyDef<From, To, Pivot>
 ```
-

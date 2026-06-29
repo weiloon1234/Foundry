@@ -405,6 +405,27 @@ impl Default for DatabaseModelConfig {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DatabasePoolConfig {
+    pub min_connections: Option<u32>,
+    pub max_connections: Option<u32>,
+    pub acquire_timeout_ms: Option<u64>,
+    pub idle_timeout_seconds: Option<u64>,
+    pub max_lifetime_seconds: Option<u64>,
+    pub connect_lazy: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedDatabasePoolConfig {
+    pub min_connections: u32,
+    pub max_connections: u32,
+    pub acquire_timeout_ms: u64,
+    pub idle_timeout_seconds: u64,
+    pub max_lifetime_seconds: u64,
+    pub connect_lazy: bool,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct DatabaseConfig {
@@ -429,6 +450,9 @@ pub struct DatabaseConfig {
     pub n_plus_one_retention: usize,
     pub idle_timeout_seconds: u64,
     pub max_lifetime_seconds: u64,
+    pub connect_lazy: bool,
+    pub write_pool: DatabasePoolConfig,
+    pub read_pool: DatabasePoolConfig,
     pub models: DatabaseModelConfig,
 }
 
@@ -461,6 +485,9 @@ impl std::fmt::Debug for DatabaseConfig {
             .field("n_plus_one_retention", &self.n_plus_one_retention)
             .field("idle_timeout_seconds", &self.idle_timeout_seconds)
             .field("max_lifetime_seconds", &self.max_lifetime_seconds)
+            .field("connect_lazy", &self.connect_lazy)
+            .field("write_pool", &self.write_pool)
+            .field("read_pool", &self.read_pool)
             .field("models", &self.models)
             .finish()
     }
@@ -490,7 +517,35 @@ impl Default for DatabaseConfig {
             n_plus_one_retention: 100,
             idle_timeout_seconds: 600,
             max_lifetime_seconds: 1800,
+            connect_lazy: false,
+            write_pool: DatabasePoolConfig::default(),
+            read_pool: DatabasePoolConfig::default(),
             models: DatabaseModelConfig::default(),
+        }
+    }
+}
+
+impl DatabaseConfig {
+    pub fn write_pool_config(&self) -> ResolvedDatabasePoolConfig {
+        self.resolve_pool_config(&self.write_pool)
+    }
+
+    pub fn read_pool_config(&self) -> ResolvedDatabasePoolConfig {
+        self.resolve_pool_config(&self.read_pool)
+    }
+
+    fn resolve_pool_config(&self, pool: &DatabasePoolConfig) -> ResolvedDatabasePoolConfig {
+        ResolvedDatabasePoolConfig {
+            min_connections: pool.min_connections.unwrap_or(self.min_connections),
+            max_connections: pool.max_connections.unwrap_or(self.max_connections),
+            acquire_timeout_ms: pool.acquire_timeout_ms.unwrap_or(self.acquire_timeout_ms),
+            idle_timeout_seconds: pool
+                .idle_timeout_seconds
+                .unwrap_or(self.idle_timeout_seconds),
+            max_lifetime_seconds: pool
+                .max_lifetime_seconds
+                .unwrap_or(self.max_lifetime_seconds),
+            connect_lazy: pool.connect_lazy.unwrap_or(self.connect_lazy),
         }
     }
 }
@@ -1489,6 +1544,31 @@ mod tests {
     }
 
     #[test]
+    fn env_overlay_supports_nested_database_pool_config() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("FOUNDRY__DATABASE__READ_URL", "postgres://read.example/app");
+        std::env::set_var("FOUNDRY__DATABASE__WRITE_POOL__MAX_CONNECTIONS", "3");
+        std::env::set_var("FOUNDRY__DATABASE__READ_POOL__MAX_CONNECTIONS", "9");
+        std::env::set_var("FOUNDRY__DATABASE__READ_POOL__CONNECT_LAZY", "true");
+
+        let config = ConfigRepository::with_env_overlay_only().unwrap();
+        let database = config.database().unwrap();
+
+        std::env::remove_var("FOUNDRY__DATABASE__READ_URL");
+        std::env::remove_var("FOUNDRY__DATABASE__WRITE_POOL__MAX_CONNECTIONS");
+        std::env::remove_var("FOUNDRY__DATABASE__READ_POOL__MAX_CONNECTIONS");
+        std::env::remove_var("FOUNDRY__DATABASE__READ_POOL__CONNECT_LAZY");
+
+        assert_eq!(
+            database.read_url.as_deref(),
+            Some("postgres://read.example/app")
+        );
+        assert_eq!(database.write_pool_config().max_connections, 3);
+        assert_eq!(database.read_pool_config().max_connections, 9);
+        assert!(database.read_pool_config().connect_lazy);
+    }
+
+    #[test]
     fn generated_split_config_matches_single_file_config() {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var("SERVER__PORT");
@@ -1678,12 +1758,24 @@ mod tests {
                 migrations_path = "database/migrations"
                 seeders_path = "database/seeders"
                 max_connections = 2
+                connect_lazy = true
                 log_query_bindings = true
                 redact_sql_literals = false
                 slow_query_retention = 40
                 n_plus_one_detection = false
                 n_plus_one_min_repeats = 7
                 n_plus_one_retention = 25
+
+                [database.write_pool]
+                max_connections = 4
+                connect_lazy = false
+
+                [database.read_pool]
+                min_connections = 0
+                max_connections = 8
+                acquire_timeout_ms = 750
+                idle_timeout_seconds = 30
+                max_lifetime_seconds = 120
 
                 [redis]
                 url = "redis://127.0.0.1/"
@@ -1745,6 +1837,15 @@ mod tests {
         assert_eq!(database.migrations_path, "database/migrations");
         assert_eq!(database.seeders_path, "database/seeders");
         assert_eq!(database.max_connections, 2);
+        assert!(database.connect_lazy);
+        assert_eq!(database.write_pool_config().max_connections, 4);
+        assert!(!database.write_pool_config().connect_lazy);
+        assert_eq!(database.read_pool_config().min_connections, 0);
+        assert_eq!(database.read_pool_config().max_connections, 8);
+        assert_eq!(database.read_pool_config().acquire_timeout_ms, 750);
+        assert_eq!(database.read_pool_config().idle_timeout_seconds, 30);
+        assert_eq!(database.read_pool_config().max_lifetime_seconds, 120);
+        assert!(database.read_pool_config().connect_lazy);
         assert!(database.log_query_bindings);
         assert!(!database.redact_sql_literals);
         assert_eq!(database.slow_query_retention, 40);

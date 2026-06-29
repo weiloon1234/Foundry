@@ -34,6 +34,15 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 
 ### Added
 
+- Serverless database pool tuning: `DatabaseConfig` now supports `connect_lazy`, optional
+  `[database.write_pool]` and `[database.read_pool]` override sections, and resolved
+  `write_pool_config()` / `read_pool_config()` helpers. This lets deployments keep the legacy
+  flat pool defaults while independently capping primary and read-replica pools for serverless
+  Postgres or provider poolers.
+- Database diagnostics gained `DatabaseManager::has_read_pool()`, `ping_write()`, and
+  `ping_read()` for targeted primary/read-replica readiness checks.
+- Redis now enables Tokio rustls support so `rediss://` TLS Redis endpoints work for serverless
+  Redis providers.
 - Contract-first frontend generation foundation: `types:export` now emits `FoundryContractManifest.json`, `FoundryErrors.ts`, `FoundrySdk.ts`, `FoundryClient.ts`, and per-action `sdk/*.ts` modules. The manifest normalizes route actions, transport body kind, permissions, request/response DTO JSON schemas, validation schemas, standard errors, and realtime channel contracts; new frontend code can use `createFoundryClient(...)` business actions instead of endpoint helpers.
 - Consumer update path for generated frontend clients: after upgrading, run `types:export`, import `createFoundryClient` from the configured generated TypeScript barrel, pass the existing Axios-compatible transport, and call generated business actions such as `api.userPortalLogin(payload, { params })`. Catch `FoundrySdkError` for normalized validation and HTTP failures. Existing `FoundryEndpoint` route helpers remain available for form-state screens, while `without_client_export()` / `client_export(false)` now opts a route out of both helper and SDK action output. File/file-list request fields automatically generate multipart SDK actions.
 - TypeScript route endpoint helpers: `types:export` now emits a headless `FoundryEndpoint` base runtime plus per-route helper files with path/method constants, request/response aliases, typed `validateForm()`/`submitForm()`, busy/error state, and validation metadata from `#[derive(Validate)]`. Generated DTO files now include a Foundry do-not-edit header, and validated DTO fields include validation-rule comments. Routes can opt out with `without_client_export()` or `client_export(false)`.
@@ -59,6 +68,12 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 
 ### Changed
 
+- `DatabaseManager::ping()` now checks both the primary pool and the configured read-replica pool.
+  `doctor` reports whether it checked the primary only or both primary and replica. Use
+  `ping_write()` for primary-only health checks.
+- Redis-backed runtime commands for locks, rate limits, jobs, scheduler leadership, and WebSocket
+  publishes now reuse a cached multiplexed Redis connection instead of opening a new command
+  connection for each operation.
 - Config env overrides now support an explicit `FOUNDRY__` namespace (e.g. `FOUNDRY__SERVER__PORT`), which is stripped before applying and wins over the unprefixed form. Unprefixed `__`-delimited variables keep working; the prefix avoids collisions with ambient process variables.
 - `TemplateRenderer` gained `render_async`, which renders on Tokio's blocking thread pool; `EmailMessage::template(...)` uses it internally.
 - `Job::max_retries` and `jobs.max_retries` are now documented as the maximum number of *total attempts* (like Laravel's `tries`): `1` dead-letters on the first failure with no retry.
@@ -82,6 +97,12 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 
 ### Breaking
 
+- `DatabaseConfig` gained public fields: `connect_lazy`, `write_pool`, and `read_pool`. Consumers
+  that construct `DatabaseConfig` with a Rust struct literal must add those fields or use
+  `..DatabaseConfig::default()`.
+- `DatabaseManager::ping()` now fails when `database.read_url` is configured but the read replica
+  cannot be reached. Consumer readiness checks that intentionally only validate the primary should
+  call `ping_write()` instead.
 - `EmailMessage::template(...)` is now `async` (template files are read off the async runtime); add `.await` before the `?`.
 - TOTP MFA switched from HMAC-SHA256 to RFC 6238 HMAC-SHA1 (see Security); previously enrolled TOTP factors must be re-enrolled.
 - Validation: `min_numeric`, `max_numeric`, `between`, and `numeric` are stricter (see Security); requests that previously passed with non-numeric values in bounded fields now fail validation.

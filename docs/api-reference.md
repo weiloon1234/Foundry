@@ -329,9 +329,11 @@ TOML-based configuration with environment overlay.
 | `ConfigRepository` | Loads and queries TOML config |
 | `AppConfig` | `name`, `environment`, `timezone`, `signing_key`, `background_shutdown_timeout_ms` |
 | `ServerConfig` | `host`, `port` |
-| `DatabaseConfig` | `url`, `read_url`, `schema`, migration lock timeout, connection pool settings, SQL observability retention |
+| `DatabaseConfig` | `url`, `read_url`, `schema`, migration lock timeout, pool settings, lazy connection, SQL observability retention |
+| `DatabasePoolConfig` | Optional per-pool overrides for read/write pools |
+| `ResolvedDatabasePoolConfig` | Effective pool settings after flat defaults and per-pool overrides |
 | `DatabaseModelConfig` | `timestamps_default`, `soft_deletes_default` |
-| `RedisConfig` | `url`, `namespace` |
+| `RedisConfig` | `url` (`redis://` or TLS `rediss://`), `namespace` |
 | `WebSocketConfig` | `host`, `port`, `path`, heartbeat, rate limits, origin allow-list, outbound buffer, history buffer/TTL |
 | `JobsConfig` | `queue`, `max_retries`, `polling`, `concurrency`, `shutdown_timeout_ms`, `job_history` retention |
 | `SchedulerConfig` | `tick_interval_ms`, `leader_lease_ttl_ms`, `shutdown_timeout_ms` |

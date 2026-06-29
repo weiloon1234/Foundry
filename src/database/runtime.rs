@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::config::{DatabaseConfig, ObservabilityConfig};
+use crate::config::{DatabaseConfig, ObservabilityConfig, ResolvedDatabasePoolConfig};
 use crate::foundation::{Error, Result};
 use crate::logging::{catch_future_panic, panic_payload_message};
 use crate::support::sync::{lock_unpoisoned, read_unpoisoned, write_unpoisoned};
@@ -823,6 +823,50 @@ impl DatabaseRuntime {
     }
 }
 
+fn validate_postgres_url(config_key: &str, url: &str) -> Result<()> {
+    if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+        return Err(Error::message(format!(
+            "Foundry database runtime is Postgres-only and requires {config_key} to use a postgres:// or postgresql:// URL",
+        )));
+    }
+    Ok(())
+}
+
+async fn connect_postgres_pool(
+    config_key: &str,
+    url: &str,
+    settings: &ResolvedDatabasePoolConfig,
+) -> Result<PgPool> {
+    if settings.max_connections == 0 {
+        return Err(Error::message(format!(
+            "{config_key} pool max_connections must be at least 1"
+        )));
+    }
+    if settings.min_connections > settings.max_connections {
+        return Err(Error::message(format!(
+            "{config_key} pool min_connections ({}) cannot exceed max_connections ({})",
+            settings.min_connections, settings.max_connections
+        )));
+    }
+
+    let options = PgPoolOptions::new()
+        .min_connections(settings.min_connections)
+        .max_connections(settings.max_connections)
+        .acquire_timeout(Duration::from_millis(settings.acquire_timeout_ms))
+        .idle_timeout(Duration::from_secs(settings.idle_timeout_seconds))
+        .max_lifetime(Duration::from_secs(settings.max_lifetime_seconds));
+
+    if settings.connect_lazy {
+        options.connect_lazy(url).map_err(|error| {
+            Error::message(format!("failed to create lazy {config_key} pool: {error}"))
+        })
+    } else {
+        options.connect(url).await.map_err(|error| {
+            Error::message(format!("failed to connect {config_key} pool: {error}"))
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DbRecord {
     values: BTreeMap<String, DbValue>,
@@ -999,34 +1043,22 @@ impl DatabaseManager {
             return Ok(Self::disabled());
         }
 
-        if !config.url.starts_with("postgres://") && !config.url.starts_with("postgresql://") {
-            return Err(Error::message(
-                "Foundry database runtime is Postgres-only and requires a postgres:// URL",
-            ));
-        }
+        validate_postgres_url("database.url", &config.url)?;
 
-        let pool = PgPoolOptions::new()
-            .min_connections(config.min_connections)
-            .max_connections(config.max_connections)
-            .acquire_timeout(Duration::from_millis(config.acquire_timeout_ms))
-            .idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
-            .max_lifetime(Duration::from_secs(config.max_lifetime_seconds))
-            .connect(&config.url)
-            .await
-            .map_err(Error::other)?;
+        let pool =
+            connect_postgres_pool("database.url", &config.url, &config.write_pool_config()).await?;
 
         let read_pool = if let Some(ref read_url) = config.read_url {
             if !read_url.trim().is_empty() {
-                let rp = PgPoolOptions::new()
-                    .min_connections(config.min_connections)
-                    .max_connections(config.max_connections)
-                    .acquire_timeout(Duration::from_millis(config.acquire_timeout_ms))
-                    .idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
-                    .max_lifetime(Duration::from_secs(config.max_lifetime_seconds))
-                    .connect(read_url)
-                    .await
-                    .map_err(Error::other)?;
-                Some(rp)
+                validate_postgres_url("database.read_url", read_url)?;
+                Some(
+                    connect_postgres_pool(
+                        "database.read_url",
+                        read_url,
+                        &config.read_pool_config(),
+                    )
+                    .await?,
+                )
             } else {
                 None
             }
@@ -1048,6 +1080,12 @@ impl DatabaseManager {
 
     pub fn is_configured(&self) -> bool {
         matches!(self.state.as_ref(), DatabaseState::Ready(_))
+    }
+
+    pub fn has_read_pool(&self) -> bool {
+        self.runtime()
+            .map(|runtime| runtime.read_pool.is_some())
+            .unwrap_or(false)
     }
 
     pub fn pool(&self) -> Result<&PgPool> {
@@ -1072,11 +1110,30 @@ impl DatabaseManager {
             .copied())
     }
 
-    pub async fn ping(&self) -> Result<()> {
+    pub async fn ping_write(&self) -> Result<()> {
         sqlx::query("SELECT 1")
             .execute(self.pool()?)
             .await
-            .map_err(Error::other)?;
+            .map_err(|error| Error::message(format!("database primary ping failed: {error}")))?;
+        Ok(())
+    }
+
+    pub async fn ping_read(&self) -> Result<()> {
+        let runtime = self.runtime()?;
+        if let Some(read_pool) = runtime.read_pool.as_ref() {
+            sqlx::query("SELECT 1")
+                .execute(read_pool)
+                .await
+                .map_err(|error| {
+                    Error::message(format!("database read replica ping failed: {error}"))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub async fn ping(&self) -> Result<()> {
+        self.ping_write().await?;
+        self.ping_read().await?;
         Ok(())
     }
 
@@ -2944,5 +3001,45 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.to_string(), "database stream panicked: stream boom");
+    }
+
+    #[tokio::test]
+    async fn lazy_database_config_validates_read_url_scheme_before_connecting() {
+        use crate::config::DatabaseConfig;
+
+        let config = DatabaseConfig {
+            url: "postgres://primary.example/app".to_string(),
+            read_url: Some("mysql://replica.example/app".to_string()),
+            connect_lazy: true,
+            ..DatabaseConfig::default()
+        };
+
+        let error = match super::DatabaseManager::from_config(&config).await {
+            Ok(_) => panic!("invalid read_url scheme should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("database.read_url"));
+    }
+
+    #[tokio::test]
+    async fn database_pool_config_rejects_zero_max_connections() {
+        use crate::config::DatabaseConfig;
+
+        let config = DatabaseConfig {
+            url: "postgres://primary.example/app".to_string(),
+            connect_lazy: true,
+            max_connections: 0,
+            ..DatabaseConfig::default()
+        };
+
+        let error = match super::DatabaseManager::from_config(&config).await {
+            Ok(_) => panic!("zero max_connections should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("database.url pool max_connections must be at least 1"));
     }
 }

@@ -50,7 +50,7 @@ image = "0.25"
 infer = "0.19"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
 object_store = { version = "0.13", features = ["aws"] }
-redis = { version = "1", features = ["tokio-comp"] }
+redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 regex = "1"
 rust_xlsxwriter = "0.94"
