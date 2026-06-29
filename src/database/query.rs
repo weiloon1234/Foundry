@@ -186,19 +186,13 @@ impl<T: Serialize> Paginated<T> {
         };
 
         let next = if current_page < last_page {
-            Some(format!(
-                "{base_url}?page={}&per_page={per_page}",
-                current_page + 1
-            ))
+            Some(pagination_link(base_url, current_page + 1, per_page))
         } else {
             None
         };
 
         let prev = if current_page > 1 {
-            Some(format!(
-                "{base_url}?page={}&per_page={per_page}",
-                current_page - 1
-            ))
+            Some(pagination_link(base_url, current_page - 1, per_page))
         } else {
             None
         };
@@ -227,6 +221,28 @@ impl<T: Serialize> Paginated<T> {
             meta: response.meta,
             links: response.links,
         }
+    }
+}
+
+fn pagination_link(base_url: &str, page: u64, per_page: u64) -> String {
+    let (base, fragment) = base_url
+        .split_once('#')
+        .map_or((base_url, None), |(base, fragment)| (base, Some(fragment)));
+    let separator = if base.contains('?') {
+        if base.ends_with('?') || base.ends_with('&') {
+            ""
+        } else {
+            "&"
+        }
+    } else {
+        "?"
+    };
+    let url = format!("{base}{separator}page={page}&per_page={per_page}");
+
+    if let Some(fragment) = fragment {
+        format!("{url}#{fragment}")
+    } else {
+        url
     }
 }
 
@@ -5350,6 +5366,18 @@ mod tests {
     use crate::foundation::{Error, Result};
     use crate::support::sync::lock_unpoisoned;
     use crate::{Model, ModelId};
+
+    #[test]
+    fn pagination_link_preserves_existing_query_and_fragment() {
+        assert_eq!(
+            super::pagination_link("/users?active=true#results", 2, 15),
+            "/users?active=true&page=2&per_page=15#results"
+        );
+        assert_eq!(
+            super::pagination_link("/users?", 3, 25),
+            "/users?page=3&per_page=25"
+        );
+    }
 
     #[test]
     fn insert_builder_switches_from_select_source_to_values_without_panicking() {

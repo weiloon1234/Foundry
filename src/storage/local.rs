@@ -275,7 +275,7 @@ impl StorageAdapter for LocalStorageAdapter {
     async fn url(&self, path: &str) -> Result<String> {
         let path = normalize_path(path)?;
         match &self.url {
-            Some(base) => Ok(format!("{base}/{path}")),
+            Some(base) => Ok(format!("{}/{path}", base.trim_end_matches('/'))),
             None => Err(Error::message(
                 "URL generation not supported for this disk (no url configured)",
             )),
@@ -497,6 +497,15 @@ mod tests {
     async fn url_returns_url_when_configured() {
         let dir = TempDir::new().unwrap();
         let adapter = make_adapter_with_url(&dir, "http://localhost/storage");
+
+        let url = adapter.url("images/photo.jpg").await.unwrap();
+        assert_eq!(url, "http://localhost/storage/images/photo.jpg");
+    }
+
+    #[tokio::test]
+    async fn url_trims_configured_trailing_slash() {
+        let dir = TempDir::new().unwrap();
+        let adapter = make_adapter_with_url(&dir, "http://localhost/storage/");
 
         let url = adapter.url("images/photo.jpg").await.unwrap();
         assert_eq!(url, "http://localhost/storage/images/photo.jpg");

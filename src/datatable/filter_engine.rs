@@ -139,14 +139,11 @@ where
     }
 
     if conditions.is_empty() {
-        return Ok(query);
-    }
-
-    let Some(scope) = scope else {
         return Err(Error::message(
             "LikeAny requires at least one filter target",
         ));
-    };
+    }
+    let scope = scope.expect("conditions are only pushed after scope is set");
 
     Ok(apply_filter(query, scope, Condition::or(conditions)))
 }
@@ -521,6 +518,34 @@ mod tests {
             error
                 .to_string()
                 .contains("LikeAny cannot mix WHERE and HAVING"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn like_any_rejects_unknown_targets_instead_of_nooping() {
+        let columns = vec![DatatableColumn::field(ReportRow::MERCHANT_ID)
+            .filter_by(ReportRow::MERCHANT_ID.column_ref())];
+        let filters = vec![DatatableFilterInput {
+            field: "missing|also_missing".to_string(),
+            op: DatatableFilterOp::LikeAny,
+            value: DatatableFilterValue::Text("10".to_string()),
+        }];
+
+        let result = apply_auto_filters(
+            ProjectionQuery::<ReportRow>::table("orders"),
+            &filters,
+            &columns,
+        );
+        let error = match result {
+            Ok(_) => panic!("unknown LikeAny targets should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("LikeAny requires at least one filter target"),
             "unexpected error: {error}"
         );
     }

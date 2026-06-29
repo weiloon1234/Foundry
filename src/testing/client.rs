@@ -29,7 +29,6 @@ impl TestApp {
     pub fn builder() -> TestAppBuilder {
         TestAppBuilder {
             inner: App::builder(),
-            config_dir: None,
         }
     }
 
@@ -77,13 +76,10 @@ impl TestApp {
 /// Builder for TestApp.
 pub struct TestAppBuilder {
     inner: AppBuilder,
-    config_dir: Option<PathBuf>,
 }
 
 impl TestAppBuilder {
     pub fn load_config_dir(mut self, path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        self.config_dir = Some(path.clone());
         self.inner = self.inner.load_config_dir(path);
         self
     }

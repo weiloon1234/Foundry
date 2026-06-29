@@ -7,6 +7,7 @@ use crate::contract::{
     ContractPayload, ContractResponse, ContractSchema, ContractTransport,
 };
 use crate::http::route_path_params;
+use crate::http::routes::route_segment_param;
 
 use super::RouteDoc;
 
@@ -97,7 +98,9 @@ pub fn generate_openapi_spec_from_contract(
             operation["responses"] = responses;
         }
 
-        let path_entry = paths.entry(http.path.clone()).or_insert_with(|| json!({}));
+        let path_entry = paths
+            .entry(openapi_path(&http.path))
+            .or_insert_with(|| json!({}));
         path_entry[&method] = operation;
     }
 
@@ -173,6 +176,24 @@ fn contract_manifest_from_documented_routes(routes: &[DocumentedRoute]) -> Contr
     manifest
 }
 
+fn openapi_path(path: &str) -> String {
+    let mut normalized = String::with_capacity(path.len());
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            normalized.push('/');
+        }
+
+        if let Some(param) = route_segment_param(segment) {
+            normalized.push('{');
+            normalized.push_str(param);
+            normalized.push('}');
+        } else {
+            normalized.push_str(segment);
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -215,5 +236,34 @@ mod tests {
                 .is_none(),
             "bodyless contract action should not emit OpenAPI requestBody: {spec}"
         );
+    }
+
+    #[test]
+    fn openapi_paths_use_braced_parameter_syntax() {
+        let mut manifest = ContractManifest::new();
+        manifest.actions = vec![ContractAction {
+            id: "files.show".to_string(),
+            action_name: "FilesShow".to_string(),
+            summary: None,
+            description: None,
+            tags: Vec::new(),
+            deprecated: false,
+            request: None,
+            responses: Vec::new(),
+            auth: ContractAuth::default(),
+            client_export: true,
+            validation: None,
+            transport: ContractTransport::Http(ContractHttpTransport {
+                method: Some("get".to_string()),
+                path: "/users/:id/files/{*path}".to_string(),
+                path_params: vec!["id".to_string(), "path".to_string()],
+                body: ContractHttpBody::None,
+            }),
+        }];
+
+        let spec = generate_openapi_spec_from_contract("Foundry", "test", &manifest);
+
+        assert!(spec["paths"].get("/users/{id}/files/{path}").is_some());
+        assert!(spec["paths"].get("/users/:id/files/{*path}").is_none());
     }
 }

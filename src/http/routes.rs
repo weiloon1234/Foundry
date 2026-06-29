@@ -104,9 +104,30 @@ impl RouteRegistry {
 }
 
 fn replace_route_param(url: &str, param: &str, value: &str) -> String {
-    url.replace(&format!("{{{param}}}"), value)
-        .replace(&format!("{{*{param}}}"), value)
-        .replace(&format!(":{param}"), value)
+    let mut replaced = String::with_capacity(url.len() + value.len());
+    for (index, segment) in url.split('/').enumerate() {
+        if index > 0 {
+            replaced.push('/');
+        }
+
+        if route_segment_param(segment).is_some_and(|candidate| candidate == param) {
+            replaced.push_str(value);
+        } else {
+            replaced.push_str(segment);
+        }
+    }
+    replaced
+}
+
+pub(crate) fn route_segment_param(segment: &str) -> Option<&str> {
+    if let Some(inner) = segment
+        .strip_prefix('{')
+        .and_then(|inner| inner.strip_suffix('}'))
+    {
+        Some(inner.strip_prefix('*').unwrap_or(inner))
+    } else {
+        segment.strip_prefix(':')
+    }
 }
 
 fn percent_encode(value: &str) -> String {
@@ -269,6 +290,24 @@ mod tests {
             .unwrap_err();
 
         assert!(error_message(error).contains("invalid signature"));
+    }
+
+    #[test]
+    fn url_replaces_only_complete_legacy_param_segments() {
+        let mut registry = RouteRegistry::new();
+        registry.register(
+            RouteId::new("tokens.show"),
+            "/tokens/:id/identities/:identifier",
+        );
+
+        let url = registry
+            .url(
+                RouteId::new("tokens.show"),
+                &[("id", "42"), ("identifier", "abc")],
+            )
+            .unwrap();
+
+        assert_eq!(url, "/tokens/42/identities/abc");
     }
 
     #[test]

@@ -1636,17 +1636,9 @@ pub(crate) fn route_path_params(path: &str) -> Vec<String> {
     let mut params = Vec::new();
 
     for segment in path.split('/') {
-        let param = if let Some(inner) = segment
-            .strip_prefix('{')
-            .and_then(|inner| inner.strip_suffix('}'))
-        {
-            inner.strip_prefix('*').unwrap_or(inner)
-        } else if let Some(inner) = segment.strip_prefix(':') {
-            inner
-        } else {
+        let Some(param) = routes::route_segment_param(segment) else {
             continue;
         };
-
         if !param.is_empty() && !params.iter().any(|existing| existing == param) {
             params.push(param.to_string());
         }
