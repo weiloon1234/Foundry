@@ -181,6 +181,41 @@ User::NICKNAME.is_null()
 User::NICKNAME.is_not_null()
 ```
 
+### Raw Column & Expression Conditions
+
+Model field constants are the preferred path for a model's own table. For raw table aliases, joins, projections, or computed expressions, use explicit condition helpers:
+
+```rust
+let is_system = ColumnRef::new("templates", "is_system");
+
+Query::table("templates")
+    .where_(Condition::and([
+        Condition::eq(is_system, true),
+        Condition::is_null(ColumnRef::new("templates", "deleted_at")),
+    ]));
+```
+
+Raw columns also expose value helpers when you already have the column in a variable:
+
+```rust
+let visible = ColumnRef::new("templates", "visible");
+query.where_(visible.eq_value(true));
+```
+
+`ColumnRef::eq(value)` is also a SQL condition helper for parity with model fields; `eq_value(...)` is the clearest raw-column spelling when you want to avoid any visual overlap with Rust equality.
+
+For computed values, pass the expression to `Condition::eq(...)`, `Condition::gte(...)`, or use `Expr` helpers such as `eq_value(...)`:
+
+```rust
+query.where_(Condition::gte(
+    Expr::function("COALESCE", [
+        Expr::column(ColumnRef::new("stats", "published_count")),
+        Expr::value(0_i64),
+    ]),
+    10_i64,
+));
+```
+
 ### Ordering & Limits
 
 ```rust

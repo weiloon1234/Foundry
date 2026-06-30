@@ -632,6 +632,114 @@ impl ColumnRef {
         self.alias = Some(alias.into());
         self
     }
+
+    pub fn expr(&self) -> Expr {
+        Expr::column(self.clone())
+    }
+
+    pub fn compare(&self, op: ComparisonOp, right: impl Into<Expr>) -> Condition {
+        Condition::compare(self.expr(), op, right.into())
+    }
+
+    pub fn compare_value(&self, op: ComparisonOp, value: impl Into<DbValue>) -> Condition {
+        self.compare(op, Expr::value(value.into()))
+    }
+
+    pub fn eq(&self, value: impl Into<DbValue>) -> Condition {
+        self.eq_value(value)
+    }
+
+    pub fn eq_value(&self, value: impl Into<DbValue>) -> Condition {
+        self.compare_value(ComparisonOp::Eq, value)
+    }
+
+    pub fn not_eq(&self, value: impl Into<DbValue>) -> Condition {
+        self.not_eq_value(value)
+    }
+
+    pub fn not_eq_value(&self, value: impl Into<DbValue>) -> Condition {
+        self.compare_value(ComparisonOp::NotEq, value)
+    }
+
+    pub fn gt(&self, value: impl Into<DbValue>) -> Condition {
+        self.gt_value(value)
+    }
+
+    pub fn gt_value(&self, value: impl Into<DbValue>) -> Condition {
+        self.compare_value(ComparisonOp::Gt, value)
+    }
+
+    pub fn gte(&self, value: impl Into<DbValue>) -> Condition {
+        self.gte_value(value)
+    }
+
+    pub fn gte_value(&self, value: impl Into<DbValue>) -> Condition {
+        self.compare_value(ComparisonOp::Gte, value)
+    }
+
+    pub fn lt(&self, value: impl Into<DbValue>) -> Condition {
+        self.lt_value(value)
+    }
+
+    pub fn lt_value(&self, value: impl Into<DbValue>) -> Condition {
+        self.compare_value(ComparisonOp::Lt, value)
+    }
+
+    pub fn lte(&self, value: impl Into<DbValue>) -> Condition {
+        self.lte_value(value)
+    }
+
+    pub fn lte_value(&self, value: impl Into<DbValue>) -> Condition {
+        self.compare_value(ComparisonOp::Lte, value)
+    }
+
+    pub fn in_list<I, V>(&self, values: I) -> Condition
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<DbValue>,
+    {
+        Condition::in_list(self.clone(), values)
+    }
+
+    pub fn not_in_list<I, V>(&self, values: I) -> Condition
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<DbValue>,
+    {
+        Condition::not_in_list(self.clone(), values)
+    }
+
+    pub fn is_null(&self) -> Condition {
+        Condition::is_null(self.clone())
+    }
+
+    pub fn is_not_null(&self) -> Condition {
+        Condition::is_not_null(self.clone())
+    }
+
+    pub fn is_true(&self) -> Condition {
+        Condition::is_true(self.clone())
+    }
+
+    pub fn is_false(&self) -> Condition {
+        Condition::is_false(self.clone())
+    }
+
+    pub fn ieq(&self, value: impl Into<String>) -> Condition {
+        self.compare(ComparisonOp::IEq, Expr::text(value))
+    }
+
+    pub fn like(&self, value: impl Into<String>) -> Condition {
+        self.compare(ComparisonOp::Like, Expr::text(value))
+    }
+
+    pub fn not_like(&self, value: impl Into<String>) -> Condition {
+        self.compare(ComparisonOp::NotLike, Expr::text(value))
+    }
+
+    pub fn ilike(&self, value: impl Into<String>) -> Condition {
+        self.compare(ComparisonOp::ILike, Expr::text(value))
+    }
 }
 
 impl From<&str> for ColumnRef {
@@ -1117,6 +1225,8 @@ pub enum Condition {
     Not(Box<Condition>),
     IsNull(Expr),
     IsNotNull(Expr),
+    IsTrue(Expr),
+    IsFalse(Expr),
     Exists(Box<QueryAst>),
     Raw {
         sql: String,
@@ -1127,6 +1237,73 @@ pub enum Condition {
 impl Condition {
     pub fn compare(left: Expr, op: ComparisonOp, right: Expr) -> Self {
         Self::Comparison { left, op, right }
+    }
+
+    pub fn compare_value(
+        left: impl Into<Expr>,
+        op: ComparisonOp,
+        value: impl Into<DbValue>,
+    ) -> Self {
+        Self::compare(left.into(), op, Expr::value(value.into()))
+    }
+
+    pub fn eq(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self {
+        Self::compare_value(left, ComparisonOp::Eq, value)
+    }
+
+    pub fn not_eq(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self {
+        Self::compare_value(left, ComparisonOp::NotEq, value)
+    }
+
+    pub fn gt(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self {
+        Self::compare_value(left, ComparisonOp::Gt, value)
+    }
+
+    pub fn gte(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self {
+        Self::compare_value(left, ComparisonOp::Gte, value)
+    }
+
+    pub fn lt(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self {
+        Self::compare_value(left, ComparisonOp::Lt, value)
+    }
+
+    pub fn lte(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self {
+        Self::compare_value(left, ComparisonOp::Lte, value)
+    }
+
+    pub fn ieq(left: impl Into<Expr>, value: impl Into<String>) -> Self {
+        Self::compare(left.into(), ComparisonOp::IEq, Expr::text(value))
+    }
+
+    pub fn like(left: impl Into<Expr>, value: impl Into<String>) -> Self {
+        Self::compare(left.into(), ComparisonOp::Like, Expr::text(value))
+    }
+
+    pub fn not_like(left: impl Into<Expr>, value: impl Into<String>) -> Self {
+        Self::compare(left.into(), ComparisonOp::NotLike, Expr::text(value))
+    }
+
+    pub fn ilike(left: impl Into<Expr>, value: impl Into<String>) -> Self {
+        Self::compare(left.into(), ComparisonOp::ILike, Expr::text(value))
+    }
+
+    pub fn in_list<I, V>(expr: impl Into<Expr>, values: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<DbValue>,
+    {
+        Self::InList {
+            expr: expr.into(),
+            values: values.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn not_in_list<I, V>(expr: impl Into<Expr>, values: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<DbValue>,
+    {
+        Self::negate(Self::in_list(expr, values))
     }
 
     pub fn json(expr: Expr, op: JsonPredicateOp, value: JsonPredicateValue) -> Self {
@@ -1173,6 +1350,14 @@ impl Condition {
 
     pub fn expr_is_not_null(expr: impl Into<Expr>) -> Self {
         Self::IsNotNull(expr.into())
+    }
+
+    pub fn is_true(expr: impl Into<Expr>) -> Self {
+        Self::IsTrue(expr.into())
+    }
+
+    pub fn is_false(expr: impl Into<Expr>) -> Self {
+        Self::IsFalse(expr.into())
     }
 
     pub fn false_() -> Self {

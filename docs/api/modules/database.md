@@ -587,8 +587,21 @@ async fn scope_model_extensions<F, T>(future: F) -> T
 enum AggregateFn { Count, Sum, Avg, Min, Max }
 enum BinaryOperator { Add, Subtract, Multiply, Divide, Concat, Custom }
 enum ComparisonOp { Eq, IEq, NotEq, Gt, Gte, Lt, Lte, Like, NotLike, ILike }
-enum Condition { Comparison, InList, JsonPredicate, FullText, And, Or, Not, IsNull, IsNotNull, Exists, Raw }
+enum Condition { Comparison, InList, JsonPredicate, FullText, And, Or, Not, IsNull, IsNotNull, IsTrue, IsFalse, Exists, Raw }
   fn compare(left: Expr, op: ComparisonOp, right: Expr) -> Self
+  fn compare_value( left: impl Into<Expr>, op: ComparisonOp, value: impl Into<DbValue>, ) -> Self
+  fn eq(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self
+  fn not_eq(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self
+  fn gt(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self
+  fn gte(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self
+  fn lt(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self
+  fn lte(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self
+  fn ieq(left: impl Into<Expr>, value: impl Into<String>) -> Self
+  fn like(left: impl Into<Expr>, value: impl Into<String>) -> Self
+  fn not_like(left: impl Into<Expr>, value: impl Into<String>) -> Self
+  fn ilike(left: impl Into<Expr>, value: impl Into<String>) -> Self
+  fn in_list<I, V>(expr: impl Into<Expr>, values: I) -> Self
+  fn not_in_list<I, V>(expr: impl Into<Expr>, values: I) -> Self
   fn json(expr: Expr, op: JsonPredicateOp, value: JsonPredicateValue) -> Self
   fn full_text( columns: impl IntoIterator<Item = ColumnRef>, query: impl Into<String>, ) -> Self
   fn and(conditions: impl IntoIterator<Item = Condition>) -> Self
@@ -599,6 +612,8 @@ enum Condition { Comparison, InList, JsonPredicate, FullText, And, Or, Not, IsNu
   fn is_not_null(column: impl Into<ColumnRef>) -> Self
   fn expr_is_null(expr: impl Into<Expr>) -> Self
   fn expr_is_not_null(expr: impl Into<Expr>) -> Self
+  fn is_true(expr: impl Into<Expr>) -> Self
+  fn is_false(expr: impl Into<Expr>) -> Self
   fn false_() -> Self
   fn true_() -> Self
   fn raw(sql: impl Into<String>, bindings: Vec<DbValue>) -> Self
@@ -683,6 +698,31 @@ struct ColumnRef
   fn bare(name: impl Into<String>) -> Self
   fn typed(self, db_type: DbType) -> Self
   fn aliased(self, alias: impl Into<String>) -> Self
+  fn expr(&self) -> Expr
+  fn compare(&self, op: ComparisonOp, right: impl Into<Expr>) -> Condition
+  fn compare_value( &self, op: ComparisonOp, value: impl Into<DbValue>, ) -> Condition
+  fn eq(&self, value: impl Into<DbValue>) -> Condition
+  fn eq_value(&self, value: impl Into<DbValue>) -> Condition
+  fn not_eq(&self, value: impl Into<DbValue>) -> Condition
+  fn not_eq_value(&self, value: impl Into<DbValue>) -> Condition
+  fn gt(&self, value: impl Into<DbValue>) -> Condition
+  fn gt_value(&self, value: impl Into<DbValue>) -> Condition
+  fn gte(&self, value: impl Into<DbValue>) -> Condition
+  fn gte_value(&self, value: impl Into<DbValue>) -> Condition
+  fn lt(&self, value: impl Into<DbValue>) -> Condition
+  fn lt_value(&self, value: impl Into<DbValue>) -> Condition
+  fn lte(&self, value: impl Into<DbValue>) -> Condition
+  fn lte_value(&self, value: impl Into<DbValue>) -> Condition
+  fn in_list<I, V>(&self, values: I) -> Condition
+  fn not_in_list<I, V>(&self, values: I) -> Condition
+  fn is_null(&self) -> Condition
+  fn is_not_null(&self) -> Condition
+  fn is_true(&self) -> Condition
+  fn is_false(&self) -> Condition
+  fn ieq(&self, value: impl Into<String>) -> Condition
+  fn like(&self, value: impl Into<String>) -> Condition
+  fn not_like(&self, value: impl Into<String>) -> Condition
+  fn ilike(&self, value: impl Into<String>) -> Condition
 struct CteNode
 struct DeleteNode
 struct FunctionCall

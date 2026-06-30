@@ -201,6 +201,47 @@ Legacy query strings normalize to the same filter inputs when routed through `Da
 
 Projection datatables should keep relation-like behavior explicit with `filter_by(...)`, `filter_having(...)`, or a custom `filters()` hook.
 
+For filters on the model's own table, prefer model field constants because they keep the Rust value type tied to the database column:
+
+```rust
+Order::query().where_(Order::TOTAL.gte(5_000_i64))
+```
+
+When a projection needs raw table aliases, joined columns, or computed expressions, build the condition explicitly from the raw column or expression:
+
+```rust
+fn query(_ctx: &DatatableContext) -> Self::Query {
+    ProjectionQuery::<TemplateRow>::table(TableRef::new("templates").aliased("t"))
+        .select_field(TemplateRow::ID, ColumnRef::new("t", "id"))
+        .select_field(TemplateRow::NAME, ColumnRef::new("t", "name"))
+        .where_(Condition::and([
+            Condition::eq(ColumnRef::new("t", "is_system"), true),
+            Condition::is_null(ColumnRef::new("t", "deleted_at")),
+        ]))
+}
+```
+
+The same pattern works for expressions:
+
+```rust
+query.where_(Condition::gte(
+    Expr::function("COALESCE", [
+        Expr::column(ColumnRef::new("stats", "published_count")),
+        Expr::value(0_i64),
+    ]),
+    10_i64,
+));
+```
+
+If you already have a raw column variable, use the non-conflicting value helpers:
+
+```rust
+let is_system = ColumnRef::new("t", "is_system");
+query.where_(is_system.eq_value(true));
+```
+
+`ColumnRef::eq(value)` is also a SQL condition helper for parity with model fields, so the model-style `col.eq(true)` form no longer falls through to Rust equality.
+
 ## Projection / Report Example
 
 ```rust

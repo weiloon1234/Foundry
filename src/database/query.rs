@@ -5360,8 +5360,8 @@ mod tests {
         Query, QueryBody, Sql,
     };
     use crate::database::{
-        has_many, ColumnRef, DbRecord, DbValue, Expr, Loaded, QueryExecutionOptions, QueryExecutor,
-        RelationDef,
+        has_many, ColumnRef, Condition, DbRecord, DbValue, Expr, Loaded, QueryExecutionOptions,
+        QueryExecutor, RelationDef,
     };
     use crate::foundation::{Error, Result};
     use crate::support::sync::lock_unpoisoned;
@@ -5505,6 +5505,26 @@ mod tests {
         assert_eq!(
             PostgresCompiler::compile(exclude.ast()).unwrap().sql,
             "SELECT \"id\" FROM \"users\" WHERE NOT (\"status\" IN ($1::text, $2::text))"
+        );
+    }
+
+    #[test]
+    fn raw_column_condition_helpers_compile() {
+        let query = Query::table("templates")
+            .select(["id"])
+            .where_(Condition::and([
+                Condition::eq(ColumnRef::new("templates", "is_system"), true),
+                Condition::not_eq(ColumnRef::new("templates", "status"), "archived"),
+                Condition::is_null(ColumnRef::new("templates", "deleted_at")),
+                ColumnRef::new("templates", "visible").eq(true),
+                ColumnRef::new("templates", "hidden").is_false(),
+            ]));
+
+        let compiled = PostgresCompiler::compile(query.ast()).unwrap();
+
+        assert_eq!(
+            compiled.sql,
+            "SELECT \"id\" FROM \"templates\" WHERE (\"templates\".\"is_system\" = $1::boolean AND \"templates\".\"status\" <> $2::text AND \"templates\".\"deleted_at\" IS NULL AND \"templates\".\"visible\" = $3::boolean AND \"templates\".\"hidden\" IS FALSE)"
         );
     }
 
