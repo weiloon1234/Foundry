@@ -19,6 +19,7 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 
 ### Fixed
 
+- Pinned the transitive `axum-extra`/`cookie` time parser dependency to `time 0.3.47`, preventing downstream deploy builds from resolving to newer `time 0.3.x` releases that break `cookie 0.18.1` in some toolchains.
 - A worker whose job-lease heartbeat fails (lease expired, claimed elsewhere, or backend unreachable past the lease TTL) now cancels the running job instead of letting it race the redelivered copy on another worker. Transient renewal errors are retried while the last successful renewal still covers the lease TTL.
 - Plugins that booted successfully are now shut down (in reverse order) when a later plugin's `boot()` fails, so resources acquired during partial bootstrap no longer leak.
 - The in-memory scheduler leadership backend no longer renews an already-expired lease; like the Redis backend, the previous holder must win a fresh election, preventing split-brain in single-process and test setups.
