@@ -1,6 +1,7 @@
 use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -109,6 +110,14 @@ mod app {
                         )
                         .token("guest-token", Actor::new("guest-1", ids::AuthGuard::Api))
                         .token(
+                            "mfa-pending-token",
+                            Actor::new("pending-1", ids::AuthGuard::Api).with_permissions([
+                                ids::Ability::ReportsView.into(),
+                                ids::Ability::WsChat.into(),
+                                PermissionId::new(foundry::auth::token::MFA_PENDING_ABILITY),
+                            ]),
+                        )
+                        .token(
                             "admin-token",
                             Actor::new("admin-1", ids::AuthGuard::Api)
                                 .with_roles([ids::RoleKey::Admin])
@@ -214,6 +223,39 @@ mod app {
     }
 }
 
+#[derive(Clone)]
+struct RevocableBearerAuthenticator {
+    actor: Arc<RwLock<Option<Actor>>>,
+}
+
+#[async_trait]
+impl BearerAuthenticator for RevocableBearerAuthenticator {
+    async fn authenticate(&self, token: &str) -> Result<Option<Actor>> {
+        if token != "revocable-token" {
+            return Ok(None);
+        }
+        Ok(self.actor.read().unwrap().clone())
+    }
+}
+
+struct RevocableAuthProvider {
+    actor: Arc<RwLock<Option<Actor>>>,
+}
+
+#[async_trait]
+impl ServiceProvider for RevocableAuthProvider {
+    async fn register(&self, registrar: &mut ServiceRegistrar) -> Result<()> {
+        registrar.register_guard(
+            app::ids::AuthGuard::Api,
+            RevocableBearerAuthenticator {
+                actor: self.actor.clone(),
+            },
+        )?;
+        registrar.register_guard(app::ids::AuthGuard::Admin, StaticBearerAuthenticator::new())?;
+        Ok(())
+    }
+}
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -312,6 +354,32 @@ async fn next_websocket_message(
         .unwrap()
         .unwrap();
     serde_json::from_str(frame.to_text().unwrap()).unwrap()
+}
+
+async fn assert_websocket_closes_without_event(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    forbidden_event: &ChannelEventId,
+) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(payload))) => {
+                    let message: ServerMessage = serde_json::from_str(&payload).unwrap();
+                    assert_ne!(&message.event, forbidden_event);
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    socket.send(Message::Pong(payload)).await.unwrap();
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {}
+                Some(Err(_)) => break,
+            }
+        }
+    })
+    .await
+    .expect("websocket stayed open after cached credentials became invalid");
 }
 
 #[tokio::test]
@@ -510,6 +578,30 @@ async fn guarded_websocket_channels_require_auth_and_permissions() {
     );
     assert!(guest_error.payload.get("code").is_none());
 
+    let mut mfa_pending = connect_websocket_with_token(&url, Some("mfa-pending-token")).await;
+    mfa_pending
+        .send(Message::Text(
+            serde_json::to_string(&ClientMessage {
+                action: ClientAction::Subscribe,
+                channel: app::ids::SECURE_CHAT_CHANNEL,
+                room: None,
+                payload: None,
+                event: None,
+                ack_id: None,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let mfa_pending_error = next_websocket_message(&mut mfa_pending).await;
+    assert_eq!(mfa_pending_error.channel, SYSTEM_CHANNEL);
+    assert_eq!(mfa_pending_error.event, ERROR_EVENT);
+    assert_eq!(
+        mfa_pending_error.payload["message"],
+        "Multi-factor authentication verification is required."
+    );
+
     let mut viewer = connect_websocket_with_token(&url, Some("viewer-token")).await;
     viewer
         .send(Message::Text(
@@ -550,6 +642,114 @@ async fn guarded_websocket_channels_require_auth_and_permissions() {
     assert_eq!(echoed.event, app::ids::ECHO_EVENT);
     assert_eq!(echoed.payload["actor_id"], "viewer-1");
     assert_eq!(echoed.payload["body"], "hello");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn guarded_websocket_revalidates_cached_credentials_before_actions_and_broadcasts() {
+    let config_dir = tempdir().unwrap();
+    let server_port = free_port();
+    let websocket_port = free_port();
+    write_auth_config(
+        config_dir.path(),
+        server_port,
+        websocket_port,
+        &format!("auth-ws-revalidation-{websocket_port}"),
+    );
+    fs::write(
+        config_dir.path().join("01-websocket-revalidation.toml"),
+        "[websocket]\nauth_revalidation_interval_seconds = 1\n",
+    )
+    .unwrap();
+
+    let actor = Arc::new(RwLock::new(Some(
+        Actor::new("revocable-1", app::ids::AuthGuard::Api)
+            .with_permissions([app::ids::Ability::WsChat]),
+    )));
+    let kernel = App::builder()
+        .load_config_dir(config_dir.path())
+        .register_provider(RevocableAuthProvider {
+            actor: actor.clone(),
+        })
+        .register_websocket_routes(app::realtime::register)
+        .build_websocket_kernel()
+        .await
+        .unwrap();
+    let app_context = kernel.app().clone();
+    let server = tokio::spawn(async move { kernel.serve().await.unwrap() });
+    let url = format!("ws://127.0.0.1:{websocket_port}/ws");
+
+    let subscribe = || ClientMessage {
+        action: ClientAction::Subscribe,
+        channel: app::ids::SECURE_CHAT_CHANNEL,
+        room: None,
+        payload: None,
+        event: None,
+        ack_id: None,
+    };
+
+    let mut permission_revoked = connect_websocket_with_token(&url, Some("revocable-token")).await;
+    permission_revoked
+        .send(Message::Text(
+            serde_json::to_string(&subscribe()).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_websocket_message(&mut permission_revoked).await.event,
+        SUBSCRIBED_EVENT
+    );
+
+    *actor.write().unwrap() = Some(Actor::new("revocable-1", app::ids::AuthGuard::Api));
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let protected_event = ChannelEventId::new("protected-after-permission-revocation");
+    app_context
+        .websocket()
+        .unwrap()
+        .publish(
+            app::ids::SECURE_CHAT_CHANNEL,
+            protected_event.clone(),
+            None,
+            serde_json::json!({"secret": true}),
+        )
+        .await
+        .unwrap();
+    assert_websocket_closes_without_event(&mut permission_revoked, &protected_event).await;
+
+    *actor.write().unwrap() = Some(
+        Actor::new("revocable-1", app::ids::AuthGuard::Api)
+            .with_permissions([app::ids::Ability::WsChat]),
+    );
+    let mut token_revoked = connect_websocket_with_token(&url, Some("revocable-token")).await;
+    token_revoked
+        .send(Message::Text(
+            serde_json::to_string(&subscribe()).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_websocket_message(&mut token_revoked).await.event,
+        SUBSCRIBED_EVENT
+    );
+
+    *actor.write().unwrap() = None;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let _ = token_revoked
+        .send(Message::Text(
+            serde_json::to_string(&ClientMessage {
+                action: ClientAction::Message,
+                channel: app::ids::SECURE_CHAT_CHANNEL,
+                room: None,
+                payload: Some(serde_json::json!({"body": "must not echo"})),
+                event: None,
+                ack_id: None,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await;
+    assert_websocket_closes_without_event(&mut token_revoked, &app::ids::ECHO_EVENT).await;
 
     server.abort();
 }

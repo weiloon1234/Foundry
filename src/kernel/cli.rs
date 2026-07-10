@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 
-use clap::Command;
+use clap::{error::ErrorKind, Command};
 
 use crate::cli::{CommandInvocation, CommandRegistry};
 use crate::foundation::{AppContext, Error, Result};
@@ -43,9 +43,19 @@ impl CliKernel {
             root = root.subcommand(registered.command.clone());
         }
 
-        let matches = root
-            .try_get_matches_from(args)
-            .map_err(crate::foundation::Error::other)?;
+        let matches = match root.try_get_matches_from(args) {
+            Ok(matches) => matches,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) =>
+            {
+                error.print().map_err(Error::other)?;
+                return Ok(());
+            }
+            Err(error) => return Err(Error::other(error)),
+        };
         if let Some((name, sub_matches)) = matches.subcommand() {
             if let Some(registered) = registry
                 .commands()
@@ -144,6 +154,27 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.to_string(), "command failed");
+    }
+
+    #[tokio::test]
+    async fn root_help_and_version_are_successful_cli_outcomes() {
+        let registrar: CommandRegistrar = Arc::new(|registry| {
+            registry.command(
+                CommandId::new("hello"),
+                Command::new("hello"),
+                |_invocation| async { Ok(()) },
+            )?;
+            Ok(())
+        });
+
+        kernel_with_registrar(registrar.clone())
+            .run_with_args(["foundry", "--help"])
+            .await
+            .unwrap();
+        kernel_with_registrar(registrar)
+            .run_with_args(["foundry", "--version"])
+            .await
+            .unwrap();
     }
 
     #[test]

@@ -250,19 +250,22 @@ impl<T> Collection<T> {
 
     /// Split into chunks of the given size. Returns an empty collection if size is 0
     /// or the collection is empty.
-    pub fn chunk(self, size: usize) -> Collection<Collection<T>>
-    where
-        T: Clone,
-    {
+    pub fn chunk(self, size: usize) -> Collection<Collection<T>> {
         if size == 0 || self.items.is_empty() {
             return Collection::new();
         }
-        Collection::from_vec(
-            self.items
-                .chunks(size)
-                .map(|chunk| Collection::from_vec(chunk.to_vec()))
-                .collect(),
-        )
+
+        let mut items = self.items.into_iter();
+        let mut chunks = Vec::new();
+        loop {
+            let chunk = items.by_ref().take(size).collect::<Vec<_>>();
+            if chunk.is_empty() {
+                break;
+            }
+            chunks.push(Collection::from_vec(chunk));
+        }
+
+        Collection::from_vec(chunks)
     }
 }
 
@@ -617,6 +620,18 @@ mod tests {
         let c = Collection::from_vec(vec![1, 2, 3]);
         let chunks = c.chunk(0);
         assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn chunk_consumes_non_clone_items() {
+        struct NonClone(u8);
+
+        let chunks = Collection::from_vec(vec![NonClone(1), NonClone(2), NonClone(3)]).chunk(2);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].as_slice()[0].0, 1);
+        assert_eq!(chunks[0].as_slice()[1].0, 2);
+        assert_eq!(chunks[1].as_slice()[0].0, 3);
     }
 
     // -- Ordering --

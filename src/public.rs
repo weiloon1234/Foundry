@@ -33,11 +33,12 @@ pub use crate::auth::{
 pub use crate::cache::{CacheManager, CacheStore};
 pub use crate::cli::{CommandInvocation, CommandRegistry};
 pub use crate::contract::{
-    ContractAction, ContractAuth, ContractHttpBody, ContractHttpTransport, ContractManifest,
-    ContractPayload, ContractRealtimeChannel, ContractRealtimeEvent, ContractResponse,
-    ContractSchema, ContractTransport, ContractValidationAttribute, ContractValidationField,
-    ContractValidationMessage, ContractValidationRule, ContractValidationSchema, ContractValueKind,
-    ContractWebSocketTransport, CONTRACT_MANIFEST_VERSION,
+    ContractAction, ContractAuth, ContractError, ContractHttpBody, ContractHttpTransport,
+    ContractManifest, ContractPayload, ContractRealtimeChannel, ContractRealtimeEvent,
+    ContractResponse, ContractSchema, ContractTransport, ContractValidationAttribute,
+    ContractValidationField, ContractValidationMessage, ContractValidationRule,
+    ContractValidationSchema, ContractValueKind, ContractWebSocketTransport,
+    CONTRACT_MANIFEST_VERSION,
 };
 pub use crate::countries::Country;
 pub use crate::database::{
@@ -58,8 +59,8 @@ pub use crate::database::{
     ProjectionFieldInfo, ProjectionMeta, ProjectionQuery, Query, QueryAst, QueryBody,
     QueryExecutionOptions, QueryExecutor, RelationAggregateDef, RelationDef, RelationKind,
     RelationLoader, RelationNode, RestoreModel, SeederContext, SeederFile, SelectItem, SelectNode,
-    SetOperator, Sql, TableMeta, TableRef, ToDbValue, UnaryExpr, UnaryOperator, UpdateDraft,
-    UpdateModel, Window, WindowBuilder, WindowExpr, WindowFrame, WindowFrameBound,
+    SetOperator, Sql, TableMeta, TableRef, ToDbValue, TypedPrimaryKey, UnaryExpr, UnaryOperator,
+    UpdateDraft, UpdateModel, Window, WindowBuilder, WindowExpr, WindowFrame, WindowFrameBound,
     WindowFrameUnits, WindowSpec,
 };
 pub use crate::datatable::{
@@ -116,10 +117,10 @@ pub use crate::logging::{
 };
 pub use crate::metadata::{HasMetadata, ModelMeta};
 pub use crate::notifications::{
-    BroadcastNotificationChannel, DatabaseNotificationChannel, EmailNotificationChannel,
-    Notifiable, Notification, NotificationChannel, NotificationChannelRegistry,
-    NOTIFICATION_BROADCAST_CHANNEL, NOTIFICATION_BROADCAST_EVENT, NOTIFY_BROADCAST,
-    NOTIFY_DATABASE, NOTIFY_EMAIL,
+    register_notification_websocket_channel, BroadcastNotificationChannel,
+    DatabaseNotificationChannel, EmailNotificationChannel, Notifiable, Notification,
+    NotificationChannel, NotificationChannelRegistry, NOTIFICATION_BROADCAST_CHANNEL,
+    NOTIFICATION_BROADCAST_EVENT, NOTIFY_BROADCAST, NOTIFY_DATABASE, NOTIFY_EMAIL,
 };
 pub use crate::openapi::spec::{
     generate_openapi_spec, generate_openapi_spec_from_contract, DocumentedRoute,
@@ -140,12 +141,13 @@ pub use crate::support::lock::{DistributedLock, LockGuard, LockHeartbeat};
 pub use crate::support::{
     run_blocking, sanitize_html, sha256_hex, sha256_hex_str, strip_tags, ChannelEventId, ChannelId,
     Clock, Collection, CommandId, CryptManager, Date, DateTime, EventId, GuardId, HashManager,
-    JobId, LocalDateTime, MigrationId, ModelId, NotificationChannelId, PermissionId, PluginAssetId,
-    PluginId, PluginScaffoldId, PolicyId, ProbeId, QueueId, RoleId, RouteId, ScheduleId, SeederId,
-    Time, Timezone, Token, ValidationRuleId,
+    JobId, LocalDateTime, MiddlewareGroupId, MigrationId, ModelId, NotificationChannelId,
+    PermissionId, PluginAssetId, PluginId, PluginScaffoldId, PolicyId, ProbeId, QueueId, RoleId,
+    RouteId, ScheduleId, SeederId, Time, Timezone, Token, ValidationRuleId,
 };
 pub use crate::testing::{
-    assert_safe_to_wipe, Factory, FactoryBuilder, FactoryValue, TestApp, TestClient, TestResponse,
+    assert_safe_to_wipe, Factory, FactoryBuilder, FactoryValue, TestApp, TestAppBuilder,
+    TestClient, TestRequestBuilder, TestResponse,
 };
 pub use crate::translations::{
     current_locale, translation_join, HasTranslations, ModelTranslation, TranslatedFields,

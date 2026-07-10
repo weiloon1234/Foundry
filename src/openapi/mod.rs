@@ -1,4 +1,6 @@
-use std::collections::BTreeMap;
+use std::any::TypeId;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 pub mod spec;
 
@@ -6,7 +8,7 @@ use serde_json::Value;
 
 /// Trait implemented by types that can generate an OpenAPI JSON Schema.
 /// Derive with `#[derive(ApiSchema)]`.
-pub trait ApiSchema {
+pub trait ApiSchema: 'static {
     fn schema() -> Value;
     fn schema_name() -> &'static str;
 }
@@ -104,7 +106,7 @@ impl ApiSchema for bool {
 
 impl ApiSchema for serde_json::Value {
     fn schema() -> Value {
-        serde_json::json!({"type": "object"})
+        serde_json::json!({})
     }
     fn schema_name() -> &'static str {
         "JsonValue"
@@ -113,14 +115,10 @@ impl ApiSchema for serde_json::Value {
 
 impl<T: ApiSchema> ApiSchema for Option<T> {
     fn schema() -> Value {
-        let mut s = T::schema();
-        if let Some(obj) = s.as_object_mut() {
-            obj.insert("nullable".into(), true.into());
-        }
-        s
+        nullable_schema(T::schema())
     }
     fn schema_name() -> &'static str {
-        T::schema_name()
+        structural_schema_name::<Option<T>>("Nullable", T::schema_name())
     }
 }
 
@@ -129,7 +127,7 @@ impl<T: ApiSchema> ApiSchema for Vec<T> {
         serde_json::json!({"type": "array", "items": T::schema()})
     }
     fn schema_name() -> &'static str {
-        "Array"
+        structural_schema_name::<Vec<T>>("ArrayOf", T::schema_name())
     }
 }
 
@@ -141,8 +139,33 @@ impl<T: ApiSchema> ApiSchema for BTreeMap<String, T> {
         })
     }
     fn schema_name() -> &'static str {
-        "Record"
+        structural_schema_name::<BTreeMap<String, T>>("RecordOf", T::schema_name())
     }
+}
+
+/// Wrap a JSON Schema so it accepts either the original value or JSON `null`.
+///
+/// Foundry emits OpenAPI 3.1, where JSON Schema unions replace the obsolete OpenAPI 3.0
+/// `nullable` keyword.
+pub fn nullable_schema(schema: Value) -> Value {
+    serde_json::json!({
+        "anyOf": [schema, {"type": "null"}]
+    })
+}
+
+pub(crate) fn structural_schema_name<T: 'static>(prefix: &str, inner: &str) -> &'static str {
+    static NAMES: OnceLock<Mutex<HashMap<TypeId, &'static str>>> = OnceLock::new();
+    let names = NAMES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut names = names
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(&name) = names.get(&TypeId::of::<T>()) {
+        return name;
+    }
+
+    let name: &'static str = Box::leak(format!("{prefix}{inner}").into_boxed_str());
+    names.insert(TypeId::of::<T>(), name);
+    name
 }
 
 /// Type-erased schema reference for route documentation.

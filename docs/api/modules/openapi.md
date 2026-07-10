@@ -28,6 +28,7 @@ struct SchemaRef
 trait ApiSchema
   fn schema() -> Value
   fn schema_name() -> &'static str
+fn nullable_schema(schema: Value) -> Value
 ```
 
 ## foundry::openapi::spec
@@ -37,4 +38,3 @@ struct DocumentedRoute
 fn generate_openapi_spec( title: &str, version: &str, routes: &[DocumentedRoute], ) -> Value
 fn generate_openapi_spec_from_contract( title: &str, version: &str, manifest: &ContractManifest, ) -> Value
 ```
-

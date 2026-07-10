@@ -4,9 +4,6 @@ Namespaced Redis wrapper (RedisManager, RedisConnection)
 
 [Back to index](../index.md)
 
-Supports `redis://` and TLS `rediss://` endpoints. Framework runtime Redis commands reuse a
-multiplexed connection; pub/sub uses a dedicated subscription connection.
-
 ## foundry::redis
 
 ```rust

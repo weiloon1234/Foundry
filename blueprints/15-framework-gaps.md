@@ -212,12 +212,15 @@ let url = app.route_url("users.show", &[("id", "123")])?;
 
 **DX:**
 ```rust
+const WEB_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("web");
+const API_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("api");
+
 App::builder()
-    .middleware_group("web", vec![
+    .middleware_group(WEB_MIDDLEWARE, vec![
         Csrf::new().build(),
         Compression::new().build(),
     ])
-    .middleware_group("api", vec![
+    .middleware_group(API_MIDDLEWARE, vec![
         RateLimit::new(100).per_minute().by_actor_or_ip().build(),
         Compression::new().build(),
     ])
@@ -225,13 +228,13 @@ App::builder()
 
 // Use in routes:
 r.route_with_options("/dashboard", get(dashboard),
-    HttpRouteOptions::new().middleware_group("web"));
+    HttpRouteOptions::new().middleware_group(WEB_MIDDLEWARE));
 
 r.route_with_options("/api/users", get(list_users),
-    HttpRouteOptions::new().middleware_group("api"));
+    HttpRouteOptions::new().middleware_group(API_MIDDLEWARE));
 ```
 
-**Internal:** `AppBuilder` stores named groups as `HashMap<String, Vec<MiddlewareConfig>>`. `HttpRouteOptions::middleware_group()` resolves the group at router-build time.
+**Internal:** `AppBuilder` and `MiddlewareGroups` store semantic `MiddlewareGroupId` keys. `HttpRouteOptions::middleware_group()` resolves the typed group at router-build time.
 
 **Files:** `src/foundation/app.rs` — `middleware_group()` on builder, `src/http/mod.rs` — `middleware_group()` on options
 

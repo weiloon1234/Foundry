@@ -56,9 +56,10 @@ struct ConfigRepository
   fn crypt(&self) -> Result<CryptConfig>
 struct CryptConfig
 struct DatabaseConfig
+  fn write_pool_config(&self) -> ResolvedDatabasePoolConfig
+  fn read_pool_config(&self) -> ResolvedDatabasePoolConfig
 struct DatabaseModelConfig
 struct DatabasePoolConfig
-struct ResolvedDatabasePoolConfig
 struct DatatableConfig
 struct EmailVerificationConfig
 struct GuardDriverConfig
@@ -77,6 +78,7 @@ struct MfaConfig
 struct ObservabilityConfig
 struct PasswordResetConfig
 struct RedisConfig
+struct ResolvedDatabasePoolConfig
 struct RuntimeConfig
 struct SchedulerConfig
 struct ServerConfig

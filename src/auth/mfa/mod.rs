@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 
 use crate::auth::lockout::LoginThrottle;
-use crate::auth::token::TokenResponse;
+use crate::auth::token::{actor_has_mfa_pending, TokenResponse};
 use crate::auth::{Actor, CurrentActor};
 use crate::config::MfaConfig;
 use crate::database::{ComparisonOp, Condition, DbType, DbValue, Expr, FromDbValue, Query, Sql};
@@ -259,11 +259,11 @@ impl TotpFactor {
         }))
     }
 
-    async fn upsert_pending_secret(&self, actor: &Actor, secret: &str) -> Result<()> {
+    async fn upsert_pending_secret(&self, actor: &Actor, secret: &str) -> Result<bool> {
         let encrypted = self.app.crypt()?.encrypt_string(secret)?;
         let database = self.app.database()?;
         let empty_recovery_codes = serde_json::json!([]);
-        Query::insert_into(AUTH_MFA_TOTP_FACTORS_TABLE)
+        let affected = Query::insert_into(AUTH_MFA_TOTP_FACTORS_TABLE)
             .values([
                 ("guard", DbValue::Text(actor.guard.to_string())),
                 ("actor_id", DbValue::Text(actor.id.clone())),
@@ -280,9 +280,10 @@ impl TotpFactor {
             .set("recovery_codes", DbValue::Json(empty_recovery_codes))
             .set("last_used_step", DbValue::Null(DbType::Int64))
             .set_expr("updated_at", Sql::now())
+            .where_(Expr::column("confirmed_at").is_null())
             .execute(database.as_ref())
             .await?;
-        Ok(())
+        Ok(affected > 0)
     }
 
     async fn mark_confirmed(&self, actor: &Actor, last_used_step: i64) -> Result<()> {
@@ -429,7 +430,13 @@ impl MfaFactor for TotpFactor {
     async fn enroll(&self, actor: &Actor) -> Result<EnrollChallenge> {
         self.ensure_enabled()?;
         let secret = encode_base32(&Token::bytes(20)?);
-        self.upsert_pending_secret(actor, &secret).await?;
+        if !self.upsert_pending_secret(actor, &secret).await? {
+            return Err(Error::http_with_code(
+                409,
+                "MFA is already confirmed. Verify the current factor before replacing it.",
+                "mfa_replacement_requires_verification",
+            ));
+        }
         let issuer = if self.config.issuer.trim().is_empty() {
             self.app.config().app()?.name
         } else {
@@ -559,6 +566,7 @@ pub mod routes {
         CurrentActor(actor): CurrentActor,
         Json(body): Json<CodeRequest>,
     ) -> Result<Json<TokenResponse>> {
+        ensure_mfa_pending_actor(&actor)?;
         let manager = MfaManager::new(&app)?;
         let totp = manager.totp();
         totp.verify(&actor, &body.code).await?;
@@ -588,6 +596,18 @@ pub mod routes {
             .await?;
         Ok(Json(RecoveryCodesResponse { recovery_codes }))
     }
+}
+
+fn ensure_mfa_pending_actor(actor: &Actor) -> Result<()> {
+    if actor_has_mfa_pending(actor) {
+        return Ok(());
+    }
+
+    Err(Error::http_with_code(
+        403,
+        "An MFA-pending credential is required to complete authentication.",
+        "mfa_pending_token_required",
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -815,5 +835,21 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn mfa_token_exchange_requires_pending_actor() {
+        let actor = Actor::new("actor-1", GuardId::new("api"));
+        let error = ensure_mfa_pending_actor(&actor).unwrap_err();
+        assert_eq!(error.payload()["status"], serde_json::json!(403));
+        assert_eq!(
+            error.payload()["error_code"],
+            serde_json::json!("mfa_pending_token_required")
+        );
+
+        let pending = actor.with_permissions([crate::support::PermissionId::new(
+            crate::auth::token::MFA_PENDING_ABILITY,
+        )]);
+        ensure_mfa_pending_actor(&pending).unwrap();
     }
 }

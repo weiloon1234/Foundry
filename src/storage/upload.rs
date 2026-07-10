@@ -26,7 +26,12 @@ const MAX_UPLOAD_FILENAME_BYTES: usize = 255;
 /// Contains metadata about the upload (original name, content type, size)
 /// and the temporary path where the file body was written by the HTTP layer.
 ///
-/// Helper methods generate safe storage names and paths.
+/// Helper methods generate safe storage names and paths. The borrowed `store*`
+/// methods intentionally leave the temporary file in place so callers can read,
+/// transform, or store it more than once. When the caller owns the upload and no
+/// longer needs its temporary bytes, prefer the consuming `store*_and_cleanup`
+/// methods so Foundry removes its temporary file immediately after the storage
+/// attempt.
 #[derive(Debug, Clone)]
 pub struct UploadedFile {
     pub field_name: String,
@@ -185,6 +190,8 @@ impl UploadedFile {
     /// Stores the uploaded file on the default disk in the given directory.
     ///
     /// Generates a unique filename (UUIDv7-based) preserving the original extension.
+    /// The temporary file is retained for reuse; prefer [`Self::store_and_cleanup`]
+    /// when this is the final use of the upload.
     pub async fn store(&self, app: &AppContext, dir: &str) -> Result<StoredFile> {
         let storage = app.resolve::<StorageManager>()?;
         let disk = storage.default_disk()?;
@@ -197,6 +204,8 @@ impl UploadedFile {
     /// Stores the uploaded file on a named disk in the given directory.
     ///
     /// Generates a unique filename (UUIDv7-based) preserving the original extension.
+    /// The temporary file is retained for reuse; prefer
+    /// [`Self::store_on_and_cleanup`] when this is the final use of the upload.
     pub async fn store_on(
         &self,
         app: &AppContext,
@@ -214,6 +223,8 @@ impl UploadedFile {
     /// Stores the uploaded file on the default disk with a custom filename.
     ///
     /// The name is normalized (path components stripped) before storage.
+    /// The temporary file is retained for reuse; prefer
+    /// [`Self::store_as_and_cleanup`] when this is the final use of the upload.
     pub async fn store_as(&self, app: &AppContext, dir: &str, name: &str) -> Result<StoredFile> {
         let storage = app.resolve::<StorageManager>()?;
         let disk = storage.default_disk()?;
@@ -226,6 +237,8 @@ impl UploadedFile {
     /// Stores the uploaded file on a named disk with a custom filename.
     ///
     /// The name is normalized (path components stripped) before storage.
+    /// The temporary file is retained for reuse; prefer
+    /// [`Self::store_as_on_and_cleanup`] when this is the final use of the upload.
     pub async fn store_as_on(
         &self,
         app: &AppContext,
@@ -239,6 +252,95 @@ impl UploadedFile {
         let path = Self::storage_path(dir, &safe_name);
         disk.put_file(&path, &self.temp_path, self.content_type.as_deref())
             .await
+    }
+
+    /// Stores this upload on the default disk, then removes its Foundry-owned
+    /// temporary file whether storage succeeds or fails.
+    ///
+    /// This consumes the handle to make final-use intent explicit. Foundry-owned
+    /// temporary bytes are no longer reusable after the call; a non-Foundry
+    /// `temp_path` is never removed. If storage and cleanup both fail, the storage
+    /// error is returned as the primary error.
+    pub async fn store_and_cleanup(self, app: &AppContext, dir: &str) -> Result<StoredFile> {
+        let result = self.store(app, dir).await;
+        self.finish_store_and_cleanup(result).await
+    }
+
+    /// Stores this upload on a named disk, then removes its Foundry-owned temporary
+    /// file whether storage succeeds or fails.
+    ///
+    /// This consumes the handle to make final-use intent explicit. Foundry-owned
+    /// temporary bytes are no longer reusable after the call; a non-Foundry
+    /// `temp_path` is never removed. If storage and cleanup both fail, the storage
+    /// error is returned as the primary error.
+    pub async fn store_on_and_cleanup(
+        self,
+        app: &AppContext,
+        disk_name: &str,
+        dir: &str,
+    ) -> Result<StoredFile> {
+        let result = self.store_on(app, disk_name, dir).await;
+        self.finish_store_and_cleanup(result).await
+    }
+
+    /// Stores this upload with a custom filename on the default disk, then removes
+    /// its Foundry-owned temporary file whether storage succeeds or fails.
+    ///
+    /// This consumes the handle to make final-use intent explicit. Foundry-owned
+    /// temporary bytes are no longer reusable after the call; a non-Foundry
+    /// `temp_path` is never removed. If storage and cleanup both fail, the storage
+    /// error is returned as the primary error.
+    pub async fn store_as_and_cleanup(
+        self,
+        app: &AppContext,
+        dir: &str,
+        name: &str,
+    ) -> Result<StoredFile> {
+        let result = self.store_as(app, dir, name).await;
+        self.finish_store_and_cleanup(result).await
+    }
+
+    /// Stores this upload with a custom filename on a named disk, then removes its
+    /// Foundry-owned temporary file whether storage succeeds or fails.
+    ///
+    /// This consumes the handle to make final-use intent explicit. Foundry-owned
+    /// temporary bytes are no longer reusable after the call; a non-Foundry
+    /// `temp_path` is never removed. If storage and cleanup both fail, the storage
+    /// error is returned as the primary error.
+    pub async fn store_as_on_and_cleanup(
+        self,
+        app: &AppContext,
+        disk_name: &str,
+        dir: &str,
+        name: &str,
+    ) -> Result<StoredFile> {
+        let result = self.store_as_on(app, disk_name, dir, name).await;
+        self.finish_store_and_cleanup(result).await
+    }
+
+    async fn finish_store_and_cleanup(
+        self,
+        store_result: Result<StoredFile>,
+    ) -> Result<StoredFile> {
+        let cleanup_result = remove_foundry_upload_temp_path(&self.temp_path).await;
+
+        match store_result {
+            Err(store_error) => {
+                if let Err(cleanup_error) = cleanup_result {
+                    tracing::warn!(
+                        target: "foundry.storage",
+                        path = %self.temp_path.display(),
+                        error = %cleanup_error,
+                        "Failed to clean up uploaded temp file after storage failed"
+                    );
+                }
+                Err(store_error)
+            }
+            Ok(stored) => {
+                cleanup_result?;
+                Ok(stored)
+            }
+        }
     }
 }
 
@@ -362,15 +464,9 @@ pub async fn prune_stale_upload_temp_files(retention_seconds: u64, batch_size: u
 }
 
 pub async fn remove_uploaded_temp_file(file: &UploadedFile) -> bool {
-    if !is_foundry_upload_temp_path(&file.temp_path) {
-        return false;
-    }
-
-    match tokio::fs::remove_file(&file.temp_path).await {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => false,
-    }
+    remove_foundry_upload_temp_path(&file.temp_path)
+        .await
+        .unwrap_or(false)
 }
 
 pub async fn cleanup_uploaded_files<'a, I>(files: I)
@@ -432,6 +528,21 @@ async fn prune_stale_upload_temp_files_in_dir(
     }
 
     Ok(deleted)
+}
+
+async fn remove_foundry_upload_temp_path(path: &Path) -> Result<bool> {
+    if !is_foundry_upload_temp_path(path) {
+        return Ok(false);
+    }
+
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::message(format!(
+            "failed to remove uploaded temp file `{}`: {error}",
+            path.display()
+        ))),
+    }
 }
 
 fn upload_too_large_error() -> Error {
@@ -526,6 +637,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use axum::body::Body;
     use axum::extract::FromRequest as _;
     use axum::http::{header, Request, StatusCode};
@@ -570,6 +683,42 @@ mod tests {
             size: 1024,
             temp_path: PathBuf::from("/tmp/upload123"),
         }
+    }
+
+    fn make_upload_at(temp_path: PathBuf, original_name: &str, size: u64) -> UploadedFile {
+        UploadedFile {
+            field_name: "file".to_string(),
+            original_name: Some(original_name.to_string()),
+            content_type: Some("text/plain".to_string()),
+            size,
+            temp_path,
+        }
+    }
+
+    fn foundry_owned_temp_file(contents: &[u8]) -> PathBuf {
+        let path = foundry_upload_temp_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    async fn app_with_local_storage(root: &Path) -> AppContext {
+        let root = toml::Value::String(root.to_string_lossy().into_owned());
+        let app = app_with_storage_config(&format!(
+            r#"
+            [storage]
+            default = "local"
+
+            [storage.disks.local]
+            driver = "local"
+            root = {root}
+            "#
+        ));
+        let storage = StorageManager::from_config(app.config(), HashMap::new())
+            .await
+            .unwrap();
+        app.container().singleton(storage).unwrap();
+        app
     }
 
     #[test]
@@ -699,6 +848,123 @@ mod tests {
     fn storage_path_combines_dir_and_name() {
         let path = UploadedFile::storage_path("avatars", "uuid.png");
         assert_eq!(path, "avatars/uuid.png");
+    }
+
+    #[tokio::test]
+    async fn consuming_store_removes_foundry_owned_temp_file_after_success() {
+        let root = tempfile::tempdir().unwrap();
+        let app = app_with_local_storage(root.path()).await;
+        let temp_path = foundry_owned_temp_file(b"stored contents");
+        let upload = make_upload_at(temp_path.clone(), "report.txt", 15);
+
+        let stored = upload
+            .store_as_and_cleanup(&app, "reports", "final.txt")
+            .await
+            .unwrap();
+
+        assert_eq!(stored.path, "reports/final.txt");
+        assert_eq!(
+            std::fs::read(root.path().join("reports/final.txt")).unwrap(),
+            b"stored contents"
+        );
+        assert!(!temp_path.exists());
+    }
+
+    #[tokio::test]
+    async fn consuming_store_removes_foundry_owned_temp_file_after_storage_error() {
+        let app = app_with_storage_config("[storage]\n");
+        let temp_path = foundry_owned_temp_file(b"cleanup on error");
+        let upload = make_upload_at(temp_path.clone(), "report.txt", 16);
+
+        let error = upload.store_and_cleanup(&app, "reports").await.unwrap_err();
+
+        assert!(error.to_string().contains("StorageManager"));
+        assert!(error.to_string().contains("not registered"));
+        assert!(!temp_path.exists());
+    }
+
+    #[tokio::test]
+    async fn consuming_store_preserves_storage_error_when_cleanup_also_fails() {
+        let temp_path = foundry_upload_temp_path();
+        std::fs::create_dir_all(&temp_path).unwrap();
+        let upload = make_upload_at(temp_path.clone(), "report.txt", 0);
+
+        let error = upload
+            .finish_store_and_cleanup(Err(Error::message("primary storage error")))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "primary storage error");
+        assert!(temp_path.is_dir());
+        std::fs::remove_dir(temp_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn consuming_store_reports_cleanup_error_after_storage_succeeds() {
+        let temp_path = foundry_upload_temp_path();
+        std::fs::create_dir_all(&temp_path).unwrap();
+        let upload = make_upload_at(temp_path.clone(), "report.txt", 0);
+        let stored = StoredFile {
+            disk: "local".to_string(),
+            path: "reports/report.txt".to_string(),
+            name: "report.txt".to_string(),
+            size: 0,
+            content_type: Some("text/plain".to_string()),
+            url: None,
+        };
+
+        let error = upload
+            .finish_store_and_cleanup(Ok(stored))
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to remove uploaded temp file"));
+        assert!(temp_path.is_dir());
+        std::fs::remove_dir(temp_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn borrowed_store_keeps_temp_file_reusable() {
+        let root = tempfile::tempdir().unwrap();
+        let app = app_with_local_storage(root.path()).await;
+        let temp_path = foundry_owned_temp_file(b"reusable contents");
+        let upload = make_upload_at(temp_path.clone(), "report.txt", 17);
+
+        upload.store_as(&app, "reports", "first.txt").await.unwrap();
+        upload
+            .store_as(&app, "reports", "second.txt")
+            .await
+            .unwrap();
+
+        assert!(temp_path.exists());
+        assert_eq!(
+            std::fs::read(root.path().join("reports/first.txt")).unwrap(),
+            b"reusable contents"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("reports/second.txt")).unwrap(),
+            b"reusable contents"
+        );
+        assert!(remove_uploaded_temp_file(&upload).await);
+    }
+
+    #[tokio::test]
+    async fn consuming_store_does_not_remove_non_foundry_temp_path() {
+        let root = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let app = app_with_local_storage(root.path()).await;
+        let temp_path = source.path().join("external.txt");
+        std::fs::write(&temp_path, b"external contents").unwrap();
+        let upload = make_upload_at(temp_path.clone(), "external.txt", 17);
+
+        upload
+            .store_as_and_cleanup(&app, "reports", "external.txt")
+            .await
+            .unwrap();
+
+        assert!(temp_path.exists());
     }
 
     #[test]

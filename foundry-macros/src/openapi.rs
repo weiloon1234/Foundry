@@ -60,46 +60,34 @@ fn expand_struct(
 
         // Parse #[validate(...)] attributes for constraints
         let constraints = parse_validate_constraints(&field.attrs)?;
-
-        if !is_option {
-            // Check if validate has `required` — but non-Option fields are always required
+        let is_required = !is_option
+            || constraints
+                .iter()
+                .any(|constraint| matches!(constraint, ValidateConstraint::Required));
+        if is_required {
             required_fields.push(field_name.clone());
-        } else {
-            // Option fields are required only if explicitly marked
-            for c in &constraints {
-                if matches!(c, ValidateConstraint::Required) {
-                    required_fields.push(field_name.clone());
-                }
-            }
         }
 
         let constraint_inserts: Vec<TokenStream> = constraints
             .iter()
             .filter_map(|c| c.to_schema_insert())
             .collect();
-
-        if is_option {
-            property_inserts.push(quote! {
-                {
-                    let mut field_schema = #schema_expr;
-                    if let Some(obj) = field_schema.as_object_mut() {
-                        obj.insert("nullable".into(), ::serde_json::Value::Bool(true));
-                        #(#constraint_inserts)*
-                    }
-                    properties.insert(#field_name.to_string(), field_schema);
-                }
-            });
+        let nullable_wrap = if is_option && !is_required {
+            quote!(let field_schema = ::foundry::openapi::nullable_schema(field_schema);)
         } else {
-            property_inserts.push(quote! {
-                {
-                    let mut field_schema = #schema_expr;
-                    if let Some(obj) = field_schema.as_object_mut() {
-                        #(#constraint_inserts)*
-                    }
-                    properties.insert(#field_name.to_string(), field_schema);
+            quote!()
+        };
+
+        property_inserts.push(quote! {
+            {
+                let mut field_schema = #schema_expr;
+                if let Some(obj) = field_schema.as_object_mut() {
+                    #(#constraint_inserts)*
                 }
-            });
-        }
+                #nullable_wrap
+                properties.insert(#field_name.to_string(), field_schema);
+            }
+        });
     }
 
     let required_tokens = if required_fields.is_empty() {
@@ -197,13 +185,7 @@ fn type_to_schema_expr(ty: &Type) -> TokenStream {
     if let Some(inner) = option_inner_type(ty) {
         let inner_expr = type_to_schema_expr(inner);
         return quote! {
-            {
-                let mut s = #inner_expr;
-                if let Some(obj) = s.as_object_mut() {
-                    obj.insert("nullable".into(), ::serde_json::Value::Bool(true));
-                }
-                s
-            }
+            ::foundry::openapi::nullable_schema(#inner_expr)
         };
     }
 
@@ -245,7 +227,7 @@ fn type_to_schema_expr(ty: &Type) -> TokenStream {
         return quote! { ::serde_json::json!({"type": "string", "format": "uuid"}) };
     }
     if type_path_last_segment_matches(ty, "Value") {
-        return quote! { ::serde_json::json!({"type": "object"}) };
+        return quote! { ::serde_json::json!({}) };
     }
 
     // For types that implement ApiSchema, call their schema() at runtime.

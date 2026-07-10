@@ -214,4 +214,3 @@ enum DatatableValue { Null, String, Number, Bool, Date, DateTime }
 
 - JSON responses clamp `DatatableRequest.per_page` to `datatable.max_per_page` unless the cap is `0`.
 - XLSX downloads and queued exports apply `datatable.max_export_rows` before loading rows into memory; `0` disables the cap.
-

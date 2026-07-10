@@ -1,0 +1,6 @@
+error: AppEnum alias 'legacy' conflicts with the key or alias for variant `Archived`
+ --> tests/ui/derive/fail_app_enum_alias_collision.rs:3:5
+  |
+3 | /     #[foundry(aliases = ["legacy"])]
+4 | |     Active,
+  | |__________^

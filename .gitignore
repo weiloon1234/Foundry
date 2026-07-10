@@ -24,6 +24,10 @@ Thumbs.db
 # Environment
 .env
 .env.*
+.env*.backup
+.env*.backup.*
+.env*.deploy-backup
+.env*.deploy-backup.*
 
 # Logs
 logs/

@@ -43,23 +43,33 @@ impl ServiceProvider for DummyProvider {
     }
 }
 
+fn raw_middleware_group_references(scope: &mut HttpScope<'_>, route: &mut HttpRouteBuilder) {
+    let mut groups = MiddlewareGroups::default();
+    let _ = groups.register("api", Vec::new());
+    scope.middleware_group("api");
+    route.middleware_group("api");
+}
+
 fn main() {
     let _ = App::builder()
         .register_provider(DummyProvider)
-        .register_validation_rule("mobile", DummyRule);
+        .register_validation_rule("mobile", DummyRule)
+        .middleware_group("api", Vec::new());
 
     let _ = HttpRouteOptions::new()
         .guard("api")
-        .permission("reports:view");
+        .permission("reports:view")
+        .middleware_group("api");
 
     let _ = WebSocketChannelOptions::new()
         .guard("api")
         .permission("ws:chat");
 
     let mut commands = CommandRegistry::new();
-    let _ = commands.command(Command::new("hello"), |_invocation: CommandInvocation| async {
-        Ok(())
-    });
+    let _ = commands.command(
+        Command::new("hello"),
+        |_invocation: CommandInvocation| async { Ok(()) },
+    );
 
     let mut schedules = ScheduleRegistry::new();
     let _ = schedules.cron(

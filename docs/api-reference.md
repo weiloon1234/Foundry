@@ -124,7 +124,7 @@ fn register_schedule<F>(self, registrar: F) -> Self
 fn register_websocket_routes<F>(self, registrar: F) -> Self
 fn register_validation_rule<I, R>(self, id: I, rule: R) -> Self
 fn register_middleware(self, config: MiddlewareConfig) -> Self
-fn middleware_group(self, name: &str, middlewares: Vec<MiddlewareConfig>) -> Self
+fn middleware_group<I: Into<MiddlewareGroupId>>(self, id: I, middlewares: Vec<MiddlewareConfig>) -> Self
 fn enable_observability(self) -> Self
 fn enable_public_observability(self) -> Self
 fn enable_observability_with(self, options: ObservabilityOptions) -> Self
@@ -209,7 +209,7 @@ fn transaction(&self) -> &DatabaseTransaction
 fn set_actor(&mut self, actor: Actor)
 fn actor(&self) -> Option<&Actor>
 fn dispatch_after_commit<J: Job>(&self, job: J)
-fn notify_after_commit(&self, notifiable: &dyn Notifiable, notification: &dyn Notification)
+fn notify_after_commit(&self, notifiable: &dyn Notifiable, notification: &dyn Notification) -> Result<()>
 fn after_commit<F, Fut>(&self, callback: F)
 async fn commit(self) -> Result<()>
 async fn rollback(self) -> Result<()>
@@ -297,6 +297,10 @@ async fn tick_at(&self, now: DateTime) -> Result<Vec<ScheduleId>>
 async fn run_once(&self) -> Result<Vec<ScheduleId>>
 async fn run_once_at(&self, now: DateTime) -> Result<Vec<ScheduleId>>
 ```
+
+`tick`, `run_once`, and the normal scheduler runtime evaluate cron fields in the configured app
+timezone. `tick_at` and `run_once_at` retain UTC cron semantics for deterministic injected times.
+Nonexistent and ambiguous IANA local wall times are skipped.
 
 ### WorkerKernel
 
@@ -440,6 +444,7 @@ All created via `TypeId::new("literal")` — zero-cost, const-constructible:
 | `PolicyId` | Authorization policy |
 | `PermissionId` | Permission |
 | `RoleId` | Role |
+| `MiddlewareGroupId` | HTTP middleware group |
 | `ValidationRuleId` | Validation rule |
 | `CommandId` | CLI command |
 | `ScheduleId` | Scheduled task |
@@ -1288,7 +1293,7 @@ fn guard<I>(&mut self, guard: I) -> &mut Self
 fn permission<I>(&mut self, permission: I) -> &mut Self
 fn permissions<I, P>(&mut self, permissions: I) -> &mut Self
 fn middleware(&mut self, config: MiddlewareConfig) -> &mut Self
-fn middleware_group(&mut self, name: impl Into<String>) -> &mut Self
+fn middleware_group<I: Into<MiddlewareGroupId>>(&mut self, id: I) -> &mut Self
 fn rate_limit(&mut self, rate_limit: RateLimit) -> &mut Self
 fn tag(&mut self, tag: &str) -> &mut Self
 fn summary(&mut self, summary: &str) -> &mut Self
@@ -1309,7 +1314,7 @@ fn guard<I>(self, guard: I) -> Self
 fn permission<I>(self, permission: I) -> Self
 fn permissions<I, P>(self, permissions: I) -> Self
 fn middleware(self, config: MiddlewareConfig) -> Self
-fn middleware_group(self, name: impl Into<String>) -> Self
+fn middleware_group<I: Into<MiddlewareGroupId>>(self, id: I) -> Self
 fn rate_limit(self, rate_limit: RateLimit) -> Self
 fn document(self, doc: RouteDoc) -> Self
 ```
@@ -1322,7 +1327,7 @@ fn guard<I>(&mut self, guard: I) -> &mut Self
 fn permission<I>(&mut self, permission: I) -> &mut Self
 fn permissions<I, P>(&mut self, permissions: I) -> &mut Self
 fn middleware(&mut self, config: MiddlewareConfig) -> &mut Self
-fn middleware_group(&mut self, name: impl Into<String>) -> &mut Self
+fn middleware_group<I: Into<MiddlewareGroupId>>(&mut self, id: I) -> &mut Self
 fn rate_limit(&mut self, rate_limit: RateLimit) -> &mut Self
 fn tag(&mut self, tag: &str) -> &mut Self
 fn summary(&mut self, summary: &str) -> &mut Self
@@ -1361,6 +1366,11 @@ fn deprecated(&mut self) -> &mut Self
 | `TrustedProxy` | Proxy trust config |
 | `ETag` | HTTP ETag support |
 | `MiddlewareGroups` | Named middleware group registry |
+
+```rust
+fn get(&self, id: &MiddlewareGroupId) -> Option<&Vec<MiddlewareConfig>>
+fn register<I: Into<MiddlewareGroupId>>(&mut self, id: I, middlewares: Vec<MiddlewareConfig>) -> Result<()>
+```
 
 #### Download helpers
 
@@ -1506,7 +1516,7 @@ Wire values serialize as `snake_case` (`subscribe`, `unsubscribe`, `message`, `c
 
 | Name | Summary |
 |------|---------|
-| `PresenceInfo` | `actor_id`, `channel`, `joined_at` |
+| `PresenceInfo` | `actor_id`, `channel`, optional `room`, `joined_at` |
 | `ClientMessage` | `action`, `channel`, `room`, `payload`, `event`, `ack_id` |
 | `ServerMessage` | `channel`, `event`, `room`, `payload` |
 | `WebSocketContext` | Connection context: app, connection_id, actor, channel, room |
@@ -1749,8 +1759,8 @@ Local + S3 file storage with multipart uploads.
 
 ```rust
 trait StorageAdapter: Send + Sync + 'static {
-    async fn put_bytes(&self, path: &str, bytes: &[u8]) -> Result<()>;
-    async fn put_file(&self, path: &str, temp_path: &Path, content_type: Option<&str>) -> Result<()>;
+    async fn put_bytes(&self, path: &str, bytes: &[u8], content_type: Option<&str>, visibility: StorageVisibility) -> Result<StoredFile>;
+    async fn put_file(&self, path: &str, temp_path: &Path, content_type: Option<&str>, visibility: StorageVisibility) -> Result<StoredFile>;
     async fn get(&self, path: &str) -> Result<Vec<u8>>;
     async fn delete(&self, path: &str) -> Result<()>;
     async fn exists(&self, path: &str) -> Result<bool>;
@@ -1761,6 +1771,8 @@ trait StorageAdapter: Send + Sync + 'static {
     async fn list_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<StorageObject>>;
 }
 ```
+
+S3 writes persist the supplied content type as object metadata. `StorageVisibility` is disk-level access intent and is not emitted as an `x-amz-acl` header; public access should be configured with bucket policy or provider public-bucket/CDN settings so ACL-disabled AWS buckets and S3-compatible providers remain supported.
 
 ### Type Aliases
 
@@ -1791,7 +1803,15 @@ fn store(&self, app: &AppContext, dir: &str) -> Result<StoredFile>
 fn store_on(&self, app: &AppContext, disk_name: &str, dir: &str) -> Result<StoredFile>
 fn store_as(&self, app: &AppContext, dir: &str, name: &str) -> Result<StoredFile>
 fn store_as_on(&self, app: &AppContext, disk_name: &str, dir: &str, name: &str) -> Result<StoredFile>
+fn store_and_cleanup(self, app: &AppContext, dir: &str) -> Result<StoredFile>
+fn store_on_and_cleanup(self, app: &AppContext, disk_name: &str, dir: &str) -> Result<StoredFile>
+fn store_as_and_cleanup(self, app: &AppContext, dir: &str, name: &str) -> Result<StoredFile>
+fn store_as_on_and_cleanup(self, app: &AppContext, disk_name: &str, dir: &str, name: &str) -> Result<StoredFile>
 ```
+
+Borrowed `store*` methods retain the temporary file for reuse. Consuming
+`store*_and_cleanup` methods remove framework-owned upload temp files after the storage attempt,
+including when storage fails; non-Foundry paths are never removed.
 
 ### Upload helpers
 
@@ -1950,6 +1970,7 @@ fn as_str(&self) -> &str
 ```rust
 fn new() -> Self
 fn without_overlapping(self) -> Self
+fn without_overlapping_for(self, ttl: Duration) -> Self
 fn environments(self, envs: &[&str]) -> Self
 fn before<F, Fut>(self, hook: F) -> Self
 fn after<F, Fut>(self, hook: F) -> Self
@@ -1973,8 +1994,9 @@ fn weekly<I, F, Fut>(&mut self, id: I, job: F) -> Result<&mut Self>
 ```
 
 Schedule handler panics are handled as schedule failures and route through `ScheduleOptions::on_failure`.
-Hook panics are logged and isolated, `without_overlapping` locks are released on failure or panic,
-and active schedules drain for `scheduler.shutdown_timeout_ms` during shutdown.
+Hook panics are logged and isolated. `without_overlapping` uses an owner-token lease that is renewed
+for long-running handlers, fails closed when its backend is unavailable, and is released safely on
+failure or panic. Active schedules drain for `scheduler.shutdown_timeout_ms` during shutdown.
 
 ---
 
@@ -2061,7 +2083,8 @@ trait NotificationChannel: Send + Sync + 'static {
 ```rust
 async fn notify(app: &AppContext, notifiable: &dyn Notifiable, notification: &dyn Notification) -> Result<()>
 async fn notify_queued(app: &AppContext, notifiable: &dyn Notifiable, notification: &dyn Notification) -> Result<()>
-fn build_notification_job(notifiable: &dyn Notifiable, notification: &dyn Notification) -> SendNotificationJob
+fn build_notification_job(notifiable: &dyn Notifiable, notification: &dyn Notification) -> Result<SendNotificationJob>
+fn register_notification_websocket_channel<G: Into<GuardId>>(registrar: &mut WebSocketRegistrar, guard: G) -> Result<()>
 ```
 
 ---
@@ -2612,8 +2635,12 @@ trait Factory: Model {
 
 ```rust
 fn builder() -> TestAppBuilder
+fn from_builder(builder: AppBuilder) -> TestAppBuilder
 fn app(&self) -> &AppContext
 fn client(&self) -> TestClient
+async fn shutdown(self) -> Result<()>
+async fn seed_presence(&self, channel: &ChannelId, actor_id: &str, joined_at: i64) -> Result<()>
+async fn history_ttl(&self, channel: &ChannelId) -> Result<Option<u64>>
 ```
 
 ### TestAppBuilder
@@ -2623,7 +2650,11 @@ fn load_config_dir(self, path: impl Into<PathBuf>) -> Self
 fn register_provider<P>(self, provider: P) -> Self
 fn register_routes<F>(self, registrar: F) -> Self
 fn register_middleware(self, config: MiddlewareConfig) -> Self
-async fn build(self) -> TestApp
+fn register_websocket_routes<F>(self, registrar: F) -> Self
+fn enable_observability(self) -> Self
+fn enable_public_observability(self) -> Self
+fn enable_observability_with(self, options: ObservabilityOptions) -> Self
+async fn build(self) -> Result<TestApp>
 ```
 
 ### TestClient
@@ -2641,8 +2672,10 @@ fn delete(&self, path: &str) -> TestRequestBuilder
 ```rust
 fn header(self, name: &str, value: &str) -> Self
 fn bearer_auth(self, token: &str) -> Self
-fn json(self, value: &impl Serialize) -> Self
-async fn send(self) -> TestResponse
+fn body(self, body: impl Into<Vec<u8>>) -> Self
+fn text(self, body: impl Into<String>) -> Self
+fn json(self, value: &impl Serialize) -> Result<Self>
+async fn send(self) -> Result<TestResponse>
 ```
 
 ### TestResponse
@@ -2650,7 +2683,9 @@ async fn send(self) -> TestResponse
 ```rust
 fn status(&self) -> StatusCode
 fn header(&self, name: &str) -> Option<&str>
-fn json<T: DeserializeOwned>(&self) -> T
+fn json<T: DeserializeOwned>(&self) -> Result<T>
+fn text(&self) -> Result<String>
+fn bytes(&self) -> &[u8]
 fn text(&self) -> String
 fn bytes(&self) -> &[u8]
 ```

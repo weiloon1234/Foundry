@@ -3,17 +3,20 @@ mod leadership;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime as ChronoDateTime, TimeZone as ChronoTimeZone};
 use cron::Schedule as CronSchedule;
 use serde::{Deserialize, Serialize};
 
 use crate::foundation::{AppContext, Error, Result};
 use crate::logging::{catch_sync_panic, panic_payload_message};
 use crate::support::{boxed, BoxFuture};
-use crate::support::{DateTime, ScheduleId};
+use crate::support::{DateTime, ScheduleId, Timezone};
 
 pub type ScheduleRegistrar = Arc<dyn Fn(&mut ScheduleRegistry) -> Result<()> + Send + Sync>;
 pub(crate) type ScheduleHandler = Arc<dyn Fn(AppContext) -> BoxFuture<Result<()>> + Send + Sync>;
 pub(crate) type ScheduleHook = Arc<dyn Fn(AppContext) -> BoxFuture<Result<()>> + Send + Sync>;
+
+const DEFAULT_OVERLAP_LOCK_TTL: Duration = Duration::from_secs(3_600);
 
 pub(crate) fn build_registry(registrars: &[ScheduleRegistrar]) -> Result<ScheduleRegistry> {
     let mut registry = ScheduleRegistry::new();
@@ -102,6 +105,9 @@ impl CronExpression {
     }
 
     /// Daily at a specific time (HH:MM format).
+    ///
+    /// Clock-driven scheduler execution interprets this wall time in the configured
+    /// application timezone.
     pub fn daily_at(time: &str) -> Result<Self> {
         let parts: Vec<&str> = time.split(':').collect();
         if parts.len() != 2 {
@@ -163,13 +169,27 @@ pub enum ScheduleKind {
 }
 
 /// Per-task configuration options.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ScheduleOptions {
     pub(crate) without_overlapping: bool,
+    pub(crate) overlap_lock_ttl: Duration,
     pub(crate) environments: Vec<String>,
     pub(crate) before_hook: Option<ScheduleHook>,
     pub(crate) after_hook: Option<ScheduleHook>,
     pub(crate) on_failure: Option<ScheduleHook>,
+}
+
+impl Default for ScheduleOptions {
+    fn default() -> Self {
+        Self {
+            without_overlapping: false,
+            overlap_lock_ttl: DEFAULT_OVERLAP_LOCK_TTL,
+            environments: Vec::new(),
+            before_hook: None,
+            after_hook: None,
+            on_failure: None,
+        }
+    }
 }
 
 impl ScheduleOptions {
@@ -178,9 +198,22 @@ impl ScheduleOptions {
     }
 
     /// Prevent this task from running if the previous invocation hasn't finished.
-    /// Uses a distributed lock keyed by the schedule ID.
+    ///
+    /// Uses an owner-token distributed lock keyed by the schedule ID. The default
+    /// one-hour lease is renewed while the task is running. If the lock backend is
+    /// unavailable, the task is skipped instead of running without protection.
     pub fn without_overlapping(mut self) -> Self {
         self.without_overlapping = true;
+        self
+    }
+
+    /// Prevent overlapping with a custom lock lease duration.
+    ///
+    /// The lease is renewed while the task is running. Durations below one second
+    /// are normalized to one second to match the distributed lock backend.
+    pub fn without_overlapping_for(mut self, ttl: Duration) -> Self {
+        self.without_overlapping = true;
+        self.overlap_lock_ttl = Duration::from_secs(ttl.as_secs().max(1));
         self
     }
 
@@ -382,13 +415,40 @@ fn ensure_unique_name(tasks: &[ScheduledTask], id: &ScheduleId) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cron_due(schedule: &CronExpression, previous: DateTime, now: DateTime) -> bool {
+pub(crate) fn cron_due_in_timezone(
+    schedule: &CronExpression,
+    previous: DateTime,
+    now: DateTime,
+    timezone: &Timezone,
+) -> bool {
+    match timezone {
+        Timezone::Utc => cron_due_with_timezone(schedule, previous.as_chrono(), now.as_chrono()),
+        Timezone::Iana(timezone) => cron_due_with_timezone(
+            schedule,
+            previous.as_chrono().with_timezone(timezone),
+            now.as_chrono().with_timezone(timezone),
+        ),
+        Timezone::FixedOffset(timezone) => cron_due_with_timezone(
+            schedule,
+            previous.as_chrono().with_timezone(timezone),
+            now.as_chrono().with_timezone(timezone),
+        ),
+    }
+}
+
+fn cron_due_with_timezone<Tz>(
+    schedule: &CronExpression,
+    previous: ChronoDateTime<Tz>,
+    now: ChronoDateTime<Tz>,
+) -> bool
+where
+    Tz: ChronoTimeZone,
+{
     schedule
         .schedule()
-        .after(&(previous.as_chrono() - chrono::Duration::nanoseconds(1)))
+        .after(&(previous - chrono::Duration::nanoseconds(1)))
         .next()
-        .map(|next| next <= now.as_chrono())
-        .unwrap_or(false)
+        .is_some_and(|next| next <= now)
 }
 
 #[cfg(test)]
@@ -396,8 +456,59 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{CronExpression, ScheduleOptions, ScheduleRegistrar, ScheduleRegistry};
-    use crate::support::ScheduleId;
+    use super::{
+        cron_due_in_timezone, CronExpression, ScheduleOptions, ScheduleRegistrar, ScheduleRegistry,
+    };
+    use crate::support::{DateTime, ScheduleId, Timezone};
+
+    fn schedule_time(value: &str) -> DateTime {
+        DateTime::parse(value).unwrap()
+    }
+
+    #[test]
+    fn cron_due_interprets_fields_in_the_requested_timezone() {
+        let schedule = CronExpression::daily_at("08:00").unwrap();
+        let timezone = Timezone::parse("Asia/Kuala_Lumpur").unwrap();
+
+        assert!(cron_due_in_timezone(
+            &schedule,
+            schedule_time("2026-04-07T23:59:59Z"),
+            schedule_time("2026-04-08T00:00:00Z"),
+            &timezone,
+        ));
+        assert!(!cron_due_in_timezone(
+            &schedule,
+            schedule_time("2026-04-07T23:59:59Z"),
+            schedule_time("2026-04-08T00:00:00Z"),
+            &Timezone::Utc,
+        ));
+    }
+
+    #[test]
+    fn cron_due_skips_nonexistent_and_ambiguous_local_instants() {
+        let timezone = Timezone::parse("America/New_York").unwrap();
+        let nonexistent = CronExpression::daily_at("02:30").unwrap();
+        let ambiguous = CronExpression::daily_at("01:30").unwrap();
+
+        assert!(!cron_due_in_timezone(
+            &nonexistent,
+            schedule_time("2026-03-08T06:59:59Z"),
+            schedule_time("2026-03-08T07:30:00Z"),
+            &timezone,
+        ));
+        assert!(!cron_due_in_timezone(
+            &ambiguous,
+            schedule_time("2026-11-01T05:29:59Z"),
+            schedule_time("2026-11-01T05:30:00Z"),
+            &timezone,
+        ));
+        assert!(!cron_due_in_timezone(
+            &ambiguous,
+            schedule_time("2026-11-01T06:29:59Z"),
+            schedule_time("2026-11-01T06:30:00Z"),
+            &timezone,
+        ));
+    }
 
     #[test]
     fn rejects_duplicate_schedule_names() {
@@ -488,9 +599,18 @@ mod tests {
     #[test]
     fn schedule_options_builder() {
         let opts = ScheduleOptions::new()
-            .without_overlapping()
+            .without_overlapping_for(Duration::from_secs(30))
             .environments(&["production", "staging"]);
         assert!(opts.without_overlapping);
+        assert_eq!(opts.overlap_lock_ttl, Duration::from_secs(30));
         assert_eq!(opts.environments.len(), 2);
+    }
+
+    #[test]
+    fn overlap_lock_ttl_is_at_least_one_second() {
+        let opts = ScheduleOptions::new().without_overlapping_for(Duration::ZERO);
+
+        assert!(opts.without_overlapping);
+        assert_eq!(opts.overlap_lock_ttl, Duration::from_secs(1));
     }
 }

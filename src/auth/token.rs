@@ -285,6 +285,13 @@ impl TokenManager {
 
         let row = rows.first().ok_or_else(invalid_refresh_token_error)?;
         let refresh_record = TokenRowMetadata::from_row(row)?;
+        if refresh_record
+            .abilities
+            .iter()
+            .any(|ability| ability == MFA_PENDING_ABILITY)
+        {
+            return Err(invalid_refresh_token_error());
+        }
 
         self.insert_token_pair(
             &refresh_record.guard,
@@ -451,6 +458,10 @@ pub fn actor_has_mfa_pending(actor: &Actor) -> bool {
         .permissions
         .iter()
         .any(|permission| permission.as_ref() == MFA_PENDING_ABILITY)
+}
+
+pub(crate) fn mfa_pending_auth_error() -> AuthError {
+    AuthError::forbidden("Multi-factor authentication verification is required.")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

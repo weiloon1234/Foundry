@@ -37,4 +37,3 @@ struct AuditLog
 - `#[foundry(audit_exclude)]` still removes a field entirely from audit payloads.
 - `audit.redact_sensitive_fields = true` masks common credential-like field names with `[redacted]` in before/after/changes JSON.
 - `audit.sensitive_fields` adds project-specific names; set `redact_sensitive_fields = false` to return to explicit model-only exclusions.
-

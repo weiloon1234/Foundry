@@ -59,6 +59,22 @@ pub fn generate_openapi_spec_from_contract(
             operation["x-foundry-permissions"] = json!(action.auth.permissions);
         }
 
+        if !http.path_params.is_empty() {
+            operation["parameters"] = Value::Array(
+                http.path_params
+                    .iter()
+                    .map(|name| {
+                        json!({
+                            "name": name,
+                            "in": "path",
+                            "required": true,
+                            "schema": {"type": "string"}
+                        })
+                    })
+                    .collect(),
+            );
+        }
+
         if let Some(req) = action
             .request
             .as_ref()
@@ -199,6 +215,31 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::openapi::ApiSchema;
+
+    struct UserSchema;
+
+    impl ApiSchema for UserSchema {
+        fn schema() -> Value {
+            json!({"type": "object", "properties": {"user_name": {"type": "string"}}})
+        }
+
+        fn schema_name() -> &'static str {
+            "User"
+        }
+    }
+
+    struct OrderSchema;
+
+    impl ApiSchema for OrderSchema {
+        fn schema() -> Value {
+            json!({"type": "object", "properties": {"order_number": {"type": "string"}}})
+        }
+
+        fn schema_name() -> &'static str {
+            "Order"
+        }
+    }
 
     #[test]
     fn bodyless_contract_request_does_not_emit_request_body() {
@@ -265,5 +306,70 @@ mod tests {
 
         assert!(spec["paths"].get("/users/{id}/files/{path}").is_some());
         assert!(spec["paths"].get("/users/:id/files/{*path}").is_none());
+        assert_eq!(
+            spec["paths"]["/users/{id}/files/{path}"]["get"]["parameters"],
+            json!([
+                {
+                    "name": "id",
+                    "in": "path",
+                    "required": true,
+                    "schema": {"type": "string"}
+                },
+                {
+                    "name": "path",
+                    "in": "path",
+                    "required": true,
+                    "schema": {"type": "string"}
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn structural_wrapper_schemas_have_unique_resolvable_names() {
+        let routes = vec![
+            DocumentedRoute {
+                method: "get".to_string(),
+                path: "/users".to_string(),
+                doc: RouteDoc::new().response::<Vec<UserSchema>>(200),
+            },
+            DocumentedRoute {
+                method: "get".to_string(),
+                path: "/orders".to_string(),
+                doc: RouteDoc::new().response::<Vec<OrderSchema>>(200),
+            },
+        ];
+
+        let spec = generate_openapi_spec("Foundry", "test", &routes);
+
+        assert_eq!(
+            spec["paths"]["/users"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/ArrayOfUser"
+        );
+        assert_eq!(
+            spec["paths"]["/orders"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/ArrayOfOrder"
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["ArrayOfUser"]["items"],
+            UserSchema::schema()
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["ArrayOfOrder"]["items"],
+            OrderSchema::schema()
+        );
+    }
+
+    #[test]
+    fn nullable_schema_uses_openapi_31_json_schema_union() {
+        let schema = <Option<String> as ApiSchema>::schema();
+
+        assert_eq!(
+            schema,
+            json!({"anyOf": [{"type": "string"}, {"type": "null"}]})
+        );
+        assert!(schema.get("nullable").is_none());
     }
 }

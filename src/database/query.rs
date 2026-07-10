@@ -30,7 +30,7 @@ use super::model::{
     IntoFieldValue, Model, ModelCreatedEvent, ModelCreatingEvent, ModelDeletedEvent,
     ModelDeletingEvent, ModelFieldWriteMutator, ModelHookContext, ModelLifecycle,
     ModelLifecycleSnapshot, ModelPrimaryKeyStrategy, ModelUpdatedEvent, ModelUpdatingEvent,
-    ModelWriteExecutor, TableMeta, ToDbValue, UpdateDraft,
+    ModelWriteExecutor, TableMeta, ToDbValue, TypedPrimaryKey, UpdateDraft,
 };
 use super::projection::{Projection, ProjectionField, ProjectionMeta};
 use super::relation::{
@@ -153,7 +153,7 @@ where
     }
 
     fn schema_name() -> &'static str {
-        "PaginatedResponse"
+        crate::openapi::structural_schema_name::<Self>("PaginatedResponseOf", T::schema_name())
     }
 }
 
@@ -1191,10 +1191,10 @@ impl Query {
                     ..
                 }) = &mut insert.on_conflict
                 {
-                    conflict.assignments.push((column, expr));
+                    upsert_assignment(&mut conflict.assignments, column, expr);
                 }
             }
-            QueryBody::Update(update) => update.values.push((column, expr)),
+            QueryBody::Update(update) => upsert_assignment(&mut update.values, column, expr),
             QueryBody::Select(_) | QueryBody::Delete(_) | QueryBody::SetOperation(_) => {}
         }
         self
@@ -2445,8 +2445,10 @@ where
     pub async fn find<E, K>(&self, executor: &E, key: K) -> Result<Option<M>>
     where
         E: QueryExecutor,
-        K: ToDbValue,
+        M: TypedPrimaryKey,
+        K: IntoColumnValue<M::PrimaryKey>,
     {
+        let key = key.into_column_value();
         Ok(self
             .clone()
             .where_(self.primary_key_condition(key)?)
@@ -2460,7 +2462,8 @@ where
     pub async fn find_or_fail<E, K>(&self, executor: &E, key: K) -> Result<M>
     where
         E: QueryExecutor,
-        K: ToDbValue,
+        M: TypedPrimaryKey,
+        K: IntoColumnValue<M::PrimaryKey>,
     {
         self.find(executor, key).await?.ok_or_else(|| {
             Error::message(format!(
@@ -2473,12 +2476,13 @@ where
     pub async fn find_many<E, I, K>(&self, executor: &E, keys: I) -> Result<Collection<M>>
     where
         E: QueryExecutor,
+        M: TypedPrimaryKey,
         I: IntoIterator<Item = K>,
-        K: ToDbValue,
+        K: IntoColumnValue<M::PrimaryKey>,
     {
         let values = keys
             .into_iter()
-            .map(ToDbValue::to_db_value)
+            .map(|key| key.into_column_value().to_db_value())
             .collect::<Vec<_>>();
         if values.is_empty() {
             return Ok(Collection::new());
@@ -2990,23 +2994,25 @@ impl<M> CreateRow<M> {
     where
         V: IntoFieldValue<T>,
     {
-        self.values.push((
+        upsert_assignment(
+            &mut self.values,
             column.column_ref(),
             Expr::value(value.into_field_value(column.db_type())),
-        ));
+        );
         self
     }
 
     pub fn set_expr<T>(mut self, column: Column<M, T>, expr: impl Into<Expr>) -> Self {
-        self.values.push((column.column_ref(), expr.into()));
+        upsert_assignment(&mut self.values, column.column_ref(), expr.into());
         self
     }
 
-    pub fn set_null<T>(mut self, column: Column<M, T>) -> Self {
-        self.values.push((
+    pub fn set_null<T>(mut self, column: Column<M, Option<T>>) -> Self {
+        upsert_assignment(
+            &mut self.values,
             column.column_ref(),
             Expr::value(super::ast::DbValue::Null(column.db_type())),
-        ));
+        );
         self
     }
 }
@@ -3038,15 +3044,20 @@ where
     where
         V: IntoFieldValue<T>,
     {
-        ensure_insert_row(&mut self.rows).push((
+        upsert_assignment(
+            ensure_insert_row(&mut self.rows),
             column.column_ref(),
             Expr::value(value.into_field_value(column.db_type())),
-        ));
+        );
         self
     }
 
     pub fn set_expr<T>(mut self, column: Column<M, T>, expr: impl Into<Expr>) -> Self {
-        ensure_insert_row(&mut self.rows).push((column.column_ref(), expr.into()));
+        upsert_assignment(
+            ensure_insert_row(&mut self.rows),
+            column.column_ref(),
+            expr.into(),
+        );
         self
     }
 
@@ -3055,7 +3066,11 @@ where
         column: super::ast::ColumnRef,
         value: super::ast::DbValue,
     ) -> Self {
-        ensure_insert_row(&mut self.rows).push((column, Expr::value(value)));
+        upsert_assignment(
+            ensure_insert_row(&mut self.rows),
+            column,
+            Expr::value(value),
+        );
         self
     }
 
@@ -3590,23 +3605,25 @@ where
     where
         V: IntoFieldValue<T>,
     {
-        self.values.push((
+        upsert_assignment(
+            &mut self.values,
             column.column_ref(),
             Expr::value(value.into_field_value(column.db_type())),
-        ));
+        );
         self
     }
 
     pub fn set_expr<T>(mut self, column: Column<M, T>, expr: impl Into<Expr>) -> Self {
-        self.values.push((column.column_ref(), expr.into()));
+        upsert_assignment(&mut self.values, column.column_ref(), expr.into());
         self
     }
 
-    pub fn set_null<T>(mut self, column: Column<M, T>) -> Self {
-        self.values.push((
+    pub fn set_null<T>(mut self, column: Column<M, Option<T>>) -> Self {
+        upsert_assignment(
+            &mut self.values,
             column.column_ref(),
             Expr::value(super::ast::DbValue::Null(column.db_type())),
-        ));
+        );
         self
     }
 
@@ -5586,6 +5603,47 @@ mod tests {
         assert!(compiled.sql.contains("TO_TIMESTAMP"));
         assert!(compiled.sql.contains("::double precision"));
         assert!(compiled.sql.contains("NOW()"));
+    }
+
+    #[test]
+    fn repeated_query_assignments_use_the_last_value_once() {
+        let update = Query::update_table("users")
+            .set("name", "first")
+            .set("name", "last");
+        let compiled = PostgresCompiler::compile(update.ast()).unwrap();
+
+        assert_eq!(compiled.sql, "UPDATE \"users\" SET \"name\" = $1::text");
+        assert_eq!(compiled.bindings, vec![DbValue::Text("last".to_string())]);
+
+        let upsert = Query::insert_into("users")
+            .value("id", 1_i64)
+            .on_conflict_columns(["id"])
+            .do_update()
+            .set("name", "first")
+            .set("name", "last");
+        let compiled = PostgresCompiler::compile(upsert.ast()).unwrap();
+
+        assert_eq!(compiled.sql.matches("\"name\" =").count(), 1);
+        assert_eq!(
+            compiled.bindings,
+            vec![DbValue::Int64(1), DbValue::Text("last".to_string())]
+        );
+    }
+
+    #[test]
+    fn repeated_typed_row_assignments_use_the_last_value_once() {
+        let compiled = CreateManyModel::new(IterationUser::table_meta())
+            .row(|row| {
+                row.set(IterationUser::ID, 1_i64)
+                    .set(IterationUser::ID, 2_i64)
+            })
+            .to_compiled_sql()
+            .unwrap();
+
+        assert!(compiled
+            .sql
+            .starts_with("INSERT INTO \"iteration_users\" (\"id\") VALUES ($1::bigint)"));
+        assert_eq!(compiled.bindings, vec![DbValue::Int64(2)]);
     }
 
     #[test]

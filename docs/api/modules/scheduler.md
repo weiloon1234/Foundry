@@ -27,6 +27,7 @@ struct ScheduleInvocation
 struct ScheduleOptions
   fn new() -> Self
   fn without_overlapping(self) -> Self
+  fn without_overlapping_for(self, ttl: Duration) -> Self
   fn environments(self, envs: &[&str]) -> Self
   fn before<F, Fut>(self, hook: F) -> Self
   fn after<F, Fut>(self, hook: F) -> Self
@@ -51,4 +52,3 @@ struct ScheduledTask
 - Schedule handler panics are handled as schedule failures and route through `ScheduleOptions::on_failure`.
 - Scheduler hooks are isolated: hook panics are logged and do not crash the scheduler task.
 - `SchedulerConfig.shutdown_timeout_ms` defaults to `30000`; `0` aborts active schedules immediately on shutdown.
-

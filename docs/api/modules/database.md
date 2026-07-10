@@ -64,7 +64,7 @@ struct ColumnInfo
 struct CreateDraft
   fn set<T, V>(&mut self, column: Column<M, T>, value: V) -> &mut Self
   fn set_expr<T>( &mut self, column: Column<M, T>, expr: impl Into<Expr>, ) -> &mut Self
-  fn set_null<T>(&mut self, column: Column<M, T>) -> &mut Self
+  fn set_null<T>(&mut self, column: Column<M, Option<T>>) -> &mut Self
   fn assigned_columns(&self) -> Vec<&str>
   fn pending_record(&self) -> DbRecord
 struct CreateManyModel
@@ -109,7 +109,7 @@ struct CreateModel
 struct CreateRow
   fn set<T, V>(self, column: Column<M, T>, value: V) -> Self
   fn set_expr<T>(self, column: Column<M, T>, expr: impl Into<Expr>) -> Self
-  fn set_null<T>(self, column: Column<M, T>) -> Self
+  fn set_null<T>(self, column: Column<M, Option<T>>) -> Self
 struct Cte
   fn new(name: impl Into<String>, query: impl Into<QueryAst>) -> Self
   fn materialized(self) -> Self
@@ -277,6 +277,7 @@ struct ModelUpdatingEvent
 struct NoModelLifecycle
 struct Paginated
   fn to_response(&self, base_url: &str) -> PaginatedResponse<&T>
+  fn map_response<U, F>(&self, base_url: &str, f: F) -> PaginatedResponse<U>
 struct PaginatedResponse
 struct Pagination
   fn new(page: u64, per_page: u64) -> Self
@@ -487,7 +488,7 @@ struct TableMeta
 struct UpdateDraft
   fn set<T, V>(&mut self, column: Column<M, T>, value: V) -> &mut Self
   fn set_expr<T>( &mut self, column: Column<M, T>, expr: impl Into<Expr>, ) -> &mut Self
-  fn set_null<T>(&mut self, column: Column<M, T>) -> &mut Self
+  fn set_null<T>(&mut self, column: Column<M, Option<T>>) -> &mut Self
   fn changed_columns(&self) -> Vec<&str>
   fn pending_record(&self) -> DbRecord
 struct UpdateModel
@@ -495,7 +496,7 @@ struct UpdateModel
   fn with_label(self, label: impl Into<String>) -> Self
   fn set<T, V>(self, column: Column<M, T>, value: V) -> Self
   fn set_expr<T>(self, column: Column<M, T>, expr: impl Into<Expr>) -> Self
-  fn set_null<T>(self, column: Column<M, T>) -> Self
+  fn set_null<T>(self, column: Column<M, Option<T>>) -> Self
   fn where_(self, condition: Condition) -> Self
   fn from(self, source: impl Into<FromItem>) -> Self
   fn allow_all(self) -> Self
@@ -578,6 +579,7 @@ trait SeederFile
 trait ToDbValue
   fn to_db_value(self) -> DbValue
   fn db_type() -> DbType
+trait TypedPrimaryKey: Model
 async fn scope_model_extensions<F, T>(future: F) -> T
 ```
 
@@ -587,7 +589,7 @@ async fn scope_model_extensions<F, T>(future: F) -> T
 enum AggregateFn { Count, Sum, Avg, Min, Max }
 enum BinaryOperator { Add, Subtract, Multiply, Divide, Concat, Custom }
 enum ComparisonOp { Eq, IEq, NotEq, Gt, Gte, Lt, Lte, Like, NotLike, ILike }
-enum Condition { Comparison, InList, JsonPredicate, FullText, And, Or, Not, IsNull, IsNotNull, IsTrue, IsFalse, Exists, Raw }
+enum Condition { Show 13 variants    Comparison, InList, JsonPredicate, FullText, And, Or, Not, IsNull, IsNotNull, IsTrue, IsFalse, Exists, Raw }
   fn compare(left: Expr, op: ComparisonOp, right: Expr) -> Self
   fn compare_value( left: impl Into<Expr>, op: ComparisonOp, value: impl Into<DbValue>, ) -> Self
   fn eq(left: impl Into<Expr>, value: impl Into<DbValue>) -> Self
@@ -821,7 +823,7 @@ trait RelationLoader: Send>
   fn node(&self) -> RelationNode
   fn load<'life0, 'life1, 'life2, 'async_trait>(
   fn load_missing<'life0, 'life1, 'life2, 'async_trait>(
-fn belongs_to<From, To, Key>( foreign_key: Column<From, Key>, owner_key: Column<To, Key>, parent_key: fn(&From) -> Option<Key>, attach: fn(&mut From, Option<To>), ) -> RelationDef<From, To>
+fn belongs_to<From, To, ForeignKey, Key>( foreign_key: Column<From, ForeignKey>, owner_key: Column<To, Key>, parent_key: fn(&From) -> Option<Key>, attach: fn(&mut From, Option<To>), ) -> RelationDef<From, To>
 fn has_many<From, To, Key>( local_key: Column<From, Key>, foreign_key: Column<To, Key>, parent_key: fn(&From) -> Key, attach: fn(&mut From, Vec<To>), ) -> RelationDef<From, To>
 fn has_one<From, To, Key>( local_key: Column<From, Key>, foreign_key: Column<To, Key>, parent_key: fn(&From) -> Key, attach: fn(&mut From, Option<To>), ) -> RelationDef<From, To>
 fn many_to_many<From, To, Pivot, LocalKey, TargetKey>( local_key: Column<From, LocalKey>, pivot_table: &'static str, pivot_local_key: &'static str, pivot_related_key: &'static str, target_key: Column<To, TargetKey>, parent_key: fn(&From) -> LocalKey, attach: fn(&mut From, Vec<To>), ) -> ManyToManyDef<From, To, Pivot>

@@ -8,6 +8,14 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 
 ### Security
 
+- Typed routes registered inside `group_with_options` now inherit the group's guard, permissions, dynamic authorizer, middleware group, rate limit, audit area, tags, and documentation defaults. Explicit `.public()` remains the opt-out. Unknown middleware groups now fail router construction, and duplicate group IDs fail bootstrap instead of silently replacing or bypassing policy.
+- MFA-pending access tokens can no longer subscribe to protected WebSocket channels, and MFA-pending refresh credentials can no longer renew the challenge beyond its bounded TTL. Confirmed TOTP factors cannot be replaced with an ordinary authenticated credential; factor replacement remains confined to the pending MFA exchange flow.
+- WebSocket action failures no longer return internal handler or panic details to clients, and notification broadcasts now have `register_notification_websocket_channel`, a guarded server-only channel helper that restricts subscriptions to the authenticated actor's own room.
+- Presence handlers now enumerate/count only members in their current channel-and-room subscription, preventing actor IDs from other rooms on the same presence channel from leaking through `presence_members` or `presence_count`. Guarded observability retains its intentional channel-wide administrative view.
+- Audit JSON redaction now recursively removes credential-shaped keys inside nested objects and arrays, and `CryptConfig` redacts its encryption key from `Debug` output.
+- Dependency locks now use patched `crossbeam-epoch`, `ammonia`, `anyhow`, `lettre`, `rand`, and `rustls-webpki` releases; consumer fixture locks were refreshed to current compatible releases, and `validator_derive` moved off the unmaintained `proc-macro-error2` chain. The upstream-constrained `object_store`/`quick-xml` advisory remains documented in the framework audit.
+- Framework-generated outputs now reject symlinked path components beneath the selected output root before creating directories, writing files, or removing manifest-owned files, preventing TypeScript, API-doc, scaffold, config, and plugin generators from escaping through nested parent symlinks. A caller-selected output root may still itself be a symlink.
+- Guarded WebSocket connections now revalidate cached bearer/session credentials on a bounded interval without extending sliding sessions, refresh actor abilities, and close revoked or unauthorized sockets before protected actions or broadcasts. Production same-origin checks now compare scheme, host, and effective port and honor forwarded origin metadata only from trusted proxies. New global and anonymous per-IP admission caps reserve capacity before upgrade, while authenticated limits are scoped by `(guard, actor ID)`.
 - Auth now rejects actors whose stored guard does not match the requested guard instead of retagging them, preventing a user token/session from satisfying guard-only admin routes or WebSocket channels.
 - `enable_observability()` now protects `/_foundry/*` with the app's default auth guard by default; public diagnostics require the explicit `enable_public_observability()` / `ObservabilityOptions::public()` opt-in, and production-like public registration logs a warning.
 - TOTP MFA now uses HMAC-SHA1 per RFC 6238 so codes verify against mainstream authenticator apps (Google Authenticator, Authy, 1Password, etc.), which ignore the otpauth `algorithm` parameter and always compute SHA1. **TOTP factors enrolled on previous builds generate different codes and must be re-enrolled.**
@@ -19,16 +27,31 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 
 ### Fixed
 
+- HTTP route registration callbacks now execute exactly once during bootstrap. Named-route lookup, runtime routing, OpenAPI/contract metadata, and TypeScript export share one frozen route plan across every kernel profile.
+- Database migration DDL and ledger writes now use the same pinned transaction/session, and failed queries no longer leave a session-level statement timeout behind. Repeated insert/update/model assignments use deterministic last-write-wins replacement instead of emitting duplicate SQL assignments.
+- `#[derive(Validate)]` now keeps Rust, multipart, runtime validation, and TypeScript metadata aligned for required `Option` fields, typed numeric/boolean fields, collection `each` rules, and collection count bounds; invalid `each` placement receives a compile-time diagnostic.
+- OpenAPI 3.1 output now represents nullable values as JSON Schema unions, treats `serde_json::Value` as unconstrained JSON, always marks path parameters required, and gives structurally distinct schemas unique identities. Contract route schemas are materialized once and incompatible duplicate registrations fail clearly.
+- `#[derive(AppEnum)]` now rejects empty keys/aliases and detects collisions across key and alias namespaces. Model scaffolding no longer generates a duplicate `Clone` derive.
+- Nullable `belongs_to` relations preserve their owner-key type, `Collection::chunk` works for non-`Clone` values, and `ContractError` is available from the public prelude.
+- Malformed i18n configuration now fails bootstrap instead of silently disabling localization. CLI `--help`/`--version` are successful outcomes, and HTTP/WebSocket listeners accept IPv6 host values.
+- `Setting::get_as` now reports stored type drift instead of returning `None`, and `SettingType::Password` is documented as presentation metadata rather than encryption or secret storage.
+- `TestAppBuilder` and `TestRequestBuilder` are now nameable from `testing` and the prelude. `TestApp::from_builder` reuses a production `AppBuilder`, while `TestApp::shutdown` gracefully stops managed tasks and plugin hooks.
+- `types:export` now rejects exact and ASCII case-only output collisions between DTOs, AppEnums, framework runtimes, route helpers, SDK actions, and the generated barrel before cleanup or writes, with an error naming both owners instead of silently overwriting one module.
+- Immediate notifications now attempt all selected channels and return delivery or missing-registration failures instead of logging and reporting success. Queued notification jobs propagate email, database, broadcast, and custom-channel failures into worker retry/dead-letter handling, preserve custom routing values across serialization, and both `build_notification_job` and `notify_after_commit` now return pre-render failures instead of producing or registering a no-op job.
 - Pinned the transitive `axum-extra`/`cookie` time parser dependency to `time 0.3.47`, preventing downstream deploy builds from resolving to newer `time 0.3.x` releases that break `cookie 0.18.1` in some toolchains.
 - A worker whose job-lease heartbeat fails (lease expired, claimed elsewhere, or backend unreachable past the lease TTL) now cancels the running job instead of letting it race the redelivered copy on another worker. Transient renewal errors are retried while the last successful renewal still covers the lease TTL.
+- Normal scheduler ticks now interpret cron expressions in the configured app timezone instead of UTC. Explicit `tick_at` and `run_once_at` calls retain UTC semantics, and ambiguous or nonexistent IANA daylight-saving wall times are skipped consistently with `LocalDateTime::in_timezone`.
+- Scheduler `without_overlapping` now uses the shared owner-token lock, renews long-running leases, cancels protected work when ownership or renewal is lost, and fails closed on acquisition errors. Shutdown awaits compare-and-delete release, stale owners cannot delete successor locks, the deployed `schedule:<id>` key remains compatible, and `tick_at`/`run_once_at` no longer report overlap-skipped schedules as started. `ScheduleOptions::without_overlapping_for(Duration)` configures the lease duration while preserving the one-hour default.
 - Plugins that booted successfully are now shut down (in reverse order) when a later plugin's `boot()` fails, so resources acquired during partial bootstrap no longer leak.
 - The in-memory scheduler leadership backend no longer renews an already-expired lease; like the Redis backend, the previous holder must win a fresh election, preventing split-brain in single-process and test setups.
 - The WebSocket pub/sub task now resubscribes with exponential backoff when its backend subscription ends or fails, instead of going permanently silent while publishes keep succeeding; dropping the server also aborts the task instead of leaking it.
 - Scheduler leadership state uses acquire/release atomic ordering, and dropping the scheduler or a schedule overlap-lock guard outside a Tokio runtime now logs a warning instead of silently leaving the lock to lapse via TTL.
 - Image dimension validation streams the upload from disk on the blocking thread pool instead of reading the entire file into memory on the async runtime.
+- S3 `put_bytes` and `put_file` now persist a supplied content type as signed `Content-Type` object metadata. Disk visibility remains policy-based instead of emitting `x-amz-acl`, preserving compatibility with ACL-disabled AWS buckets and S3-compatible providers such as Cloudflare R2.
 - Bodyless contract actions that still expose request metadata (for example path/query params on `GET`) no longer emit an OpenAPI `requestBody`, and generated SDK actions no longer require a payload argument that would be dropped at runtime.
 - Generated `FoundryEndpoint.applyServerErrors` now safely ignores malformed or non-object error payloads before reading `.errors`, so unusual transport/client errors no longer mask the original failure with a runtime crash.
 - Multipart `Validated<T>` extraction now removes framework-owned uploaded temp files when validation fails before the handler receives the DTO.
+- `UploadedFile` now provides consuming `store*_and_cleanup` methods that remove framework-owned upload temp files after both successful and failed storage attempts while retaining the original borrowed `store*` methods for reusable attachment and image-processing workflows.
 - `#[derive(Validate)]` now generates multipart cleanup hooks for `UploadedFile`, `Option<UploadedFile>`, and `Vec<UploadedFile>` fields, and rejects unsupported nested upload wrappers with a clear derive error.
 - Datatable numeric filters now reject out-of-range `Int16`/`Int32` number values instead of wrapping them during downcast.
 - WebSocket `on_leave` hooks and presence leave cleanup now run only when an `unsubscribe` actually removed an active subscription, so forged/unmatched unsubscribe frames cannot trigger leave-side effects.
@@ -69,6 +92,8 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 
 ### Changed
 
+- Model `find`/`find_many` APIs now require the model's declared `TypedPrimaryKey`; `set_null` is available only for nullable columns, and text predicates are available only for string columns. These compile-time constraints prevent cross-model IDs and invalid SQL/type combinations.
+- Middleware group registration and route references now use the semantic `MiddlewareGroupId` type. Define shared constants with `MiddlewareGroupId::new(...)`; use `MiddlewareGroupId::owned(...)` for genuinely dynamic IDs. Raw strings are no longer accepted by `AppBuilder`, `HttpRouteOptions`, `HttpScope`, `HttpRouteBuilder`, or `MiddlewareGroups` APIs.
 - `DatabaseManager::ping()` now checks both the primary pool and the configured read-replica pool.
   `doctor` reports whether it checked the primary only or both primary and replica. Use
   `ping_write()` for primary-only health checks.
@@ -98,6 +123,12 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 
 ### Breaking
 
+- Middleware groups no longer accept raw `&str`/`String` IDs. Define a `MiddlewareGroupId` constant (or explicitly construct an owned ID for dynamic configuration) and reuse it for registration and route references.
+- Model `find`/`find_many` reject IDs that do not match `Model::PrimaryKey`; `set_null` rejects non-nullable columns, and string-only predicates reject non-string columns at compile time.
+- `HttpRegistrar::into_router` and `into_router_with_middlewares` now return `Result<Router>` so unknown middleware-group references cannot be ignored.
+- `build_notification_job` and `AppTransaction::notify_after_commit` now return `Result`; callers must propagate or handle renderer/routing failures.
+- Required `Option<T>` validation fields are no longer implicitly nullable, typed non-string numeric/boolean values validate with their actual value kinds, and collection `min`/`max` rules apply to item count.
+- `Setting::get_as` returns an error when the stored setting type differs from the requested type instead of treating the row as absent.
 - `DatabaseConfig` gained public fields: `connect_lazy`, `write_pool`, and `read_pool`. Consumers
   that construct `DatabaseConfig` with a Rust struct literal must add those fields or use
   `..DatabaseConfig::default()`.

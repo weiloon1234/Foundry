@@ -1,0 +1,90 @@
+error[E0277]: the trait bound `foundry::ModelId<Order>: IntoColumnValue<foundry::ModelId<User>>` is not satisfied
+  --> tests/ui/derive/fail_cross_model_primary_key.rs:17:25
+   |
+17 |         .find(database, ModelId::<Order>::generate())
+   |          ----           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `IntoColumnValue<foundry::ModelId<User>>` is not implemented for `foundry::ModelId<Order>`
+   |          |
+   |          required by a bound introduced by this call
+   |
+help: the following other types implement trait `IntoColumnValue<T>`
+  --> src/database/model.rs
+   |
+   | impl IntoColumnValue<String> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<std::string::String>`
+...
+   | impl IntoColumnValue<Option<String>> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<Option<std::string::String>>`
+...
+   | impl IntoColumnValue<Numeric> for i64 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `i64` implements `IntoColumnValue<foundry::Numeric>`
+...
+   | impl IntoColumnValue<Numeric> for i32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `i32` implements `IntoColumnValue<foundry::Numeric>`
+note: required by a bound in `ModelQuery::<M>::find`
+  --> src/database/query.rs
+   |
+   |     pub async fn find<E, K>(&self, executor: &E, key: K) -> Result<Option<M>>
+   |                  ---- required by a bound in this associated function
+...
+   |         K: IntoColumnValue<M::PrimaryKey>,
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `ModelQuery::<M>::find`
+
+error[E0277]: the trait bound `foundry::ModelId<Order>: IntoColumnValue<foundry::ModelId<User>>` is not satisfied
+  --> tests/ui/derive/fail_cross_model_primary_key.rs:16:13
+   |
+16 |       let _ = User::query()
+   |  _____________^
+17 | |         .find(database, ModelId::<Order>::generate())
+   | |_____________________________________________________^ the trait `IntoColumnValue<foundry::ModelId<User>>` is not implemented for `foundry::ModelId<Order>`
+   |
+help: the following other types implement trait `IntoColumnValue<T>`
+  --> src/database/model.rs
+   |
+   | impl IntoColumnValue<String> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<std::string::String>`
+...
+   | impl IntoColumnValue<Option<String>> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<Option<std::string::String>>`
+...
+   | impl IntoColumnValue<Numeric> for i64 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `i64` implements `IntoColumnValue<foundry::Numeric>`
+...
+   | impl IntoColumnValue<Numeric> for i32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `i32` implements `IntoColumnValue<foundry::Numeric>`
+note: required by a bound in `ModelQuery::<M>::find`
+  --> src/database/query.rs
+   |
+   |     pub async fn find<E, K>(&self, executor: &E, key: K) -> Result<Option<M>>
+   |                  ---- required by a bound in this associated function
+...
+   |         K: IntoColumnValue<M::PrimaryKey>,
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `ModelQuery::<M>::find`
+
+error[E0277]: the trait bound `foundry::ModelId<Order>: IntoColumnValue<foundry::ModelId<User>>` is not satisfied
+  --> tests/ui/derive/fail_cross_model_primary_key.rs:18:10
+   |
+18 |         .await;
+   |          ^^^^^ the trait `IntoColumnValue<foundry::ModelId<User>>` is not implemented for `foundry::ModelId<Order>`
+   |
+help: the following other types implement trait `IntoColumnValue<T>`
+  --> src/database/model.rs
+   |
+   | impl IntoColumnValue<String> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<std::string::String>`
+...
+   | impl IntoColumnValue<Option<String>> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<Option<std::string::String>>`
+...
+   | impl IntoColumnValue<Numeric> for i64 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `i64` implements `IntoColumnValue<foundry::Numeric>`
+...
+   | impl IntoColumnValue<Numeric> for i32 {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `i32` implements `IntoColumnValue<foundry::Numeric>`
+note: required by a bound in `ModelQuery::<M>::find`
+  --> src/database/query.rs
+   |
+   |     pub async fn find<E, K>(&self, executor: &E, key: K) -> Result<Option<M>>
+   |                  ---- required by a bound in this associated function
+...
+   |         K: IntoColumnValue<M::PrimaryKey>,
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `ModelQuery::<M>::find`

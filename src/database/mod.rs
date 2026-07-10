@@ -32,7 +32,7 @@ pub use model::{
     ModelCreatingEvent, ModelDeletedEvent, ModelDeletingEvent, ModelFeatureSetting,
     ModelHookContext, ModelInstanceWriteExt, ModelLifecycle, ModelLifecycleSnapshot,
     ModelPrimaryKeyStrategy, ModelUpdatedEvent, ModelUpdatingEvent, ModelWriteExecutor,
-    NoModelLifecycle, PersistedModel, TableMeta, ToDbValue, UpdateDraft,
+    NoModelLifecycle, PersistedModel, TableMeta, ToDbValue, TypedPrimaryKey, UpdateDraft,
 };
 pub use projection::{Projection, ProjectionField, ProjectionFieldInfo, ProjectionMeta};
 pub use query::{

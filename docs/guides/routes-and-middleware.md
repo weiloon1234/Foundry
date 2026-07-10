@@ -29,6 +29,17 @@ App::builder()
     .run_http()?;
 ```
 
+Define middleware group IDs once alongside your other semantic identifiers and reuse the constants
+for both registration and route references:
+
+```rust
+const API_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("api");
+const WEB_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("web");
+```
+
+Use `MiddlewareGroupId::owned(value)` only when an identifier genuinely comes from dynamic
+application configuration; raw strings are intentionally not accepted by registration or routes.
+
 ---
 
 ## Route Registration
@@ -217,7 +228,7 @@ r.group_with_options(
     HttpRouteOptions::new()
         .guard(Guard::Admin)
         .audit_area("admin")
-        .middleware_group("api")
+        .middleware_group(API_MIDDLEWARE)
         .tag("admin"),
     |r| {
         r.route("/users", get(list_admin_users));
@@ -332,7 +343,7 @@ r.resource_with_options(
         .destroy(delete(delete_post)),
     HttpRouteOptions::new()
         .guard(Guard::User)
-        .middleware_group("api")
+        .middleware_group(API_MIDDLEWARE)
         .tag("posts"),
 );
 ```
@@ -739,17 +750,17 @@ curl -H "X-Maintenance-Bypass: my-secret" https://app.example.com
 
 ## Middleware Groups
 
-Define a named bundle of middleware once, apply to multiple routes by name:
+Define a middleware bundle once under a semantic ID, then reuse the same typed constant on routes:
 
 ### Define
 
 ```rust
 App::builder()
-    .middleware_group("api", vec![
+    .middleware_group(API_MIDDLEWARE, vec![
         MiddlewareConfig::from(RateLimit::new(1000).per_hour()),
         MiddlewareConfig::from(Compression),
     ])
-    .middleware_group("web", vec![
+    .middleware_group(WEB_MIDDLEWARE, vec![
         MiddlewareConfig::from(Csrf::new()),
         MiddlewareConfig::from(SecurityHeaders::new()),
         MiddlewareConfig::from(Compression),
@@ -765,7 +776,7 @@ fn routes(r: &mut HttpRegistrar) -> Result<()> {
         r.route_with_options("/users", get(list_users),
             HttpRouteOptions::new()
                 .guard(Guard::User)
-                .middleware_group("api"));
+                .middleware_group(API_MIDDLEWARE));
         Ok(())
     })?;
 
@@ -774,7 +785,7 @@ fn routes(r: &mut HttpRegistrar) -> Result<()> {
         r.route_with_options("/", get(dashboard),
             HttpRouteOptions::new()
                 .guard(Guard::Admin)
-                .middleware_group("web"));
+                .middleware_group(WEB_MIDDLEWARE));
         Ok(())
     })?;
 
@@ -786,7 +797,7 @@ Group middleware is prepended before any per-route middleware. You can combine a
 
 ```rust
 HttpRouteOptions::new()
-    .middleware_group("api")
+    .middleware_group(API_MIDDLEWARE)
     .middleware(MiddlewareConfig::from(MaxBodySize::mb(50)))  // on top of group
 ```
 
@@ -895,6 +906,9 @@ async fn paginated_users(State(app): State<AppContext>, Query(page): Query<Pagin
 ```rust
 use foundry::prelude::*;
 
+const API_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("api");
+const WEB_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("web");
+
 fn main() -> Result<()> {
     App::builder()
         .load_env()
@@ -910,10 +924,10 @@ fn main() -> Result<()> {
         ))
 
         // Middleware groups
-        .middleware_group("api", vec![
+        .middleware_group(API_MIDDLEWARE, vec![
             MiddlewareConfig::from(RateLimit::new(1000).per_hour()),
         ])
-        .middleware_group("web", vec![
+        .middleware_group(WEB_MIDDLEWARE, vec![
             MiddlewareConfig::from(Csrf::new().exclude("/api")),
         ])
 
@@ -937,13 +951,13 @@ fn routes(r: &mut HttpRegistrar) -> Result<()> {
             HttpRouteOptions::new()
                 .guard(Guard::User)
                 .permission(Permission::PostsWrite)
-                .middleware_group("api")
+                .middleware_group(API_MIDDLEWARE)
                 .rate_limit(RateLimit::new(30).per_minute().by_actor()));
 
         r.route_named_with_options(Route::PostsShow, "/posts/:id", get(show_post),
             HttpRouteOptions::new()
                 .guard(Guard::User)
-                .middleware_group("api"));
+                .middleware_group(API_MIDDLEWARE));
 
         Ok(())
     })?;
@@ -954,7 +968,7 @@ fn routes(r: &mut HttpRegistrar) -> Result<()> {
             HttpRouteOptions::new()
                 .guard(Guard::Admin)
                 .permission(Permission::AdminAccess)
-                .middleware_group("web"));
+                .middleware_group(WEB_MIDDLEWARE));
         Ok(())
     })?;
 

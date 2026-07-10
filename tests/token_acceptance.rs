@@ -448,6 +448,13 @@ async fn mfa_totp_factor_lifecycle_persists_and_consumes_recovery_codes() {
     let confirm_code = totp_code(&challenge.secret, current_totp_step());
     totp.confirm(&actor, &confirm_code).await.unwrap();
 
+    let replacement = totp.enroll(&actor).await.unwrap_err();
+    assert_eq!(
+        replacement.payload()["error_code"],
+        serde_json::json!("mfa_replacement_requires_verification")
+    );
+    assert_eq!(runtime.mfa_state(&actor).await, Some((true, 0)));
+
     let recovery_codes = totp
         .regenerate_recovery_codes(
             &actor,
@@ -722,6 +729,38 @@ async fn token_ttl_can_be_overridden_per_guard() {
         .unwrap();
 
     assert_eq!(pair.expires_in, 43_200 * 60);
+
+    runtime.cleanup().await;
+}
+
+#[tokio::test]
+async fn mfa_pending_refresh_tokens_cannot_escape_the_challenge_ttl() {
+    let _guard = token_lock().await;
+    let Some(runtime) = TokenTestRuntime::new().await else {
+        return;
+    };
+
+    let tokens = runtime.app.tokens().unwrap();
+    let pending = tokens
+        .issue_mfa_pending(
+            &Actor::new("pending-actor", GuardId::new("text_api")),
+            "mfa-challenge",
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.expires_in, 10 * 60);
+
+    let error = tokens.refresh(&pending.refresh_token).await.unwrap_err();
+    assert_eq!(
+        error.payload()["error_code"],
+        serde_json::json!("invalid_refresh_token")
+    );
+    assert!(tokens
+        .validate(&pending.access_token)
+        .await
+        .unwrap()
+        .is_none());
 
     runtime.cleanup().await;
 }

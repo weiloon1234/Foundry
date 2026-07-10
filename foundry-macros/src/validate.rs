@@ -85,7 +85,6 @@ struct FieldValidation {
     field_ident: Ident,
     field_name: String,
     is_option: bool,
-    #[allow(dead_code)]
     is_vec: bool,
     is_uploaded_file: bool,
     rules: Vec<RuleSpec>,
@@ -514,11 +513,25 @@ fn generate_ts_validation_registration(
         .iter()
         .map(|field| {
             let field_name = &field.name;
-            let rules = field_validations
+            let validation_rules = field_validations
                 .iter()
                 .find(|validation| validation.field_name == field.name)
-                .map(|validation| generate_ts_validation_rules(&validation.rules))
-                .unwrap_or_else(|| Ok(Vec::new()))?;
+                .map(|validation| validation.rules.as_slice())
+                .unwrap_or_default();
+            let mut rules = generate_ts_validation_rules(validation_rules)?;
+            if should_add_implicit_nullable(field.is_option, validation_rules) {
+                rules.insert(
+                    0,
+                    generate_ts_rule(
+                        "nullable",
+                        Vec::new(),
+                        quote!(Vec::new()),
+                        &None,
+                        false,
+                        Vec::new(),
+                    ),
+                );
+            }
             let value_kind = contract_value_kind_for_field(field);
             Ok(quote! {
                 ::foundry::typescript::TsValidationField {
@@ -893,6 +906,49 @@ fn is_file_rule(rule: &RuleSpec) -> bool {
     )
 }
 
+fn rule_is_named(rule: &RuleSpec, expected: &str) -> bool {
+    matches!(
+        rule,
+        RuleSpec::Simple { name, .. } | RuleSpec::Parametric { name, .. }
+            if name == expected
+    )
+}
+
+fn should_add_implicit_nullable(is_option: bool, rules: &[RuleSpec]) -> bool {
+    is_option
+        && !rules
+            .iter()
+            .any(|rule| rule_is_named(rule, "nullable") || rule_is_named(rule, "required"))
+}
+
+fn collection_validation_value(field_ident: &Ident, is_option: bool) -> TokenStream {
+    // FieldValidator is string-backed. A same-length sentinel preserves collection
+    // presence and lets its existing required/min/max rules operate on item count.
+    if is_option {
+        quote! {
+            self.#field_ident
+                .as_ref()
+                .map(|__items| "x".repeat(__items.len()))
+                .unwrap_or_default()
+        }
+    } else {
+        quote!("x".repeat(self.#field_ident.len()))
+    }
+}
+
+fn scalar_validation_value(field_ident: &Ident, is_option: bool) -> TokenStream {
+    if is_option {
+        quote! {
+            self.#field_ident
+                .as_ref()
+                .map(|__value| ::std::string::ToString::to_string(__value))
+                .unwrap_or_default()
+        }
+    } else {
+        quote!(::std::string::ToString::to_string(&self.#field_ident))
+    }
+}
+
 fn app_enum_rule_type(rules: &[RuleSpec]) -> Option<&syn::Path> {
     rules.iter().find_map(|rule| match rule {
         RuleSpec::AppEnum { type_path } => Some(type_path),
@@ -919,6 +975,11 @@ fn generate_validate_body(
     for fv in field_validations {
         let field_ident = &fv.field_ident;
         let field_name = &fv.field_name;
+        let nullable_call = if should_add_implicit_nullable(fv.is_option, &fv.rules) {
+            quote!(.nullable())
+        } else {
+            quote!()
+        };
 
         let file_rules: Vec<&RuleSpec> = fv.rules.iter().filter(|r| is_file_rule(r)).collect();
         let text_rules: Vec<&RuleSpec> = fv
@@ -935,63 +996,69 @@ fn generate_validate_body(
             ));
         }
 
-        let has_each = fv.rules.iter().any(|r| matches!(r, RuleSpec::Each { .. }));
-        let each_rules: Vec<&RuleSpec> = fv
-            .rules
-            .iter()
-            .filter(|r| matches!(r, RuleSpec::Each { .. }))
-            .collect();
+        let mut each_rules = fv.rules.iter().filter_map(|rule| match rule {
+            RuleSpec::Each { rules } => Some(rules.as_slice()),
+            _ => None,
+        });
 
-        if has_each {
-            if each_rules.len() > 1 {
+        if let Some(rules) = each_rules.next() {
+            if !fv.is_vec {
+                return Err(syn::Error::new(
+                    field_ident.span(),
+                    "`each(...)` can only be used on Vec<T> or Option<Vec<T>> fields",
+                ));
+            }
+            if each_rules.next().is_some() {
                 return Err(syn::Error::new(
                     field_ident.span(),
                     "only one `each(...)` rule is allowed per field",
                 ));
             }
 
-            let RuleSpec::Each { rules } = each_rules[0] else {
-                unreachable!()
-            };
-
-            let rule_chain =
-                generate_rule_chain(rules, struct_ident, all_field_names, field_ident)?;
-
-            if let Some(type_path) = app_enum_rule_type(rules) {
-                let key_expr = app_enum_key_string(type_path, quote!((*__item).clone()));
-                if fv.is_option {
-                    stmts.push(quote! {
-                        if let Some(__items) = self.#field_ident.as_ref() {
-                            let __values = __items
-                                .iter()
-                                .map(|__item| #key_expr)
-                                .collect::<Vec<String>>();
-                            validator.each(#field_name, &__values)
-                                #rule_chain
-                                .apply()
-                                .await?;
-                        }
-                    });
-                } else {
-                    stmts.push(quote! {
-                        let __values = self.#field_ident
-                            .iter()
-                            .map(|__item| #key_expr)
-                            .collect::<Vec<String>>();
-                        validator.each(#field_name, &__values)
-                            #rule_chain
-                            .apply()
-                            .await?;
-                    });
-                }
-            } else {
+            if !text_rules.is_empty() {
+                let value_expr = collection_validation_value(field_ident, fv.is_option);
+                let rule_chain = generate_rule_chain_from_refs(
+                    &text_rules,
+                    struct_ident,
+                    all_field_names,
+                    field_ident,
+                )?;
                 stmts.push(quote! {
-                    validator.each(#field_name, &self.#field_ident)
+                    validator.field(#field_name, #value_expr)
+                        #nullable_call
                         #rule_chain
                         .apply()
                         .await?;
                 });
             }
+
+            let rule_chain =
+                generate_rule_chain(rules, struct_ident, all_field_names, field_ident)?;
+
+            let item_value = if let Some(type_path) = app_enum_rule_type(rules) {
+                let key_expr = app_enum_key_string(type_path, quote!((*__item).clone()));
+                quote!(#key_expr)
+            } else {
+                quote!(::std::string::ToString::to_string(__item))
+            };
+            let items = if fv.is_option {
+                quote!(self.#field_ident.as_deref())
+            } else {
+                quote!(Some(self.#field_ident.as_slice()))
+            };
+
+            stmts.push(quote! {
+                if let Some(__items) = #items {
+                    let __values = __items
+                        .iter()
+                        .map(|__item| #item_value)
+                        .collect::<Vec<String>>();
+                    validator.each(#field_name, &__values)
+                        #rule_chain
+                        .apply()
+                        .await?;
+                }
+            });
         } else if fv.is_uploaded_file {
             // File field: generate text rule chain (for "required" etc.) + file validation code
             if !text_rules.is_empty() {
@@ -1007,18 +1074,6 @@ fn generate_validate_body(
                     all_field_names,
                     field_ident,
                 )?;
-
-                let has_nullable = text_rules.iter().any(|r| match r {
-                    RuleSpec::Simple { name, .. } => name == "nullable",
-                    RuleSpec::Parametric { name, .. } => name == "nullable",
-                    _ => false,
-                });
-
-                let nullable_call = if fv.is_option && !has_nullable {
-                    quote!(.nullable())
-                } else {
-                    quote!()
-                };
 
                 stmts.push(quote! {
                     validator.field(#field_name, #value_expr)
@@ -1047,28 +1102,14 @@ fn generate_validate_body(
                 } else {
                     app_enum_key_string(type_path, quote!(self.#field_ident.clone()))
                 }
-            } else if fv.is_option {
-                quote!(self.#field_ident.as_deref().unwrap_or(""))
+            } else if fv.is_vec {
+                collection_validation_value(field_ident, fv.is_option)
             } else {
-                quote!(&self.#field_ident)
+                scalar_validation_value(field_ident, fv.is_option)
             };
 
             let rule_chain =
                 generate_rule_chain(&fv.rules, struct_ident, all_field_names, field_ident)?;
-
-            let has_nullable = fv.rules.iter().any(|r| match r {
-                RuleSpec::Simple { name, .. } => name == "nullable",
-                RuleSpec::Parametric { name, .. } => name == "nullable",
-                RuleSpec::Each { .. } => false,
-                RuleSpec::AppEnum { .. } => false,
-                _ => false,
-            });
-
-            let nullable_call = if fv.is_option && !has_nullable {
-                quote!(.nullable())
-            } else {
-                quote!()
-            };
 
             stmts.push(quote! {
                 validator.field(#field_name, #value_expr)
@@ -1291,7 +1332,10 @@ fn generate_parametric_rule_call(
         }
 
         let method = syn::Ident::new(name, proc_macro2::Span::call_site());
-        return Ok(quote!(.#method(#other_field_name, &self.#other_field_ident) #with_msg));
+        return Ok(quote!(.#method(
+            #other_field_name,
+            ::std::string::ToString::to_string(&self.#other_field_ident)
+        ) #with_msg));
     }
 
     // Two-string-param rules: unique("table", "col"), exists("table", "col")

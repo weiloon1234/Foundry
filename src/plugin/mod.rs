@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -16,6 +15,7 @@ use crate::foundation::{AppContext, Error, Result, ServiceProvider, ServiceRegis
 use crate::http::RouteRegistrar;
 use crate::logging::{catch_async_panic, catch_sync_panic, panic_payload_message};
 use crate::scheduler::ScheduleRegistrar;
+use crate::support::generated_manifest::{ensure_generated_file_writable, write_generated_file};
 use crate::support::ValidationRuleId;
 use crate::validation::ValidationRule;
 use crate::websocket::WebSocketRouteRegistrar;
@@ -1359,19 +1359,9 @@ fn write_output_file(
     force: bool,
 ) -> Result<PathBuf> {
     validate_relative_output_path(relative_path, "plugin output")?;
-    reject_existing_output_symlinks(target_dir, relative_path)?;
-
     let path = target_dir.join(relative_path);
-    if path.exists() && !force {
-        return Err(Error::message(format!(
-            "refusing to overwrite existing file `{}` without `--force`",
-            path.display()
-        )));
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(Error::other)?;
-    }
-    fs::write(&path, contents).map_err(Error::other)?;
+    ensure_generated_file_writable(target_dir, relative_path, force)?;
+    write_generated_file(target_dir, relative_path, contents)?;
     Ok(path)
 }
 
@@ -1424,29 +1414,6 @@ fn validate_relative_output_path(path: &Path, label: &str) -> Result<()> {
 
     if !has_component {
         return Err(Error::message(format!("{label} path cannot be empty")));
-    }
-
-    Ok(())
-}
-
-fn reject_existing_output_symlinks(target_dir: &Path, relative_path: &Path) -> Result<()> {
-    let mut current = target_dir.to_path_buf();
-    for component in relative_path.components() {
-        let Component::Normal(value) = component else {
-            continue;
-        };
-        current.push(value);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(Error::message(format!(
-                    "refusing to write plugin output through symlink `{}`",
-                    current.display()
-                )));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => return Err(Error::other(error)),
-        }
     }
 
     Ok(())

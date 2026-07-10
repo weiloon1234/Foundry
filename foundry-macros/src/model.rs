@@ -64,6 +64,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let mut write_mutator_helpers = Vec::new();
     let mut audit_excluded_fields = Vec::new();
     let mut primary_key_field_ident = None;
+    let mut primary_key_field_ty = None;
     let mut primary_key_const_ident = None;
     let mut primary_key_is_model_id_for_self = false;
     let mut has_created_at = false;
@@ -212,6 +213,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         let is_primary_key = column_name.value() == primary_key.value();
         if is_primary_key {
             primary_key_field_ident = Some(field_ident.clone());
+            primary_key_field_ty = Some(field_ty.clone());
             primary_key_const_ident = Some(const_ident.clone());
             let primary_key_is_model_id =
                 type_argument_if_last_segment_ident(field_ty, "ModelId").is_some();
@@ -290,6 +292,12 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         syn::Error::new_spanned(
             &ident,
             "Model derive requires a resolvable primary key field",
+        )
+    })?;
+    let primary_key_field_ty = primary_key_field_ty.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &ident,
+            "Model derive requires a resolvable primary key type",
         )
     })?;
     let primary_key_const_ident = primary_key_const_ident.ok_or_else(|| {
@@ -392,6 +400,10 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             fn audit_excluded_fields() -> &'static [&'static str] {
                 &[#(#audit_excluded_fields),*]
             }
+        }
+
+        impl ::foundry::TypedPrimaryKey for #ident {
+            type PrimaryKey = #primary_key_field_ty;
         }
 
         impl ::foundry::PersistedModel for #ident {

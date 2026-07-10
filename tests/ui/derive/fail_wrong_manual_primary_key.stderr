@@ -1,0 +1,70 @@
+error[E0277]: the trait bound `&str: IntoColumnValue<i64>` is not satisfied
+  --> tests/ui/derive/fail_wrong_manual_primary_key.rs:10:42
+   |
+10 |     let _ = User::query().find(database, "not-an-integer").await;
+   |                           ----           ^^^^^^^^^^^^^^^^ the trait `IntoColumnValue<i64>` is not implemented for `&str`
+   |                           |
+   |                           required by a bound introduced by this call
+   |
+help: the following other types implement trait `IntoColumnValue<T>`
+  --> src/database/model.rs
+   |
+   | impl IntoColumnValue<String> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<std::string::String>`
+...
+   | impl IntoColumnValue<Option<String>> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<Option<std::string::String>>`
+note: required by a bound in `ModelQuery::<M>::find`
+  --> src/database/query.rs
+   |
+   |     pub async fn find<E, K>(&self, executor: &E, key: K) -> Result<Option<M>>
+   |                  ---- required by a bound in this associated function
+...
+   |         K: IntoColumnValue<M::PrimaryKey>,
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `ModelQuery::<M>::find`
+
+error[E0277]: the trait bound `&str: IntoColumnValue<i64>` is not satisfied
+  --> tests/ui/derive/fail_wrong_manual_primary_key.rs:10:13
+   |
+10 |     let _ = User::query().find(database, "not-an-integer").await;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `IntoColumnValue<i64>` is not implemented for `&str`
+   |
+help: the following other types implement trait `IntoColumnValue<T>`
+  --> src/database/model.rs
+   |
+   | impl IntoColumnValue<String> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<std::string::String>`
+...
+   | impl IntoColumnValue<Option<String>> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<Option<std::string::String>>`
+note: required by a bound in `ModelQuery::<M>::find`
+  --> src/database/query.rs
+   |
+   |     pub async fn find<E, K>(&self, executor: &E, key: K) -> Result<Option<M>>
+   |                  ---- required by a bound in this associated function
+...
+   |         K: IntoColumnValue<M::PrimaryKey>,
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `ModelQuery::<M>::find`
+
+error[E0277]: the trait bound `&str: IntoColumnValue<i64>` is not satisfied
+  --> tests/ui/derive/fail_wrong_manual_primary_key.rs:10:60
+   |
+10 |     let _ = User::query().find(database, "not-an-integer").await;
+   |                                                            ^^^^^ the trait `IntoColumnValue<i64>` is not implemented for `&str`
+   |
+help: the following other types implement trait `IntoColumnValue<T>`
+  --> src/database/model.rs
+   |
+   | impl IntoColumnValue<String> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<std::string::String>`
+...
+   | impl IntoColumnValue<Option<String>> for &str {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&str` implements `IntoColumnValue<Option<std::string::String>>`
+note: required by a bound in `ModelQuery::<M>::find`
+  --> src/database/query.rs
+   |
+   |     pub async fn find<E, K>(&self, executor: &E, key: K) -> Result<Option<M>>
+   |                  ---- required by a bound in this associated function
+...
+   |         K: IntoColumnValue<M::PrimaryKey>,
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `ModelQuery::<M>::find`

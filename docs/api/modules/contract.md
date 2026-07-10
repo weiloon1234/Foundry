@@ -21,6 +21,7 @@ struct ContractManifest
   fn new() -> Self
   fn from_http_routes(routes: &[RouteManifestEntry]) -> Result<Self>
   fn with_schemas(self, schemas: Vec<ContractSchema>) -> Self
+  fn merge_schemas(self, schemas: Vec<ContractSchema>) -> Result<Self>
   fn with_validation_schemas( self, schemas: Vec<ContractValidationSchema>, ) -> Self
   fn with_realtime_channels( self, channels: Vec<ContractRealtimeChannel>, ) -> Self
   fn infer_transport_body_kinds(&mut self)
@@ -38,4 +39,3 @@ struct ContractValidationSchema
   fn requires_multipart(&self) -> bool
 struct ContractWebSocketTransport
 ```
-

@@ -14,6 +14,8 @@ const CREATE_PROFILES_MIGRATION_ID: &str = "202604101531_create_profiles";
 const USERS_SEED_ID: &str = "users_seed";
 const USERS_TABLE: &str = "users";
 const PROFILES_TABLE: &str = "profiles";
+const ATOMIC_MIGRATION_ID: &str = "202607101200_create_atomic_migration_widgets";
+const ATOMIC_MIGRATION_TABLE: &str = "foundry_atomic_migration_widgets";
 
 fn postgres_url() -> Option<String> {
     std::env::var("FOUNDRY_TEST_POSTGRES_URL")
@@ -36,6 +38,10 @@ fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn migration_provider() -> GeneratedDatabaseProvider {
     GeneratedDatabaseProvider
 }
@@ -47,6 +53,45 @@ struct GeneratedDatabaseProvider;
 impl ServiceProvider for GeneratedDatabaseProvider {
     async fn register(&self, registrar: &mut ServiceRegistrar) -> Result<()> {
         foundry::register_generated_database!(registrar)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct AtomicMigrationProvider;
+
+#[async_trait]
+impl ServiceProvider for AtomicMigrationProvider {
+    async fn register(&self, registrar: &mut ServiceRegistrar) -> Result<()> {
+        foundry::__private::register_generated_migration_file::<AtomicLedgerMigration>(
+            registrar,
+            MigrationId::new(ATOMIC_MIGRATION_ID),
+        )
+    }
+}
+
+struct AtomicLedgerMigration;
+
+#[async_trait]
+impl MigrationFile for AtomicLedgerMigration {
+    async fn up(ctx: &MigrationContext<'_>) -> Result<()> {
+        ctx.raw_execute(
+            &format!(
+                "CREATE TABLE {} (id BIGINT PRIMARY KEY)",
+                quote_identifier(ATOMIC_MIGRATION_TABLE)
+            ),
+            &[],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn down(ctx: &MigrationContext<'_>) -> Result<()> {
+        ctx.raw_execute(
+            &format!("DROP TABLE {}", quote_identifier(ATOMIC_MIGRATION_TABLE)),
+            &[],
+        )
+        .await?;
         Ok(())
     }
 }
@@ -105,6 +150,16 @@ impl TestRuntime {
             .database
             .raw_execute(
                 &format!("DROP TABLE IF EXISTS {}", quote_identifier(USERS_TABLE)),
+                &[],
+            )
+            .await;
+        let _ = self
+            .database
+            .raw_execute(
+                &format!(
+                    "DROP TABLE IF EXISTS {}",
+                    quote_identifier(ATOMIC_MIGRATION_TABLE)
+                ),
                 &[],
             )
             .await;
@@ -227,6 +282,60 @@ impl TestRuntime {
             .await
             .unwrap();
     }
+
+    async fn create_ledger_rejecting_migration(&self, migration_id: &str) {
+        self.database
+            .raw_execute(
+                &format!(
+                    "CREATE SCHEMA IF NOT EXISTS {}",
+                    quote_identifier(&self.schema)
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        self.database
+            .raw_execute(
+                &format!(
+                    "CREATE TABLE {}.{} (id TEXT PRIMARY KEY, batch BIGINT NOT NULL, applied_at TIMESTAMPTZ NOT NULL, CONSTRAINT {} CHECK (id <> {}))",
+                    quote_identifier(&self.schema),
+                    quote_identifier(&self.migration_table),
+                    quote_identifier("reject_atomic_migration_ledger_insert"),
+                    quote_literal(migration_id),
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn block_migration_ledger_delete(&self, migration_id: &str) {
+        self.database
+            .raw_execute(
+                &format!(
+                    "CREATE TABLE {}.{} (migration_id TEXT PRIMARY KEY, CONSTRAINT {} FOREIGN KEY (migration_id) REFERENCES {}.{} (id))",
+                    quote_identifier(&self.schema),
+                    quote_identifier("migration_ledger_delete_guard"),
+                    quote_identifier("block_atomic_migration_ledger_delete"),
+                    quote_identifier(&self.schema),
+                    quote_identifier(&self.migration_table),
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        self.database
+            .raw_execute(
+                &format!(
+                    "INSERT INTO {}.{} (migration_id) VALUES ($1)",
+                    quote_identifier(&self.schema),
+                    quote_identifier("migration_ledger_delete_guard"),
+                ),
+                &[migration_id.into()],
+            )
+            .await
+            .unwrap();
+    }
 }
 
 fn write_runtime_config(dir: &Path, url: &str, schema: &str, migration_table: &str) {
@@ -297,6 +406,35 @@ async fn db_migrate_applies_discovered_rust_migrations_and_records_the_ledger() 
 }
 
 #[tokio::test]
+async fn transactional_migration_rolls_back_ddl_when_ledger_insert_fails() {
+    let _guard = lifecycle_lock().await;
+    let Some(runtime) = TestRuntime::new().await else {
+        return;
+    };
+
+    runtime
+        .create_ledger_rejecting_migration(ATOMIC_MIGRATION_ID)
+        .await;
+
+    let error = run_cli(
+        App::builder()
+            .load_config_dir(runtime.config_dir())
+            .register_provider(AtomicMigrationProvider),
+        vec!["foundry".into(), "db:migrate".into()],
+    )
+    .await
+    .expect_err("the ledger constraint should reject the migration record");
+
+    assert!(error
+        .to_string()
+        .contains("reject_atomic_migration_ledger_insert"));
+    assert!(!runtime.table_exists(ATOMIC_MIGRATION_TABLE).await);
+    assert!(runtime.applied_migrations().await.is_empty());
+
+    runtime.cleanup().await;
+}
+
+#[tokio::test]
 async fn db_rollback_reverts_only_the_latest_generated_batch() {
     let _guard = lifecycle_lock().await;
     let Some(runtime) = TestRuntime::new().await else {
@@ -336,6 +474,46 @@ async fn db_rollback_reverts_only_the_latest_generated_batch() {
     assert_eq!(
         runtime.applied_migrations().await,
         vec![(CREATE_USERS_MIGRATION_ID.to_string(), 1)]
+    );
+
+    runtime.cleanup().await;
+}
+
+#[tokio::test]
+async fn transactional_rollback_restores_ddl_when_ledger_delete_fails() {
+    let _guard = lifecycle_lock().await;
+    let Some(runtime) = TestRuntime::new().await else {
+        return;
+    };
+
+    run_cli(
+        App::builder()
+            .load_config_dir(runtime.config_dir())
+            .register_provider(AtomicMigrationProvider),
+        vec!["foundry".into(), "db:migrate".into()],
+    )
+    .await
+    .unwrap();
+    runtime
+        .block_migration_ledger_delete(ATOMIC_MIGRATION_ID)
+        .await;
+
+    let error = run_cli(
+        App::builder()
+            .load_config_dir(runtime.config_dir())
+            .register_provider(AtomicMigrationProvider),
+        vec!["foundry".into(), "db:rollback".into()],
+    )
+    .await
+    .expect_err("the ledger foreign key should reject deleting the migration record");
+
+    assert!(error
+        .to_string()
+        .contains("block_atomic_migration_ledger_delete"));
+    assert!(runtime.table_exists(ATOMIC_MIGRATION_TABLE).await);
+    assert_eq!(
+        runtime.applied_migrations().await,
+        vec![(ATOMIC_MIGRATION_ID.to_string(), 1)]
     );
 
     runtime.cleanup().await;

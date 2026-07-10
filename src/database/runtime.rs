@@ -1671,10 +1671,13 @@ async fn query_records_on_connection(
 
     let adapter_snapshot = snapshot_adapters(adapters)?;
     configure_statement_timeout(connection, options, timeout_mode).await?;
-    let query = bind_query(sql, bindings)?;
-    let rows =
-        apply_outer_timeout(query.fetch_all(&mut *connection), options, "query", sql).await?;
-    reset_statement_timeout(connection, timeout_mode).await?;
+    let operation_result = async {
+        let query = bind_query(sql, bindings)?;
+        apply_outer_timeout(query.fetch_all(&mut *connection), options, "query", sql).await
+    }
+    .await;
+    let reset_result = reset_statement_timeout(connection, timeout_mode).await;
+    let rows = finish_statement_timeout(operation_result, reset_result, timeout_mode)?;
     let result: Result<Vec<DbRecord>> = rows
         .iter()
         .map(|row| decode_row(row, sql, options.label.as_deref(), &adapter_snapshot))
@@ -1703,10 +1706,13 @@ async fn execute_on_connection(
     let start = Instant::now();
 
     configure_statement_timeout(connection, options, timeout_mode).await?;
-    let query = bind_query(sql, bindings)?;
-    let result =
-        apply_outer_timeout(query.execute(&mut *connection), options, "execution", sql).await?;
-    reset_statement_timeout(connection, timeout_mode).await?;
+    let operation_result = async {
+        let query = bind_query(sql, bindings)?;
+        apply_outer_timeout(query.execute(&mut *connection), options, "execution", sql).await
+    }
+    .await;
+    let reset_result = reset_statement_timeout(connection, timeout_mode).await;
+    let result = finish_statement_timeout(operation_result, reset_result, timeout_mode)?;
     let rows_affected = result.rows_affected();
 
     log_sql_complete(
@@ -1864,6 +1870,28 @@ async fn reset_statement_timeout(connection: &mut PgConnection, mode: TimeoutMod
         .await
         .map_err(Error::other)?;
     Ok(())
+}
+
+fn finish_statement_timeout<T>(
+    operation: Result<T>,
+    reset: Result<()>,
+    mode: TimeoutMode,
+) -> Result<T> {
+    match (operation, reset) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(reset_error)) => Err(reset_error),
+        (Err(operation_error), Ok(())) => Err(operation_error),
+        (Err(operation_error), Err(reset_error)) => {
+            if matches!(mode, TimeoutMode::Session) {
+                tracing::error!(
+                    target: "foundry.sql",
+                    error = %reset_error,
+                    "failed to reset statement timeout after database operation error"
+                );
+            }
+            Err(operation_error)
+        }
+    }
 }
 
 fn snapshot_adapters(

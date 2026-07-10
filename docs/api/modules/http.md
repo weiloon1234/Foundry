@@ -20,6 +20,11 @@ struct HttpRegistrar
   fn route_with_options( &mut self, path: &str, method_router: MethodRouter<AppContext>, options: HttpRouteOptions, ) -> &mut Self
   fn route_named<I>( &mut self, name: I, path: &str, method_router: MethodRouter<AppContext>, ) -> &mut Self
   fn route_named_with_options<I>( &mut self, name: I, path: &str, method_router: MethodRouter<AppContext>, options: HttpRouteOptions, ) -> &mut Self
+  fn get<I, H, T>( &mut self, name: I, path: &str, handler: H, configure: impl FnOnce(&mut HttpRouteBuilder), ) -> &mut Self
+  fn post<I, H, T>( &mut self, name: I, path: &str, handler: H, configure: impl FnOnce(&mut HttpRouteBuilder), ) -> &mut Self
+  fn put<I, H, T>( &mut self, name: I, path: &str, handler: H, configure: impl FnOnce(&mut HttpRouteBuilder), ) -> &mut Self
+  fn patch<I, H, T>( &mut self, name: I, path: &str, handler: H, configure: impl FnOnce(&mut HttpRouteBuilder), ) -> &mut Self
+  fn delete<I, H, T>( &mut self, name: I, path: &str, handler: H, configure: impl FnOnce(&mut HttpRouteBuilder), ) -> &mut Self
   fn scope( &mut self, path: &str, f: impl FnOnce(&mut HttpScope<'_>) -> Result<()>, ) -> Result<&mut Self>
   fn nest(&mut self, path: &str, router: HttpRouter) -> &mut Self
   fn merge(&mut self, router: HttpRouter) -> &mut Self
@@ -28,8 +33,8 @@ struct HttpRegistrar
   fn api_version( &mut self, version: u32, f: impl FnOnce(&mut HttpRegistrar) -> Result<()>, ) -> Result<&mut Self>
   fn resource( &mut self, name: &str, path: &str, routes: HttpResourceRoutes, ) -> &mut Self
   fn resource_with_options( &mut self, name: &str, path: &str, routes: HttpResourceRoutes, options: HttpRouteOptions, ) -> &mut Self
-  fn into_router(self, app: AppContext) -> Router
-  fn into_router_with_middlewares( self, app: AppContext, middlewares: Vec<MiddlewareConfig>, ) -> Router
+  fn into_router(self, app: AppContext) -> Result<Router>
+  fn into_router_with_middlewares( self, app: AppContext, middlewares: Vec<MiddlewareConfig>, ) -> Result<Router>
   fn collect_route_manifest(&self) -> Result<Vec<RouteManifestEntry>>
 struct HttpResourceRoutes
   fn new() -> Self
@@ -46,7 +51,7 @@ struct HttpRouteBuilder
   fn permissions<I, P>(&mut self, permissions: I) -> &mut Self
   fn authorize<F, Fut>(&mut self, f: F) -> &mut Self
   fn middleware(&mut self, config: MiddlewareConfig) -> &mut Self
-  fn middleware_group(&mut self, name: impl Into<String>) -> &mut Self
+  fn middleware_group<I>(&mut self, id: I) -> &mut Self
   fn client_export(&mut self, enabled: bool) -> &mut Self
   fn without_client_export(&mut self) -> &mut Self
   fn audit_area(&mut self, area: &str) -> &mut Self
@@ -70,7 +75,7 @@ struct HttpRouteOptions
   fn without_client_export(self) -> Self
   fn audit_area(self, area: &str) -> Self
   fn audit_disabled(self) -> Self
-  fn middleware_group(self, name: impl Into<String>) -> Self
+  fn middleware_group<I>(self, id: I) -> Self
   fn rate_limit(self, rate_limit: RateLimit) -> Self
   fn document(self, doc: RouteDoc) -> Self
   fn tag(self, tag: &str) -> Self
@@ -88,7 +93,7 @@ struct HttpScope
   fn permissions<I, P>(&mut self, permissions: I) -> &mut Self
   fn authorize<F, Fut>(&mut self, f: F) -> &mut Self
   fn middleware(&mut self, config: MiddlewareConfig) -> &mut Self
-  fn middleware_group(&mut self, name: impl Into<String>) -> &mut Self
+  fn middleware_group<I>(&mut self, id: I) -> &mut Self
   fn audit_area(&mut self, area: &str) -> &mut Self
   fn audit_disabled(&mut self) -> &mut Self
   fn rate_limit(&mut self, rate_limit: RateLimit) -> &mut Self
@@ -229,7 +234,8 @@ struct MaxBodySize
   fn mb(n: usize) -> Self
   fn build(self) -> MiddlewareConfig
 struct MiddlewareGroups
-  fn get(&self, name: &str) -> Option<&Vec<MiddlewareConfig>>
+  fn get(&self, id: &MiddlewareGroupId) -> Option<&Vec<MiddlewareConfig>>
+  fn register<I>( &mut self, id: I, middlewares: Vec<MiddlewareConfig>, ) -> Result<()>
 struct RateLimit
   fn new(max: u32) -> Self
   fn per_second(self) -> Self
@@ -307,4 +313,3 @@ struct RouteRegistry
 - Config-derived body-limit, request-timeout, and rate-limit rejections return JSON `ErrorResponse` bodies with HTTP 413, 408, and 429.
 - Actor-only rate limits require an authenticated actor; use `actor_or_ip` when a global rate limit needs an IP fallback.
 - IP rate limits use `TrustedProxy` real IP when available and otherwise fall back to TCP peer connect info on the real server path.
-

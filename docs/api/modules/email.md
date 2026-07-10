@@ -165,4 +165,3 @@ struct TemplateRenderer
 - `EmailConfig.max_attachment_bytes` and `max_total_attachment_bytes` bound resolved attachment payloads before provider delivery; `0` disables each cap.
 - The built-in SES driver uses the SES SendEmail API and rejects attachments clearly instead of silently dropping them.
 - Provider error bodies are truncated and obvious secret fields are redacted before they are returned or logged.
-

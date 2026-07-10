@@ -111,7 +111,36 @@ impl AuditRedactionPolicy {
         if self.sensitive(field) {
             serde_json::Value::String(REDACTED_AUDIT_VALUE.to_string())
         } else {
-            db_value_to_json(value)
+            self.redact_json_value(db_value_to_json(value))
+        }
+    }
+
+    fn redact_json_value(&self, value: serde_json::Value) -> serde_json::Value {
+        if !self.redact_sensitive {
+            return value;
+        }
+
+        match value {
+            serde_json::Value::Object(values) => serde_json::Value::Object(
+                values
+                    .into_iter()
+                    .map(|(key, value)| {
+                        let value = if self.sensitive(&key) {
+                            serde_json::Value::String(REDACTED_AUDIT_VALUE.to_string())
+                        } else {
+                            self.redact_json_value(value)
+                        };
+                        (key, value)
+                    })
+                    .collect(),
+            ),
+            serde_json::Value::Array(values) => serde_json::Value::Array(
+                values
+                    .into_iter()
+                    .map(|value| self.redact_json_value(value))
+                    .collect(),
+            ),
+            value => value,
         }
     }
 }
@@ -707,6 +736,38 @@ mod tests {
     }
 
     #[test]
+    fn audit_redaction_recurses_through_json_objects_and_arrays() {
+        let after = record(&[(
+            "settings",
+            DbValue::Json(serde_json::json!({
+                "theme": "dark",
+                "api_key": "top-level-secret",
+                "integrations": [
+                    {
+                        "name": "billing",
+                        "credentials": {
+                            "accessToken": "nested-token",
+                            "endpoint": "https://example.test"
+                        }
+                    }
+                ]
+            })),
+        )]);
+
+        let payload = build_payload(AuditEventType::Created, None, Some(&after), &policy(&[]));
+        let settings = &payload.after_data.unwrap()["settings"];
+
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["api_key"], REDACTED_AUDIT_VALUE);
+        assert_eq!(
+            settings["integrations"][0]["credentials"],
+            REDACTED_AUDIT_VALUE
+        );
+        assert!(!settings.to_string().contains("top-level-secret"));
+        assert!(!settings.to_string().contains("nested-token"));
+    }
+
+    #[test]
     fn sensitive_audit_changes_record_redacted_markers_when_raw_values_change() {
         let before = record(&[
             ("id", DbValue::Int64(1)),
@@ -753,6 +814,10 @@ mod tests {
         let after = record(&[
             ("id", DbValue::Int64(1)),
             ("password", DbValue::Text("visible-for-test".into())),
+            (
+                "settings",
+                DbValue::Json(serde_json::json!({"api_key": "nested-visible"})),
+            ),
         ]);
 
         let payload = build_payload(
@@ -762,6 +827,8 @@ mod tests {
             &unredacted_policy(&[]),
         );
 
-        assert_eq!(payload.after_data.unwrap()["password"], "visible-for-test");
+        let after_data = payload.after_data.unwrap();
+        assert_eq!(after_data["password"], "visible-for-test");
+        assert_eq!(after_data["settings"]["api_key"], "nested-visible");
     }
 }

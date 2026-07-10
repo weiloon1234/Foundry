@@ -35,12 +35,45 @@ impl ContractManifest {
             .iter()
             .map(ContractAction::from_http_route)
             .collect::<Result<Vec<_>>>()?;
+        let mut schemas = BTreeMap::new();
+        for route in routes {
+            if let (Some(name), Some(schema)) = (route.request, &route.request_schema_json) {
+                insert_contract_schema(&mut schemas, name, schema.clone())?;
+            }
+            for response in &route.responses {
+                insert_contract_schema(
+                    &mut schemas,
+                    response.schema,
+                    response.schema_json.clone(),
+                )?;
+            }
+        }
+        manifest.schemas = schemas
+            .into_iter()
+            .map(|(name, schema)| ContractSchema { name, schema })
+            .collect();
         Ok(manifest)
     }
 
     pub fn with_schemas(mut self, schemas: Vec<ContractSchema>) -> Self {
         self.schemas = schemas;
         self
+    }
+
+    pub fn merge_schemas(mut self, schemas: Vec<ContractSchema>) -> Result<Self> {
+        let mut merged = self
+            .schemas
+            .into_iter()
+            .map(|schema| (schema.name, schema.schema))
+            .collect::<BTreeMap<_, _>>();
+        for schema in schemas {
+            insert_contract_schema(&mut merged, &schema.name, schema.schema)?;
+        }
+        self.schemas = merged
+            .into_iter()
+            .map(|(name, schema)| ContractSchema { name, schema })
+            .collect();
+        Ok(self)
     }
 
     pub fn with_validation_schemas(mut self, schemas: Vec<ContractValidationSchema>) -> Self {
@@ -76,6 +109,24 @@ impl ContractManifest {
             }
         }
     }
+}
+
+fn insert_contract_schema(
+    schemas: &mut BTreeMap<String, Value>,
+    name: &str,
+    schema: Value,
+) -> Result<()> {
+    if let Some(existing) = schemas.get(name) {
+        if existing != &schema {
+            return Err(Error::message(format!(
+                "contract contains duplicate schema name `{name}` with different definitions"
+            )));
+        }
+        return Ok(());
+    }
+
+    schemas.insert(name.to_string(), schema);
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -429,4 +480,69 @@ fn to_pascal_case_identifier(value: &str, context: &str) -> Result<String> {
     }
 
     Ok(identifier)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::http::{RouteManifestEntry, RouteManifestResponse};
+    use crate::support::RouteId;
+
+    fn route(response_schema: Value) -> RouteManifestEntry {
+        RouteManifestEntry {
+            id: RouteId::new("users.show"),
+            path: "/users/:id".to_string(),
+            method: Some("get".to_string()),
+            params: vec!["id".to_string()],
+            client_export: true,
+            guard: None,
+            permissions: Vec::new(),
+            summary: None,
+            request: Some("UserRequest"),
+            request_schema_json: Some(json!({"type": "object"})),
+            responses: vec![RouteManifestResponse {
+                status: 200,
+                schema: "UserResponse",
+                schema_json: response_schema,
+            }],
+        }
+    }
+
+    #[test]
+    fn http_route_schemas_are_materialized_in_serialized_contract() {
+        let manifest = ContractManifest::from_http_routes(&[route(json!({
+            "type": "object",
+            "properties": {"id": {"type": "string"}}
+        }))])
+        .unwrap();
+        let serialized = serde_json::to_value(&manifest).unwrap();
+
+        assert!(serialized["schemas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|schema| schema["name"] == "UserRequest"));
+        assert!(serialized["schemas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|schema| schema["name"] == "UserResponse"));
+    }
+
+    #[test]
+    fn conflicting_route_schema_definitions_are_rejected() {
+        let mut first = route(json!({"type": "string"}));
+        first.id = RouteId::new("users.first");
+        let mut second = route(json!({"type": "integer"}));
+        second.id = RouteId::new("users.second");
+
+        let error = ContractManifest::from_http_routes(&[first, second]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "contract contains duplicate schema name `UserResponse` with different definitions"
+        );
+    }
 }

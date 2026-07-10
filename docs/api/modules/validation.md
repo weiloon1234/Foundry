@@ -127,6 +127,7 @@ struct Validator
   fn custom_attribute( &mut self, field: impl Into<String>, name: impl Into<String>, )
 trait FromMultipart
   fn from_multipart<'life0, 'async_trait>(
+  fn cleanup_multipart_files<'life0, 'async_trait>(
 trait RequestValidator
   fn validate<'life0, 'life1, 'async_trait>(
   fn messages(&self) -> Vec<(String, String, String)>
@@ -146,4 +147,3 @@ fn check_max_size(file: &UploadedFile, max_kb: u64) -> bool
 async fn get_image_dimensions(file: &UploadedFile) -> Result<(u32, u32)>
 async fn is_image(file: &UploadedFile) -> Result<bool>
 ```
-

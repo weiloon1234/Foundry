@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::email::EmailMessage;
-use crate::foundation::Result;
+use crate::foundation::{AppContext, Error, Result};
 use crate::jobs::{Job, JobContext};
 use crate::support::{JobId, NotificationChannelId};
 
@@ -25,6 +25,8 @@ pub struct SendNotificationJob {
     pub(crate) database_payload: Option<serde_json::Value>,
     pub(crate) broadcast_payload: Option<serde_json::Value>,
     pub(crate) custom_payloads: Vec<(NotificationChannelId, serde_json::Value)>,
+    #[serde(default)]
+    pub(crate) custom_routes: Vec<(NotificationChannelId, String)>,
 }
 
 #[async_trait]
@@ -32,81 +34,89 @@ impl Job for SendNotificationJob {
     const ID: JobId = JobId::new("foundry:send_notification");
 
     async fn handle(&self, context: JobContext) -> Result<()> {
-        let app = context.app();
-        let registry = app.resolve::<NotificationChannelRegistry>()?;
+        self.deliver(context.app()).await
+    }
+}
+
+impl SendNotificationJob {
+    pub(super) async fn deliver(&self, app: &AppContext) -> Result<()> {
+        let registry = app
+            .resolve::<NotificationChannelRegistry>()
+            .map_err(|error| {
+                Error::message(format!(
+                    "queued notification `{}` channel registry resolution failed: {error}",
+                    self.notification_type
+                ))
+            })?;
 
         for channel_id in &self.channels {
-            if *channel_id == NOTIFY_EMAIL {
-                if let Some(ref message) = self.email_payload {
-                    if let Err(error) = app.email()?.send(message.clone()).await {
-                        tracing::error!(
-                            channel = "email",
-                            notification_type = %self.notification_type,
-                            error = %error,
-                            "queued notification email delivery failed"
-                        );
-                    }
-                }
-            } else if *channel_id == NOTIFY_DATABASE {
-                if let Some(ref data) = self.database_payload {
-                    if let Err(error) = store_database_notification(
-                        app,
-                        self.notifiable_id.clone(),
-                        self.notification_type.clone(),
-                        data.clone(),
-                    )
-                    .await
-                    {
-                        tracing::error!(
-                            channel = "database",
-                            notification_type = %self.notification_type,
-                            error = %error,
-                            "queued notification database delivery failed"
-                        );
-                    }
-                }
-            } else if *channel_id == NOTIFY_BROADCAST {
-                if let Some(ref payload) = self.broadcast_payload {
-                    if let Ok(ws) = app.websocket() {
-                        let _ = ws
-                            .publish(
-                                NOTIFICATION_BROADCAST_CHANNEL,
-                                NOTIFICATION_BROADCAST_EVENT,
-                                Some(self.notifiable_id.as_str()),
-                                payload.clone(),
-                            )
-                            .await;
-                    }
-                }
-            } else {
-                // Custom channel — look up from registry and send with a minimal notifiable stub
-                if let Some(channel) = registry.get(channel_id) {
-                    let stub = QueuedNotifiable {
-                        id: self.notifiable_id.clone(),
-                    };
-                    let stub_notification = QueuedNotificationStub {
-                        notification_type: self.notification_type.clone(),
-                        channels: self.channels.clone(),
-                        custom_payloads: self.custom_payloads.clone(),
-                    };
-                    if let Err(error) = callback::send_channel_adapter(
-                        channel_id,
-                        channel.as_ref(),
-                        app,
-                        &stub,
-                        &stub_notification,
-                    )
-                    .await
-                    {
-                        tracing::error!(
-                            channel = %channel_id,
-                            notification_type = %self.notification_type,
-                            error = %error,
-                            "queued notification custom channel delivery failed"
-                        );
-                    }
-                }
+            self.deliver_channel(app, &registry, channel_id)
+                .await
+                .map_err(|error| {
+                    Error::message(format!(
+                        "queued notification `{}` channel `{channel_id}` delivery failed: {error}",
+                        self.notification_type
+                    ))
+                })?;
+        }
+
+        Ok(())
+    }
+
+    async fn deliver_channel(
+        &self,
+        app: &AppContext,
+        registry: &NotificationChannelRegistry,
+        channel_id: &NotificationChannelId,
+    ) -> Result<()> {
+        if *channel_id == NOTIFY_EMAIL {
+            if let Some(message) = &self.email_payload {
+                app.email()?.send(message.clone()).await?;
             }
+        } else if *channel_id == NOTIFY_DATABASE {
+            if let Some(data) = &self.database_payload {
+                store_database_notification(
+                    app,
+                    self.notifiable_id.clone(),
+                    self.notification_type.clone(),
+                    data.clone(),
+                )
+                .await?;
+            }
+        } else if *channel_id == NOTIFY_BROADCAST {
+            if let Some(payload) = &self.broadcast_payload {
+                app.websocket()?
+                    .publish(
+                        NOTIFICATION_BROADCAST_CHANNEL,
+                        NOTIFICATION_BROADCAST_EVENT,
+                        Some(self.notifiable_id.as_str()),
+                        payload.clone(),
+                    )
+                    .await?;
+            }
+        } else {
+            let channel = registry.get(channel_id).ok_or_else(|| {
+                Error::message(format!(
+                    "notification channel `{channel_id}` is not registered"
+                ))
+            })?;
+            let notifiable = QueuedNotifiable {
+                id: self.notifiable_id.as_str(),
+                routes: &self.custom_routes,
+            };
+            let notification = QueuedNotificationStub {
+                notification_type: self.notification_type.as_str(),
+                channels: &self.channels,
+                custom_payloads: &self.custom_payloads,
+            };
+            callback::send_channel_adapter(
+                channel_id,
+                channel.as_ref(),
+                app,
+                &notifiable,
+                &notification,
+            )
+            .await?;
         }
 
         Ok(())
@@ -114,30 +124,38 @@ impl Job for SendNotificationJob {
 }
 
 /// Minimal notifiable for queued replay.
-struct QueuedNotifiable {
-    id: String,
+struct QueuedNotifiable<'a> {
+    id: &'a str,
+    routes: &'a [(NotificationChannelId, String)],
 }
 
-impl super::Notifiable for QueuedNotifiable {
+impl super::Notifiable for QueuedNotifiable<'_> {
     fn notification_id(&self) -> String {
-        self.id.clone()
+        self.id.to_string()
+    }
+
+    fn route_notification_for(&self, channel: &str) -> Option<String> {
+        self.routes
+            .iter()
+            .find(|(id, _)| id.as_ref() == channel)
+            .map(|(_, route)| route.clone())
     }
 }
 
 /// Minimal notification stub for custom channel replay.
-struct QueuedNotificationStub {
-    notification_type: String,
-    channels: Vec<NotificationChannelId>,
-    custom_payloads: Vec<(NotificationChannelId, serde_json::Value)>,
+struct QueuedNotificationStub<'a> {
+    notification_type: &'a str,
+    channels: &'a [NotificationChannelId],
+    custom_payloads: &'a [(NotificationChannelId, serde_json::Value)],
 }
 
-impl super::Notification for QueuedNotificationStub {
+impl super::Notification for QueuedNotificationStub<'_> {
     fn notification_type(&self) -> &str {
-        &self.notification_type
+        self.notification_type
     }
 
     fn via(&self) -> Vec<NotificationChannelId> {
-        self.channels.clone()
+        self.channels.to_vec()
     }
 
     fn to_channel(

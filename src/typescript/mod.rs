@@ -25,11 +25,12 @@ use crate::contract::{
     ContractValidationMessage, ContractValidationRule, ContractValidationSchema, ContractValueKind,
 };
 use crate::foundation::{Error, Result};
-use crate::http::{HttpRegistrar, RouteManifestEntry, RouteRegistrar};
+use crate::http::RouteManifestEntry;
 use crate::openapi::ApiSchemaDefinition;
 use crate::support::generated_manifest::{
-    clean_manifest_files as clean_generated_manifest_files, safe_manifest_path_with_extension,
-    write_generated_file, write_manifest,
+    clean_manifest_files as clean_generated_manifest_files, create_generated_dir_all,
+    prepare_generated_file_path, safe_manifest_path_with_extension, write_generated_file,
+    write_manifest,
 };
 use crate::support::CommandId;
 use crate::websocket::WebSocketRouteRegistrar;
@@ -877,6 +878,15 @@ fn websocket_event_array(events: &[crate::contract::ContractRealtimeEvent]) -> S
     string_array_literal(events.iter().map(|event| event.event.as_str()))
 }
 
+fn websocket_payload_event_array(events: &[crate::contract::ContractRealtimeEvent]) -> String {
+    string_array_literal(
+        events
+            .iter()
+            .filter(|event| event.payload.is_some())
+            .map(|event| event.event.as_str()),
+    )
+}
+
 fn websocket_payload_type(
     payload: Option<&crate::contract::ContractPayload>,
     exported_types: &BTreeMap<String, String>,
@@ -949,7 +959,7 @@ fn render_websocket_manifest(
         .iter()
         .map(|channel| {
             format!(
-                "  {}: {{ id: {}, presence: {}, replayCount: {}, allowClientEvents: {}, clientEvents: {}, serverEvents: {}, requiresAuth: {}, guard: {}, permissions: {} }}",
+                "  {}: {{ id: {}, presence: {}, replayCount: {}, allowClientEvents: {}, clientEvents: {}, serverEvents: {}, clientPayloadEvents: {}, serverPayloadEvents: {}, requiresAuth: {}, guard: {}, permissions: {} }}",
                 json_string(&channel.id),
                 json_string(&channel.id),
                 if channel.presence { "true" } else { "false" },
@@ -957,6 +967,8 @@ fn render_websocket_manifest(
                 if channel.allow_client_events { "true" } else { "false" },
                 websocket_event_array(&channel.incoming),
                 websocket_event_array(&channel.outgoing),
+                websocket_payload_event_array(&channel.incoming),
+                websocket_payload_event_array(&channel.outgoing),
                 if channel.auth.guard.is_some() { "true" } else { "false" },
                 option_string_literal(channel.auth.guard.as_deref()),
                 string_array_literal(channel.auth.permissions.iter().map(String::as_str)),
@@ -1000,6 +1012,8 @@ fn render_websocket_manifest(
            readonly allowClientEvents: boolean;\n\
            readonly clientEvents: readonly string[];\n\
            readonly serverEvents: readonly string[];\n\
+           readonly clientPayloadEvents: readonly string[];\n\
+           readonly serverPayloadEvents: readonly string[];\n\
            readonly requiresAuth: boolean;\n\
            readonly guard: string | null;\n\
            readonly permissions: readonly string[];\n\
@@ -1077,12 +1091,10 @@ fn render_websocket_manifest(
            return isWebSocketSystemEventName(event) || event === WebSocketProtocol.events.subscribed || event === WebSocketProtocol.events.unsubscribed || event === WebSocketProtocol.events.presenceJoin || event === WebSocketProtocol.events.presenceLeave;\n\
          }}\n\n\
          export function hasWebSocketServerPayload(channel: string, event: string): boolean {{\n\
-           const channelPayloads = ({{}} as WebSocketServerPayloadMap)[channel as keyof WebSocketServerPayloadMap] as Record<string, unknown> | undefined;\n\
-           return !!channelPayloads && hasOwn(channelPayloads, event);\n\
+           return isWebSocketChannelName(channel) && (WebSocketChannelManifest[channel].serverPayloadEvents as readonly string[]).includes(event);\n\
          }}\n\n\
          export function hasWebSocketClientEventPayload(channel: string, event: string): boolean {{\n\
-           const channelPayloads = ({{}} as WebSocketClientEventPayloadMap)[channel as keyof WebSocketClientEventPayloadMap] as Record<string, unknown> | undefined;\n\
-           return !!channelPayloads && hasOwn(channelPayloads, event);\n\
+           return isWebSocketChannelName(channel) && (WebSocketChannelManifest[channel].clientPayloadEvents as readonly string[]).includes(event);\n\
          }}\n\n\
          export function isWebSocketChannelName(value: string): value is WebSocketChannelName {{\n\
            return hasOwn(WebSocketChannelManifest, value);\n\
@@ -2475,7 +2487,12 @@ fn add_validation_comments(content: &str, schema: &TsValidationSchema) -> String
     output
 }
 
-fn postprocess_ts_type_file(path: &Path, validation: Option<&TsValidationSchema>) -> Result<()> {
+fn postprocess_ts_type_file(
+    root: &Path,
+    relative: &Path,
+    validation: Option<&TsValidationSchema>,
+) -> Result<()> {
+    let path = prepare_generated_file_path(root, relative)?;
     let mut content = std::fs::read_to_string(path).map_err(Error::other)?;
 
     if !content.starts_with(TYPE_FILE_HEADER) {
@@ -2487,7 +2504,7 @@ fn postprocess_ts_type_file(path: &Path, validation: Option<&TsValidationSchema>
         content = add_validation_comments(&content, validation);
     }
 
-    write_generated_file(path, content)
+    write_generated_file(root, relative, content)
 }
 
 fn render_validation_schema(schema: Option<&TsValidationSchema>, request_type: &str) -> String {
@@ -2611,7 +2628,7 @@ fn contract_manifest(
         .collect::<Vec<_>>();
 
     Ok(ContractManifest::from_http_routes(routes)?
-        .with_schemas(contract_schemas()?)
+        .merge_schemas(contract_schemas()?)?
         .with_validation_schemas(validation_schemas)
         .with_realtime_channels(realtime_channels))
 }
@@ -3120,18 +3137,20 @@ pub fn export_all_with_context(
     let route_helpers = planned_route_helpers(routes)?;
     let sdk_actions = planned_sdk_actions(&contract)?;
     let output_files =
-        planned_output_files(&ts_type_files, &app_enums, &route_helpers, &sdk_actions);
+        planned_output_files(&ts_type_files, &app_enums, &route_helpers, &sdk_actions)?;
     clean_manifest_files(dir, &output_files)?;
 
     let mut type_exports = BTreeMap::new();
     for ts_type in ts_types {
-        (ts_type.export_fn)(dir)
-            .map_err(|e| Error::message(format!("ts export `{}`: {e}", ts_type.name)))?;
         let file = ts_type_files
             .get(ts_type.name)
             .expect("planned TypeScript file should exist")
             .clone();
-        postprocess_ts_type_file(&dir.join(&file), validations.get(ts_type.name))?;
+        prepare_generated_file_path(dir, Path::new(&file))
+            .map_err(|error| Error::message(format!("ts export `{}`: {error}", ts_type.name)))?;
+        (ts_type.export_fn)(dir)
+            .map_err(|e| Error::message(format!("ts export `{}`: {e}", ts_type.name)))?;
+        postprocess_ts_type_file(dir, Path::new(&file), validations.get(ts_type.name))?;
         type_exports.insert(ts_type.name, file);
     }
 
@@ -3140,12 +3159,12 @@ pub fn export_all_with_context(
     let mut enum_names = HashSet::new();
     let mut grouped_enum_names = HashSet::new();
     for app_enum in app_enums {
-        let file_path = dir.join(format!("{}.ts", app_enum.name));
+        let file = format!("{}.ts", app_enum.name);
         let rendered = render_app_enum(app_enum.name, &(app_enum.meta_fn)())?;
         if rendered.has_groups {
             grouped_enum_names.insert(app_enum.name);
         }
-        write_generated_file(&file_path, rendered.content)?;
+        write_generated_file(dir, Path::new(&file), rendered.content)?;
         enum_names.insert(app_enum.name);
     }
 
@@ -3166,48 +3185,63 @@ pub fn export_all_with_context(
     names.dedup();
 
     write_generated_file(
-        &dir.join("RouteManifest.ts"),
+        dir,
+        Path::new("RouteManifest.ts"),
         render_route_manifest(routes)?,
     )?;
-    write_generated_file(&dir.join(ENDPOINT_RUNTIME_FILE), render_endpoint_runtime())?;
-    write_generated_file(&dir.join(ERROR_RUNTIME_FILE), render_error_runtime())?;
-    write_generated_file(&dir.join(SDK_RUNTIME_FILE), render_sdk_runtime())?;
     write_generated_file(
-        &dir.join(I18N_MANIFEST_FILE),
+        dir,
+        Path::new(ENDPOINT_RUNTIME_FILE),
+        render_endpoint_runtime(),
+    )?;
+    write_generated_file(dir, Path::new(ERROR_RUNTIME_FILE), render_error_runtime())?;
+    write_generated_file(dir, Path::new(SDK_RUNTIME_FILE), render_sdk_runtime())?;
+    write_generated_file(
+        dir,
+        Path::new(I18N_MANIFEST_FILE),
         render_i18n_manifest(context.i18n.as_ref())?,
     )?;
     write_generated_file(
-        &dir.join(WEBSOCKET_MANIFEST_FILE),
+        dir,
+        Path::new(WEBSOCKET_MANIFEST_FILE),
         render_websocket_manifest(&contract.realtime_channels, &exported_types)?,
     )?;
     write_generated_file(
-        &dir.join(DATATABLE_MANIFEST_FILE),
+        dir,
+        Path::new(DATATABLE_MANIFEST_FILE),
         render_datatable_manifest(&context.datatable_ids)?,
     )?;
     write_generated_file(
-        &dir.join(CONTRACT_MANIFEST_FILE),
+        dir,
+        Path::new(CONTRACT_MANIFEST_FILE),
         serde_json::to_string_pretty(&contract).map_err(Error::other)?,
     )?;
 
     if !route_helpers.is_empty() {
-        std::fs::create_dir_all(dir.join(ROUTE_HELPER_DIR)).map_err(Error::other)?;
+        create_generated_dir_all(dir, Path::new(ROUTE_HELPER_DIR))?;
     }
     for helper in &route_helpers {
         write_generated_file(
-            &dir.join(&helper.file),
+            dir,
+            Path::new(&helper.file),
             render_route_helper(helper, &schema_exports, &exported_types, &validations)?,
         )?;
     }
     if !sdk_actions.is_empty() {
-        std::fs::create_dir_all(dir.join(SDK_ACTION_DIR)).map_err(Error::other)?;
+        create_generated_dir_all(dir, Path::new(SDK_ACTION_DIR))?;
     }
     for action in &sdk_actions {
         write_generated_file(
-            &dir.join(&action.file),
+            dir,
+            Path::new(&action.file),
             render_sdk_action(action, &schema_exports, &exported_types)?,
         )?;
     }
-    write_generated_file(&dir.join(SDK_CLIENT_FILE), render_sdk_client(&sdk_actions)?)?;
+    write_generated_file(
+        dir,
+        Path::new(SDK_CLIENT_FILE),
+        render_sdk_client(&sdk_actions)?,
+    )?;
 
     let mut barrel = format!("{TYPE_FILE_HEADER}\n");
     for name in &names {
@@ -3253,7 +3287,7 @@ pub fn export_all_with_context(
         let module = ts_module_specifier(&action.file)?;
         barrel.push_str(&format!("export * from \"{module}\";\n"));
     }
-    write_generated_file(&dir.join("index.ts"), barrel)?;
+    write_generated_file(dir, Path::new("index.ts"), barrel)?;
     write_export_manifest(dir, &output_files)?;
 
     println!("Exported {} type(s) to {}", names.len(), dir.display());
@@ -3263,16 +3297,25 @@ pub fn export_all_with_context(
 
 fn planned_ts_type_files(ts_types: &[&TsType]) -> Result<BTreeMap<&'static str, String>> {
     let mut files = BTreeMap::new();
+    let mut outputs = BTreeMap::new();
     for ts_type in ts_types {
         let file = ts_type_output_file(ts_type)?;
-        if let Some(existing) = files.insert(ts_type.name, file.clone()) {
-            if existing != file {
-                return Err(Error::message(format!(
-                    "TypeScript export `{}` registered multiple output paths: `{existing}` and `{file}`",
-                    ts_type.name
-                )));
+        if let Some(existing) = files.get(ts_type.name) {
+            if existing == &file {
+                continue;
             }
+            return Err(Error::message(format!(
+                "TypeScript export `{}` registered multiple output paths: `{existing}` and `{file}`",
+                ts_type.name
+            )));
         }
+
+        register_planned_output(
+            &mut outputs,
+            &file,
+            format!("registered TypeScript type `{}`", ts_type.name),
+        )?;
+        files.insert(ts_type.name, file);
     }
     Ok(files)
 }
@@ -3282,31 +3325,90 @@ fn planned_output_files(
     app_enums: &[&TsAppEnum],
     route_helpers: &[PlannedRouteHelper<'_>],
     sdk_actions: &[PlannedSdkAction<'_>],
-) -> BTreeSet<String> {
-    let mut files = BTreeSet::new();
-    for file in ts_type_files.values() {
-        files.insert(file.clone());
+) -> Result<BTreeSet<String>> {
+    let mut outputs = BTreeMap::new();
+    for (name, file) in ts_type_files {
+        register_planned_output(
+            &mut outputs,
+            file,
+            format!("registered TypeScript type `{name}`"),
+        )?;
     }
     for app_enum in app_enums {
-        files.insert(format!("{}.ts", app_enum.name));
+        register_planned_output(
+            &mut outputs,
+            &format!("{}.ts", app_enum.name),
+            format!("AppEnum `{}` metadata", app_enum.name),
+        )?;
     }
-    files.insert(CONTRACT_MANIFEST_FILE.to_string());
-    files.insert("RouteManifest.ts".to_string());
-    files.insert(ENDPOINT_RUNTIME_FILE.to_string());
-    files.insert(ERROR_RUNTIME_FILE.to_string());
-    files.insert(SDK_RUNTIME_FILE.to_string());
-    files.insert(SDK_CLIENT_FILE.to_string());
-    files.insert(I18N_MANIFEST_FILE.to_string());
-    files.insert(WEBSOCKET_MANIFEST_FILE.to_string());
-    files.insert(DATATABLE_MANIFEST_FILE.to_string());
+    for (file, owner) in [
+        (CONTRACT_MANIFEST_FILE, "framework contract manifest"),
+        ("RouteManifest.ts", "framework route manifest"),
+        (ENDPOINT_RUNTIME_FILE, "framework endpoint runtime"),
+        (ERROR_RUNTIME_FILE, "framework error runtime"),
+        (SDK_RUNTIME_FILE, "framework SDK runtime"),
+        (SDK_CLIENT_FILE, "framework SDK client"),
+        (I18N_MANIFEST_FILE, "framework i18n manifest"),
+        (WEBSOCKET_MANIFEST_FILE, "framework WebSocket manifest"),
+        (DATATABLE_MANIFEST_FILE, "framework datatable manifest"),
+    ] {
+        register_planned_output(&mut outputs, file, owner)?;
+    }
     for helper in route_helpers {
-        files.insert(helper.file.clone());
+        register_planned_output(
+            &mut outputs,
+            &helper.file,
+            format!("route endpoint `{}`", helper.route.id),
+        )?;
     }
     for action in sdk_actions {
-        files.insert(action.file.clone());
+        register_planned_output(
+            &mut outputs,
+            &action.file,
+            format!("SDK action `{}`", action.action.id),
+        )?;
     }
-    files.insert("index.ts".to_string());
-    files
+    register_planned_output(&mut outputs, "index.ts", "framework barrel")?;
+
+    Ok(outputs.into_values().map(|output| output.file).collect())
+}
+
+#[derive(Debug)]
+struct PlannedOutput {
+    file: String,
+    owner: String,
+}
+
+fn register_planned_output(
+    outputs: &mut BTreeMap<String, PlannedOutput>,
+    file: &str,
+    owner: impl Into<String>,
+) -> Result<()> {
+    let owner = owner.into();
+    let portable_key = file.to_ascii_lowercase();
+    if let Some(existing) = outputs.get(&portable_key) {
+        let path_description = if existing.file == file {
+            format!("would both write `{file}`")
+        } else {
+            format!(
+                "use paths `{}` and `{file}` that differ only by ASCII case",
+                existing.file
+            )
+        };
+        return Err(Error::message(format!(
+            "TypeScript generated output collision: {} and {owner} {path_description}; choose a unique `#[ts(export_to = \"...\")]` path or remove the redundant export registration",
+            existing.owner
+        )));
+    }
+
+    outputs.insert(
+        portable_key,
+        PlannedOutput {
+            file: file.to_string(),
+            owner,
+        },
+    );
+    Ok(())
 }
 
 fn ts_type_output_file(ts_type: &TsType) -> Result<String> {
@@ -3366,21 +3468,13 @@ fn write_export_manifest(dir: &Path, output_files: &BTreeSet<String>) -> Result<
     write_manifest(dir, TYPES_EXPORT_MANIFEST, output_files)
 }
 
-fn collect_route_manifest(routes: &[RouteRegistrar]) -> Result<Vec<RouteManifestEntry>> {
-    let mut registrar = HttpRegistrar::new();
-    for route in routes {
-        route(&mut registrar)?;
-    }
-    registrar.collect_route_manifest()
-}
-
 /// CLI registrar for the `types:export` command.
 pub fn builtin_cli_registrar(
-    routes: Vec<RouteRegistrar>,
+    route_manifest: Vec<RouteManifestEntry>,
     websocket_routes: Vec<WebSocketRouteRegistrar>,
 ) -> CommandRegistrar {
     Arc::new(move |registry| {
-        let routes = routes.clone();
+        let route_manifest = route_manifest.clone();
         let websocket_routes = websocket_routes.clone();
         registry.command(
             TYPES_EXPORT_COMMAND,
@@ -3393,7 +3487,7 @@ pub fn builtin_cli_registrar(
                         .help("Output directory (overrides config)"),
                 ),
             move |invocation| {
-                let routes = routes.clone();
+                let route_manifest = route_manifest.clone();
                 let websocket_routes = websocket_routes.clone();
                 async move {
                     let output = if let Some(dir) = invocation.matches().get_one::<String>("output")
@@ -3404,7 +3498,6 @@ pub fn builtin_cli_registrar(
                         PathBuf::from(config.output_dir)
                     };
 
-                    let route_manifest = collect_route_manifest(&routes)?;
                     let ws_registrar = crate::websocket::build_registrar(&websocket_routes)?;
                     let ws_registry =
                         crate::websocket::WebSocketChannelRegistry::from_registrar(ws_registrar);
@@ -3463,21 +3556,36 @@ pub fn builtin_cli_registrar(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
+    use std::path::Path;
 
     use tempfile::tempdir;
 
     use crate::app_enum::{EnumKey, EnumKeyKind, EnumMeta, EnumOption};
+    use crate::contract::{
+        ContractAuth, ContractPayload, ContractRealtimeChannel, ContractRealtimeEvent,
+    };
     use crate::http::{RouteManifestEntry, RouteManifestResponse};
     use crate::openapi::ApiSchema;
     use crate::support::{Collection, GuardId, PermissionId, RouteId};
 
+    use super::contract_manifest;
     use super::export_all;
     use super::export_all_with_routes;
+    use super::planned_output_files;
+    use super::planned_sdk_actions;
+    use super::planned_ts_type_files;
     use super::render_app_enum;
     use super::render_route_manifest;
+    use super::render_websocket_manifest;
+    use super::PlannedRouteHelper;
+    use super::ROUTE_HELPER_DIR;
+    use super::SDK_ACTION_DIR;
+    use super::SDK_RUNTIME_FILE;
     use super::TYPES_EXPORT_MANIFEST;
     use super::TYPE_FILE_HEADER;
+    use super::{TsAppEnum, TsType};
 
     #[derive(Clone, Debug, PartialEq, Eq, crate::AppEnum)]
     enum MinimalExportStatus {
@@ -3560,12 +3668,51 @@ mod tests {
             permissions: vec![PermissionId::new("users.read")],
             summary: Some("Show user".to_string()),
             request: Some("ShowUserRequest"),
+            request_schema_json: Some(serde_json::json!({"type": "object"})),
             responses: vec![RouteManifestResponse {
                 status: 200,
                 schema: "ShowUserResponse",
                 schema_json: serde_json::json!({"type": "object"}),
             }],
         }
+    }
+
+    #[test]
+    fn websocket_payload_presence_helpers_use_generated_runtime_metadata() {
+        let channel = ContractRealtimeChannel {
+            id: "chat".to_string(),
+            presence: false,
+            replay_count: 0,
+            allow_client_events: true,
+            auth: ContractAuth::default(),
+            incoming: vec![
+                ContractRealtimeEvent {
+                    event: "typing".to_string(),
+                    payload: Some(ContractPayload {
+                        schema: "TypingPayload".to_string(),
+                    }),
+                },
+                ContractRealtimeEvent {
+                    event: "ping".to_string(),
+                    payload: None,
+                },
+            ],
+            outgoing: vec![ContractRealtimeEvent {
+                event: "message".to_string(),
+                payload: Some(ContractPayload {
+                    schema: "MessagePayload".to_string(),
+                }),
+            }],
+        };
+
+        let rendered = render_websocket_manifest(&[channel], &BTreeMap::new()).unwrap();
+
+        assert!(rendered.contains("clientPayloadEvents: [\"typing\"]"));
+        assert!(rendered.contains("serverPayloadEvents: [\"message\"]"));
+        assert!(rendered.contains("WebSocketChannelManifest[channel].serverPayloadEvents"));
+        assert!(rendered.contains("WebSocketChannelManifest[channel].clientPayloadEvents"));
+        assert!(!rendered.contains("({} as WebSocketServerPayloadMap)"));
+        assert!(!rendered.contains("({} as WebSocketClientEventPayloadMap)"));
     }
 
     fn login_route_manifest_entry(client_export: bool) -> RouteManifestEntry {
@@ -3579,6 +3726,7 @@ mod tests {
             permissions: Vec::new(),
             summary: Some("Login".to_string()),
             request: Some("MinimalLoginRequest"),
+            request_schema_json: Some(MinimalLoginRequest::schema()),
             responses: vec![RouteManifestResponse {
                 status: 200,
                 schema: "MinimalLoginResponse",
@@ -3592,6 +3740,149 @@ mod tests {
             .as_array()
             .and_then(|schemas| schemas.iter().find(|schema| schema["name"] == name))
             .unwrap_or_else(|| panic!("expected contract schema `{name}` in manifest:\n{manifest}"))
+    }
+
+    #[test]
+    fn type_planning_rejects_multiple_types_for_one_output_path() {
+        let first = TsType {
+            name: "FirstDto",
+            export_fn: |_| Ok(()),
+            output_path_fn: || Some(Path::new("Shared.ts")),
+        };
+        let second = TsType {
+            name: "SecondDto",
+            export_fn: |_| Ok(()),
+            output_path_fn: || Some(Path::new("Shared.ts")),
+        };
+
+        let error = planned_ts_type_files(&[&first, &second])
+            .expect_err("two types must not own the same output path");
+
+        assert!(error
+            .to_string()
+            .contains("registered TypeScript type `FirstDto`"));
+        assert!(error
+            .to_string()
+            .contains("registered TypeScript type `SecondDto`"));
+        assert!(error.to_string().contains("both write `Shared.ts`"));
+    }
+
+    #[test]
+    fn type_planning_rejects_case_only_output_path_collisions() {
+        let first = TsType {
+            name: "UpperDto",
+            export_fn: |_| Ok(()),
+            output_path_fn: || Some(Path::new("Types/Shared.ts")),
+        };
+        let second = TsType {
+            name: "LowerDto",
+            export_fn: |_| Ok(()),
+            output_path_fn: || Some(Path::new("types/shared.ts")),
+        };
+
+        let error = planned_ts_type_files(&[&first, &second])
+            .expect_err("portable output paths must not differ only by case");
+
+        assert!(error.to_string().contains(
+            "paths `Types/Shared.ts` and `types/shared.ts` that differ only by ASCII case"
+        ));
+    }
+
+    #[test]
+    fn type_planning_deduplicates_identical_logical_registration() {
+        let first = TsType {
+            name: "DuplicateDto",
+            export_fn: |_| Ok(()),
+            output_path_fn: || Some(Path::new("DuplicateDto.ts")),
+        };
+        let second = TsType {
+            name: "DuplicateDto",
+            export_fn: |_| Ok(()),
+            output_path_fn: || Some(Path::new("DuplicateDto.ts")),
+        };
+
+        let files = planned_ts_type_files(&[&first, &second])
+            .expect("the same logical TypeScript owner may be registered idempotently");
+
+        assert_eq!(
+            files,
+            BTreeMap::from([("DuplicateDto", "DuplicateDto.ts".to_string())])
+        );
+    }
+
+    #[test]
+    fn output_planning_rejects_registered_type_framework_collision() {
+        let types = BTreeMap::from([("CustomRuntime", SDK_RUNTIME_FILE.to_string())]);
+
+        let error = planned_output_files(&types, &[], &[], &[])
+            .expect_err("registered types must not overwrite framework runtime files");
+
+        assert!(error
+            .to_string()
+            .contains("registered TypeScript type `CustomRuntime`"));
+        assert!(error.to_string().contains("framework SDK runtime"));
+        assert!(error.to_string().contains("both write `FoundrySdk.ts`"));
+    }
+
+    #[test]
+    fn output_planning_rejects_registered_type_app_enum_collision() {
+        let types = BTreeMap::from([("StatusDto", "Status.ts".to_string())]);
+        let status = TsAppEnum {
+            name: "Status",
+            meta_fn: || string_meta(&["active"]),
+        };
+
+        let error = planned_output_files(&types, &[&status], &[], &[])
+            .expect_err("registered types must not overwrite AppEnum metadata");
+
+        assert!(error
+            .to_string()
+            .contains("registered TypeScript type `StatusDto`"));
+        assert!(error.to_string().contains("AppEnum `Status` metadata"));
+        assert!(error.to_string().contains("both write `Status.ts`"));
+    }
+
+    #[test]
+    fn output_planning_rejects_registered_type_route_helper_collision() {
+        let route = route_manifest_entry("admin.users.show", "/api/v1/admin/users/{id}", &["id"]);
+        let helper = PlannedRouteHelper {
+            route: &route,
+            name: "AdminUsersShow".to_string(),
+            file: "routes/AdminUsersShow.ts".to_string(),
+        };
+        let types = BTreeMap::from([("CustomRouteHelper", "routes/AdminUsersShow.ts".to_string())]);
+
+        let error = planned_output_files(&types, &[], &[helper], &[])
+            .expect_err("registered types must not overwrite route helpers");
+
+        assert!(error
+            .to_string()
+            .contains("registered TypeScript type `CustomRouteHelper`"));
+        assert!(error
+            .to_string()
+            .contains("route endpoint `admin.users.show`"));
+        assert!(error
+            .to_string()
+            .contains("both write `routes/AdminUsersShow.ts`"));
+    }
+
+    #[test]
+    fn output_planning_rejects_registered_type_sdk_action_collision() {
+        let route = login_route_manifest_entry(true);
+        let manifest = contract_manifest(&[route], &BTreeMap::new(), Vec::new()).unwrap();
+        let actions = planned_sdk_actions(&manifest).unwrap();
+        let types = BTreeMap::from([("CustomSdkAction", "sdk/UserPortalLogin.ts".to_string())]);
+
+        let error = planned_output_files(&types, &[], &[], &actions)
+            .expect_err("registered types must not overwrite SDK actions");
+
+        assert!(error
+            .to_string()
+            .contains("registered TypeScript type `CustomSdkAction`"));
+        assert!(error.to_string().contains("SDK action `user.portal.login`"));
+        assert!(error
+            .to_string()
+            .contains("both write `sdk/UserPortalLogin.ts`"));
     }
 
     #[test]
@@ -4006,6 +4297,45 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_refuses_symlinked_route_helper_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        symlink(outside.path(), dir.path().join(ROUTE_HELPER_DIR)).unwrap();
+
+        let error = export_all_with_routes(
+            dir.path(),
+            &[route_manifest_entry(
+                "admin.users.show",
+                "/api/v1/admin/users/{id}",
+                &["id"],
+            )],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_refuses_symlinked_sdk_action_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        symlink(outside.path(), dir.path().join(SDK_ACTION_DIR)).unwrap();
+
+        let error =
+            export_all_with_routes(dir.path(), &[login_route_manifest_entry(true)]).unwrap_err();
+
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
     #[test]

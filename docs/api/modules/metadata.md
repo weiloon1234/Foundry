@@ -18,4 +18,3 @@ trait HasMetadata
   fn has_meta<'life0, 'life1, 'life2, 'async_trait>(
   fn all_meta<'life0, 'life1, 'async_trait>(
 ```
-

@@ -7,6 +7,11 @@ use crate::support::DateTime;
 
 use super::stored_file::{StorageObject, StoredFile};
 
+/// Application-level access intent for a storage disk.
+///
+/// This does not require adapters to emit provider object ACLs. For example,
+/// S3 public access may be supplied by bucket policy or a CDN because modern AWS
+/// buckets and some S3-compatible providers disable object ACLs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageVisibility {

@@ -64,4 +64,3 @@ struct CookieJar
   fn add<C>(self, cookie: C) -> CookieJar
   fn iter(&self) -> impl Iterator<Item = &Cookie<'static>>
 ```
-

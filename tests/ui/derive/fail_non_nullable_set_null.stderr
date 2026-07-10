@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/derive/fail_non_nullable_set_null.rs:11:37
+   |
+11 |     let _ = User::update().set_null(User::EMAIL);
+   |                            -------- ^^^^^^^^^^^ expected `Column<User, Option<_>>`, found `Column<User, String>`
+   |                            |
+   |                            arguments to this method are incorrect
+   |
+   = note: expected struct `foundry::Column<User, Option<_>>`
+              found struct `foundry::Column<User, std::string::String>`
+note: method defined here
+  --> src/database/query.rs
+   |
+   |     pub fn set_null<T>(mut self, column: Column<M, Option<T>>) -> Self {
+   |            ^^^^^^^^

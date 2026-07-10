@@ -9,7 +9,7 @@ use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::uri::Authority;
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
@@ -17,7 +17,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
 
-use crate::auth::{validate_actor_guard, Actor, AuthError, AuthErrorCode};
+use crate::auth::{
+    token::{actor_has_mfa_pending, mfa_pending_auth_error},
+    validate_actor_guard, Actor, AuthError, AuthErrorCode,
+};
 use crate::config::WebSocketConfig;
 use crate::foundation::{AppContext, Error, Result};
 use crate::logging::{
@@ -48,8 +51,9 @@ impl WebSocketKernel {
 
     pub async fn bind(self) -> Result<BoundWebSocketServer> {
         let websocket = self.app.config().websocket()?;
-        let addr = format!("{}:{}", websocket.host, websocket.port);
-        let listener = TcpListener::bind(addr).await.map_err(Error::other)?;
+        let listener = TcpListener::bind((websocket.host.as_str(), websocket.port))
+            .await
+            .map_err(Error::other)?;
         let local_addr = listener.local_addr().map_err(Error::other)?;
         let (router, pubsub_task) = self.build_router().await?;
 
@@ -340,6 +344,196 @@ impl WebSocketServerState {
         ConnectionIdentity::default()
     }
 
+    fn auth_revalidation_interval(&self) -> Duration {
+        Duration::from_secs(self.ws_config.auth_revalidation_interval_seconds.max(1))
+    }
+
+    async fn authenticate_identity(
+        &self,
+        identity: &ConnectionIdentity,
+        guard_id: &GuardId,
+        extend_session: bool,
+    ) -> std::result::Result<(Actor, ConnectionCredentialKind), AuthError> {
+        if let Some(error) = &identity.auth_error {
+            return Err(error.clone());
+        }
+
+        let actor_and_kind = if let Some(session_id) = identity.session_id.as_deref() {
+            let sessions = self
+                .app
+                .sessions()
+                .map_err(|error| AuthError::internal(error.to_string()))?;
+            let actor = if extend_session {
+                sessions.validate(session_id).await
+            } else {
+                sessions.validate_without_touch(session_id).await
+            }
+            .map_err(|error| AuthError::internal(error.to_string()))?
+            .ok_or_else(|| AuthError::unauthorized_code(AuthErrorCode::InvalidSession))?;
+            let actor = validate_actor_guard(actor, guard_id, AuthErrorCode::InvalidSession)?;
+            (actor, ConnectionCredentialKind::Session)
+        } else if let Some(token) = identity.bearer_token.as_deref() {
+            let auth = self
+                .app
+                .auth()
+                .map_err(|error| AuthError::internal(error.to_string()))?;
+            let actor = auth.authenticate_token(token, Some(guard_id)).await?;
+            (actor, ConnectionCredentialKind::Bearer)
+        } else {
+            return Err(AuthError::unauthorized_code(
+                AuthErrorCode::MissingAuthCredentials,
+            ));
+        };
+
+        if actor_has_mfa_pending(&actor_and_kind.0) {
+            return Err(mfa_pending_auth_error());
+        }
+        Ok(actor_and_kind)
+    }
+
+    fn ensure_same_cached_identity(
+        cached: &CachedActor,
+        actor: &Actor,
+        credential_kind: ConnectionCredentialKind,
+    ) -> std::result::Result<(), AuthError> {
+        if cached.credential_kind == credential_kind && cached.actor.id == actor.id {
+            return Ok(());
+        }
+
+        let code = match cached.credential_kind {
+            ConnectionCredentialKind::Bearer => AuthErrorCode::InvalidBearerToken,
+            ConnectionCredentialKind::Session => AuthErrorCode::InvalidSession,
+        };
+        Err(AuthError::unauthorized_code(code))
+    }
+
+    async fn revalidate_cached_actor(
+        &self,
+        connection_id: u64,
+        guard_id: &GuardId,
+        cached: &CachedActor,
+    ) -> std::result::Result<Actor, AuthError> {
+        let identity = self.hub.identity(connection_id).await?;
+        let (actor, credential_kind) = self
+            .authenticate_identity(&identity, guard_id, false)
+            .await?;
+        Self::ensure_same_cached_identity(cached, &actor, credential_kind)?;
+        self.hub
+            .update_cached_actor(
+                connection_id,
+                guard_id,
+                &cached.actor.id,
+                credential_kind,
+                actor.clone(),
+            )
+            .await?;
+        Ok(actor)
+    }
+
+    async fn revalidate_connection_auth(
+        &self,
+        connection_id: u64,
+    ) -> std::result::Result<(), AuthError> {
+        let snapshot = self.hub.auth_snapshot(connection_id).await?;
+        if snapshot.actors.is_empty() {
+            return Ok(());
+        }
+
+        let auth = self
+            .app
+            .auth()
+            .map_err(|error| AuthError::internal(error.to_string()))?;
+        let authorizer = self
+            .app
+            .authorizer()
+            .map_err(|error| AuthError::internal(error.to_string()))?;
+        let interval = self.auth_revalidation_interval();
+
+        for (guard_id, cached) in snapshot.actors {
+            if !cached.is_due(interval) {
+                continue;
+            }
+
+            let (actor, credential_kind) = self
+                .authenticate_identity(&snapshot.identity, &guard_id, false)
+                .await?;
+            Self::ensure_same_cached_identity(&cached, &actor, credential_kind)?;
+
+            for subscription in &snapshot.subscriptions {
+                let Some(channel) = self.channels.get(&subscription.channel) else {
+                    continue;
+                };
+                if !channel.options.requires_auth() {
+                    continue;
+                }
+                let channel_guard = channel
+                    .options
+                    .guard_id()
+                    .cloned()
+                    .unwrap_or_else(|| auth.default_guard().clone());
+                if channel_guard != guard_id {
+                    continue;
+                }
+                authorizer
+                    .authorize_permissions(&actor, &channel.options.permissions_set())
+                    .await?;
+            }
+
+            self.hub
+                .update_cached_actor(
+                    connection_id,
+                    &guard_id,
+                    &cached.actor.id,
+                    credential_kind,
+                    actor,
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn disconnect_for_auth_error(&self, connection_id: u64, error: &AuthError) {
+        self.send_system_error(connection_id, error.payload()).await;
+        if let Some(closed) = self.hub.disconnect(connection_id).await {
+            self.cleanup_closed_connections(vec![closed]).await;
+        }
+    }
+
+    async fn send_system_error(&self, connection_id: u64, payload: serde_json::Value) {
+        let _ = self
+            .send(
+                connection_id,
+                WriterCommand::Json(ServerMessage {
+                    channel: SYSTEM_CHANNEL,
+                    event: ERROR_EVENT,
+                    room: None,
+                    payload,
+                }),
+            )
+            .await;
+    }
+
+    async fn revalidate_due_subscribers(&self, channel: &ChannelId) {
+        let Some(channel_config) = self.channels.get(channel) else {
+            return;
+        };
+        if !channel_config.options.requires_auth() {
+            return;
+        }
+
+        let due = self
+            .hub
+            .connections_due_for_channel(channel, self.auth_revalidation_interval())
+            .await;
+        for connection_id in due {
+            if let Err(error) = self.revalidate_connection_auth(connection_id).await {
+                self.record_auth_outcome(auth_outcome_from_error(&error));
+                self.disconnect_for_auth_error(connection_id, &error).await;
+            }
+        }
+    }
+
     async fn authorize_channel(
         &self,
         connection_id: u64,
@@ -369,7 +563,28 @@ impl WebSocketServerState {
             .cloned()
             .unwrap_or_else(|| auth.default_guard().clone());
 
-        if let Some(actor) = self.hub.cached_actor(connection_id, &guard_id).await? {
+        if let Some(cached) = self.hub.cached_actor(connection_id, &guard_id).await? {
+            if actor_has_mfa_pending(&cached.actor) {
+                let error = mfa_pending_auth_error();
+                self.record_auth_outcome(auth_outcome_from_error(&error));
+                self.disconnect_for_auth_error(connection_id, &error).await;
+                return Err(error);
+            }
+            let actor = if cached.is_due(self.auth_revalidation_interval()) {
+                match self
+                    .revalidate_cached_actor(connection_id, &guard_id, &cached)
+                    .await
+                {
+                    Ok(actor) => actor,
+                    Err(error) => {
+                        self.record_auth_outcome(auth_outcome_from_error(&error));
+                        self.disconnect_for_auth_error(connection_id, &error).await;
+                        return Err(error);
+                    }
+                }
+            } else {
+                cached.actor
+            };
             let permissions = channel.options.permissions_set();
             if let Err(error) = authorizer.authorize_permissions(&actor, &permissions).await {
                 self.record_auth_outcome(auth_outcome_from_error(&error));
@@ -380,52 +595,14 @@ impl WebSocketServerState {
         }
 
         let identity = self.hub.identity(connection_id).await?;
-        if let Some(error) = identity.auth_error {
-            self.record_auth_outcome(auth_outcome_from_error(&error));
-            return Err(error);
-        }
-
-        // Resolve actor from either bearer token or session cookie
-        let actor = if let Some(session_id) = identity.session_id {
-            let sessions = self
-                .app
-                .sessions()
-                .map_err(|e| AuthError::internal(e.to_string()))
-                .inspect_err(|e| self.record_auth_outcome(auth_outcome_from_error(e)))?;
-            match sessions.validate(&session_id).await {
-                Ok(Some(actor)) => {
-                    match validate_actor_guard(actor, &guard_id, AuthErrorCode::InvalidSession) {
-                        Ok(actor) => actor,
-                        Err(error) => {
-                            self.record_auth_outcome(auth_outcome_from_error(&error));
-                            return Err(error);
-                        }
-                    }
-                }
-                Ok(None) => {
-                    let error = AuthError::unauthorized_code(AuthErrorCode::InvalidSession);
-                    self.record_auth_outcome(auth_outcome_from_error(&error));
-                    return Err(error);
-                }
-                Err(e) => {
-                    let error = AuthError::internal(e.to_string());
-                    self.record_auth_outcome(auth_outcome_from_error(&error));
-                    return Err(error);
-                }
-            }
-        } else if let Some(token) = identity.bearer_token {
-            match auth.authenticate_token(&token, Some(&guard_id)).await {
-                Ok(actor) => actor,
+        let (actor, credential_kind) =
+            match self.authenticate_identity(&identity, &guard_id, true).await {
+                Ok(authenticated) => authenticated,
                 Err(error) => {
                     self.record_auth_outcome(auth_outcome_from_error(&error));
                     return Err(error);
                 }
-            }
-        } else {
-            let error = AuthError::unauthorized_code(AuthErrorCode::MissingAuthCredentials);
-            self.record_auth_outcome(auth_outcome_from_error(&error));
-            return Err(error);
-        };
+            };
         let permissions = channel.options.permissions_set();
         if let Err(error) = authorizer.authorize_permissions(&actor, &permissions).await {
             self.record_auth_outcome(auth_outcome_from_error(&error));
@@ -435,6 +612,7 @@ impl WebSocketServerState {
             .cache_actor(
                 connection_id,
                 actor.clone(),
+                credential_kind,
                 self.ws_config.max_connections_per_user,
             )
             .await?;
@@ -468,11 +646,13 @@ impl WebSocketServerState {
     }
 
     async fn broadcast(&self, message: &ServerMessage) {
+        self.revalidate_due_subscribers(&message.channel).await;
         let closed = self.hub.broadcast(message).await;
         self.cleanup_closed_connections(closed).await;
     }
 
     async fn broadcast_except(&self, exclude_id: u64, message: &ServerMessage) {
+        self.revalidate_due_subscribers(&message.channel).await;
         let closed = self.hub.broadcast_except(exclude_id, message).await;
         self.cleanup_closed_connections(closed).await;
     }
@@ -508,7 +688,7 @@ impl WebSocketServerState {
             }
 
             for entry in connection.presence_entries {
-                let _ = self.backend.srem(&entry.key, &entry.member_value).await;
+                self.remove_presence_entry(&entry).await;
                 let Some(channel) = self.channels.get(&entry.channel) else {
                     continue;
                 };
@@ -526,6 +706,17 @@ impl WebSocketServerState {
                 }
             }
         }
+    }
+
+    async fn remove_presence_entry(&self, entry: &PresenceEntry) {
+        let _ = self
+            .backend
+            .srem(&entry.aggregate_key, &entry.member_value)
+            .await;
+        let _ = self
+            .backend
+            .srem(&entry.scope_key, &entry.member_value)
+            .await;
     }
 }
 
@@ -555,14 +746,20 @@ async fn websocket_handler(
         .app()
         .map(|config| config.environment.is_production_like())
         .unwrap_or(false);
-    if !origin_allowed(&headers, &state.ws_config.allowed_origins, production_like) {
-        return (
-            StatusCode::FORBIDDEN,
-            axum::Json(serde_json::json!({
-                "message": "websocket origin is not allowed",
-            })),
-        )
-            .into_response();
+    match origin_allowed(
+        &state.app,
+        &headers,
+        &state.ws_config.allowed_origins,
+        production_like,
+        peer_addr,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            return websocket_rejection(StatusCode::FORBIDDEN, "websocket origin is not allowed")
+        }
+        Err(error) => {
+            return websocket_rejection(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        }
     }
 
     // Support short-lived tokens via query param for browser WebSocket
@@ -605,6 +802,18 @@ async fn websocket_handler(
             return websocket_rejection(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
         }
     }
+    let admission_ip = identity
+        .client_ip
+        .clone()
+        .or_else(|| (!peer_addr.ip().is_unspecified()).then(|| peer_addr.ip().to_string()));
+    let connection_permit = match state.hub.reserve_connection(
+        admission_ip,
+        state.ws_config.max_connections_global,
+        state.ws_config.max_connections_per_ip,
+    ) {
+        Ok(permit) => permit,
+        Err(error) => return websocket_rejection(StatusCode::TOO_MANY_REQUESTS, error.to_string()),
+    };
 
     let mut upgrade = ws;
     if state.ws_config.max_message_size_bytes > 0 {
@@ -617,7 +826,7 @@ async fn websocket_handler(
         upgrade = upgrade.max_write_buffer_size(state.ws_config.max_write_buffer_size_bytes);
     }
 
-    upgrade.on_upgrade(move |socket| handle_socket(socket, state, identity))
+    upgrade.on_upgrade(move |socket| handle_socket(socket, state, identity, connection_permit))
 }
 
 fn websocket_rejection(status: StatusCode, message: impl Into<String>) -> Response {
@@ -706,34 +915,67 @@ fn bearer_token_from_query(
     Ok(token)
 }
 
-fn origin_allowed(headers: &HeaderMap, allowed_origins: &[String], production_like: bool) -> bool {
+fn origin_allowed(
+    app: &AppContext,
+    headers: &HeaderMap,
+    allowed_origins: &[String],
+    production_like: bool,
+    peer_addr: SocketAddr,
+) -> Result<bool> {
     if allowed_origins.iter().any(|origin| origin == "*") {
-        return true;
+        return Ok(true);
     }
 
     let Some(origin) = headers
         .get(axum::http::header::ORIGIN)
         .and_then(|value| value.to_str().ok())
     else {
-        return allowed_origins.is_empty();
+        return Ok(allowed_origins.is_empty());
     };
 
     if allowed_origins.is_empty() {
-        return !production_like || origin_matches_request_host(headers, origin);
+        return Ok(
+            !production_like || origin_matches_request_endpoint(app, headers, origin, peer_addr)?
+        );
     }
 
-    allowed_origins.iter().any(|allowed| allowed == origin)
+    Ok(allowed_origins.iter().any(|allowed| allowed == origin))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OriginScheme {
+    Http,
+    Https,
+}
+
+impl OriginScheme {
+    fn parse(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("http") {
+            Some(Self::Http)
+        } else if value.eq_ignore_ascii_case("https") {
+            Some(Self::Https)
+        } else {
+            None
+        }
+    }
+
+    fn default_port(self) -> u16 {
+        match self {
+            Self::Http => 80,
+            Self::Https => 443,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OriginAuthority {
     host: String,
-    port: Option<u16>,
+    port: u16,
 }
 
 impl OriginAuthority {
-    fn parse(value: &str) -> Option<Self> {
-        let raw = value.split(',').next()?.trim();
+    fn parse(value: &str, scheme: OriginScheme) -> Option<Self> {
+        let raw = value.trim();
         if raw.is_empty() {
             return None;
         }
@@ -749,53 +991,110 @@ impl OriginAuthority {
 
         Some(Self {
             host,
-            port: authority.port_u16(),
+            port: authority.port_u16().unwrap_or(scheme.default_port()),
         })
     }
-
-    fn matches(&self, other: &Self) -> bool {
-        self.host == other.host
-            && (self.port == other.port || self.port.is_none() || other.port.is_none())
-    }
 }
 
-fn origin_matches_request_host(headers: &HeaderMap, origin: &str) -> bool {
-    let Some(origin) = origin_authority(origin) else {
-        return false;
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OriginEndpoint {
+    scheme: OriginScheme,
+    authority: OriginAuthority,
+}
+
+fn origin_matches_request_endpoint(
+    app: &AppContext,
+    headers: &HeaderMap,
+    origin: &str,
+    peer_addr: SocketAddr,
+) -> Result<bool> {
+    let Some(origin) = origin_endpoint(origin) else {
+        return Ok(false);
     };
 
-    request_authorities(headers)
-        .into_iter()
-        .any(|authority| origin.matches(&authority))
+    Ok(request_origin_endpoint(app, headers, peer_addr)? == Some(origin))
 }
 
-fn origin_authority(origin: &str) -> Option<OriginAuthority> {
-    let uri = origin.parse::<Uri>().ok()?;
-    if !matches!(uri.scheme_str(), Some("http") | Some("https")) {
+fn origin_endpoint(origin: &str) -> Option<OriginEndpoint> {
+    let url = url::Url::parse(origin).ok()?;
+    let scheme = OriginScheme::parse(url.scheme())?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let host = url
+        .host_str()?
+        .trim_matches(|ch| ch == '[' || ch == ']')
+        .to_ascii_lowercase();
+    if host.is_empty() {
         return None;
     }
 
-    OriginAuthority::parse(uri.authority()?.as_str())
+    Some(OriginEndpoint {
+        scheme,
+        authority: OriginAuthority {
+            host,
+            port: url.port().unwrap_or(scheme.default_port()),
+        },
+    })
 }
 
-fn request_authorities(headers: &HeaderMap) -> Vec<OriginAuthority> {
-    let mut authorities = Vec::new();
+fn request_origin_endpoint(
+    app: &AppContext,
+    headers: &HeaderMap,
+    peer_addr: SocketAddr,
+) -> Result<Option<OriginEndpoint>> {
+    let http = app.config().http()?;
+    let trusted_proxy = crate::http::middleware::is_trusted_proxy_peer_from_config(
+        peer_addr.ip(),
+        &http.trusted_proxy,
+    )?;
 
-    for name in ["x-forwarded-host", axum::http::header::HOST.as_str()] {
-        let Some(authority) = headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .and_then(OriginAuthority::parse)
-        else {
-            continue;
-        };
-
-        if !authorities.contains(&authority) {
-            authorities.push(authority);
+    let scheme = if trusted_proxy {
+        match headers.get("x-forwarded-proto") {
+            Some(value) => value
+                .to_str()
+                .ok()
+                .and_then(|value| value.split(',').next())
+                .map(str::trim)
+                .and_then(OriginScheme::parse),
+            None => Some(OriginScheme::Http),
         }
-    }
+    } else {
+        Some(OriginScheme::Http)
+    };
+    let Some(scheme) = scheme else {
+        return Ok(None);
+    };
 
-    authorities
+    let authority = if trusted_proxy {
+        if let Some(value) = headers.get("x-forwarded-host") {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.split(',').next())
+                .and_then(|value| OriginAuthority::parse(value, scheme))
+        } else {
+            headers
+                .get(axum::http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| OriginAuthority::parse(value, scheme))
+        }
+    } else {
+        headers
+            .get(axum::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| OriginAuthority::parse(value, scheme))
+    };
+    let Some(authority) = authority else {
+        return Ok(None);
+    };
+
+    Ok(Some(OriginEndpoint { scheme, authority }))
 }
 
 fn extract_client_ip(
@@ -820,8 +1119,12 @@ async fn handle_socket(
     socket: WebSocket,
     state: WebSocketServerState,
     identity: ConnectionIdentity,
+    connection_permit: ConnectionPermit,
 ) {
-    let (connection_id, mut outbound, last_pong_at) = state.hub.register(identity).await;
+    let (connection_id, mut outbound, last_pong_at) = state
+        .hub
+        .register_reserved(identity, connection_permit)
+        .await;
     let (mut sender, mut receiver) = socket.split();
 
     // Writer task: serializes WriterCommands into WebSocket frames.
@@ -858,26 +1161,44 @@ async fn handle_socket(
     // Heartbeat task: sends pings and closes the connection on timeout.
     let heartbeat_state = state.clone();
     let heartbeat_pong = last_pong_at.clone();
-    let heartbeat_interval = Duration::from_secs(state.ws_config.heartbeat_interval_seconds.max(1));
+    let heartbeat_period = Duration::from_secs(state.ws_config.heartbeat_interval_seconds.max(1));
     let heartbeat_timeout = Duration::from_secs(state.ws_config.heartbeat_timeout_seconds.max(1));
+    let auth_revalidation_period = state.auth_revalidation_interval();
     let heartbeat = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(heartbeat_interval);
-        interval.tick().await; // skip first immediate tick
+        let mut heartbeat_interval = tokio::time::interval(heartbeat_period);
+        let mut auth_revalidation_interval = tokio::time::interval(auth_revalidation_period);
+        heartbeat_interval.tick().await; // skip first immediate tick
+        auth_revalidation_interval.tick().await; // skip first immediate tick
         loop {
-            interval.tick().await;
-            if heartbeat_state
-                .send(connection_id, WriterCommand::Ping)
-                .await
-                .is_err()
-            {
-                break;
-            }
-            let elapsed = heartbeat_pong.lock().await.elapsed();
-            if elapsed > heartbeat_interval + heartbeat_timeout {
-                let _ = heartbeat_state
-                    .send(connection_id, WriterCommand::Close)
-                    .await;
-                break;
+            tokio::select! {
+                _ = heartbeat_interval.tick() => {
+                    if heartbeat_state
+                        .send(connection_id, WriterCommand::Ping)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let elapsed = heartbeat_pong.lock().await.elapsed();
+                    if elapsed > heartbeat_period + heartbeat_timeout {
+                        let _ = heartbeat_state
+                            .send(connection_id, WriterCommand::Close)
+                            .await;
+                        break;
+                    }
+                }
+                _ = auth_revalidation_interval.tick() => {
+                    if let Err(error) = heartbeat_state
+                        .revalidate_connection_auth(connection_id)
+                        .await
+                    {
+                        heartbeat_state.record_auth_outcome(auth_outcome_from_error(&error));
+                        heartbeat_state
+                            .disconnect_for_auth_error(connection_id, &error)
+                            .await;
+                        break;
+                    }
+                }
             }
         }
     });
@@ -893,16 +1214,8 @@ async fn handle_socket(
                 if let Err(error) =
                     process_client_message(&state, connection_id, text.to_string()).await
                 {
-                    let _ = state
-                        .send(
-                            connection_id,
-                            WriterCommand::Json(ServerMessage {
-                                channel: SYSTEM_CHANNEL,
-                                event: ERROR_EVENT,
-                                room: None,
-                                payload: error.payload(),
-                            }),
-                        )
+                    state
+                        .send_system_error(connection_id, error.payload())
                         .await;
                 }
             }
@@ -967,17 +1280,11 @@ async fn process_client_message(
         .await
     {
         state
-            .send(
+            .send_system_error(
                 connection_id,
-                WriterCommand::Json(ServerMessage {
-                    channel: SYSTEM_CHANNEL,
-                    event: ERROR_EVENT,
-                    room: None,
-                    payload: serde_json::json!({"message": "rate limit exceeded"}),
-                }),
+                serde_json::json!({"message": "rate limit exceeded"}),
             )
-            .await
-            .ok();
+            .await;
         return Ok(());
     }
 
@@ -1000,17 +1307,8 @@ async fn process_client_message(
                 Ok(actor) => actor,
                 Err(error) => {
                     state
-                        .send(
-                            connection_id,
-                            WriterCommand::Json(ServerMessage {
-                                channel: SYSTEM_CHANNEL,
-                                event: ERROR_EVENT,
-                                room: None,
-                                payload: error.payload(),
-                            }),
-                        )
-                        .await
-                        .ok();
+                        .send_system_error(connection_id, error.payload())
+                        .await;
                     return Ok(());
                 }
             };
@@ -1028,17 +1326,8 @@ async fn process_client_message(
                     authorize(ctx, message.channel.clone(), message.room.clone()).await
                 {
                     state
-                        .send(
-                            connection_id,
-                            WriterCommand::Json(ServerMessage {
-                                channel: SYSTEM_CHANNEL,
-                                event: ERROR_EVENT,
-                                room: None,
-                                payload: error.payload(),
-                            }),
-                        )
-                        .await
-                        .ok();
+                        .send_system_error(connection_id, error.payload())
+                        .await;
                     return Ok(());
                 }
             }
@@ -1060,15 +1349,24 @@ async fn process_client_message(
                     .map(|a| a.id.clone())
                     .unwrap_or_else(|| format!("anon:{connection_id}"));
                 let now = chrono::Utc::now().timestamp();
-                let key = presence_key(&message.channel);
-                let member_value = presence_member_value(&actor_id, &message.channel, now);
-                let _ = state.backend.sadd(&key, &member_value).await;
+                let aggregate_key = presence_key(&message.channel);
+                let scope_key =
+                    crate::websocket::presence_scope_key(&message.channel, message.room.as_deref());
+                let member_value = presence_member_value(
+                    &actor_id,
+                    &message.channel,
+                    message.room.as_deref(),
+                    now,
+                );
+                let _ = state.backend.sadd(&aggregate_key, &member_value).await;
+                let _ = state.backend.sadd(&scope_key, &member_value).await;
                 state
                     .hub
                     .add_presence_entry(
                         connection_id,
                         PresenceEntry {
-                            key,
+                            aggregate_key,
+                            scope_key,
                             member_value,
                             channel: message.channel.clone(),
                             room: message.room.clone(),
@@ -1169,7 +1467,7 @@ async fn process_client_message(
                     )
                     .await;
                 for entry in &entries {
-                    let _ = state.backend.srem(&entry.key, &entry.member_value).await;
+                    state.remove_presence_entry(entry).await;
                 }
 
                 for entry in entries {
@@ -1216,17 +1514,8 @@ async fn process_client_message(
                 Ok(actor) => actor,
                 Err(error) => {
                     state
-                        .send(
-                            connection_id,
-                            WriterCommand::Json(ServerMessage {
-                                channel: SYSTEM_CHANNEL,
-                                event: ERROR_EVENT,
-                                room: None,
-                                payload: error.payload(),
-                            }),
-                        )
-                        .await
-                        .ok();
+                        .send_system_error(connection_id, error.payload())
+                        .await;
                     return Ok(());
                 }
             };
@@ -1248,7 +1537,7 @@ async fn process_client_message(
             if let Some(ack_id) = message.ack_id {
                 let (status, error) = match &result {
                     Ok(()) => ("ok", None),
-                    Err(e) => ("error", Some(e.to_string())),
+                    Err(error) => ("error", Some(error.public_message())),
                 };
                 let _ = state
                     .send(
@@ -1293,17 +1582,8 @@ async fn process_client_message(
 
             if let Err(error) = state.authorize_channel(connection_id, channel).await {
                 state
-                    .send(
-                        connection_id,
-                        WriterCommand::Json(ServerMessage {
-                            channel: SYSTEM_CHANNEL,
-                            event: ERROR_EVENT,
-                            room: None,
-                            payload: error.payload(),
-                        }),
-                    )
-                    .await
-                    .ok();
+                    .send_system_error(connection_id, error.payload())
+                    .await;
                 return Ok(());
             }
 
@@ -1384,10 +1664,97 @@ async fn run_channel_handler(
     }
 }
 
+#[derive(Clone, Default)]
+struct ConnectionLimiter {
+    state: Arc<StdMutex<ConnectionLimitState>>,
+}
+
+#[derive(Default)]
+struct ConnectionLimitState {
+    active_connections: usize,
+    anonymous_by_ip: HashMap<String, usize>,
+}
+
+struct ConnectionPermit {
+    limiter: ConnectionLimiter,
+    anonymous_ip: Option<String>,
+}
+
+impl ConnectionLimiter {
+    fn reserve(
+        &self,
+        client_ip: Option<String>,
+        max_connections_global: u32,
+        max_connections_per_ip: u32,
+    ) -> Result<ConnectionPermit> {
+        let mut state = lock_unpoisoned(&self.state, "websocket connection limiter");
+        if max_connections_global > 0 && state.active_connections >= max_connections_global as usize
+        {
+            return Err(Error::http(
+                429,
+                "websocket global connection limit exceeded",
+            ));
+        }
+        let per_ip_limit_exceeded = max_connections_per_ip > 0
+            && client_ip.as_ref().is_some_and(|ip| {
+                state.anonymous_by_ip.get(ip).copied().unwrap_or_default()
+                    >= max_connections_per_ip as usize
+            });
+        if per_ip_limit_exceeded {
+            return Err(Error::http(
+                429,
+                "websocket anonymous connection limit exceeded",
+            ));
+        }
+
+        state.active_connections += 1;
+        if let Some(ip) = client_ip.as_ref() {
+            *state.anonymous_by_ip.entry(ip.clone()).or_default() += 1;
+        }
+        drop(state);
+
+        Ok(ConnectionPermit {
+            limiter: self.clone(),
+            anonymous_ip: client_ip,
+        })
+    }
+}
+
+impl ConnectionPermit {
+    fn mark_authenticated(&mut self) {
+        let Some(ip) = self.anonymous_ip.take() else {
+            return;
+        };
+        let mut state = lock_unpoisoned(&self.limiter.state, "websocket connection limiter");
+        decrement_connection_count(&mut state.anonymous_by_ip, &ip);
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let mut state = lock_unpoisoned(&self.limiter.state, "websocket connection limiter");
+        state.active_connections = state.active_connections.saturating_sub(1);
+        if let Some(ip) = self.anonymous_ip.take() {
+            decrement_connection_count(&mut state.anonymous_by_ip, &ip);
+        }
+    }
+}
+
+fn decrement_connection_count(counts: &mut HashMap<String, usize>, key: &str) {
+    let Some(count) = counts.get_mut(key) else {
+        return;
+    };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        counts.remove(key);
+    }
+}
+
 #[derive(Clone)]
 struct ConnectionHub {
     next_id: Arc<AtomicU64>,
     state: Arc<RwLock<HubState>>,
+    limiter: ConnectionLimiter,
     diagnostics: Option<Arc<RuntimeDiagnostics>>,
     outbound_buffer_size: usize,
 }
@@ -1397,6 +1764,7 @@ impl ConnectionHub {
         Self {
             next_id: Arc::new(AtomicU64::new(0)),
             state: Arc::new(RwLock::new(HubState::default())),
+            limiter: ConnectionLimiter::default(),
             diagnostics,
             outbound_buffer_size: outbound_buffer_size.max(1),
         }
@@ -1404,6 +1772,17 @@ impl ConnectionHub {
 }
 
 impl ConnectionHub {
+    fn reserve_connection(
+        &self,
+        client_ip: Option<String>,
+        max_connections_global: u32,
+        max_connections_per_ip: u32,
+    ) -> Result<ConnectionPermit> {
+        self.limiter
+            .reserve(client_ip, max_connections_global, max_connections_per_ip)
+    }
+
+    #[cfg(test)]
     async fn register(
         &self,
         identity: ConnectionIdentity,
@@ -1412,10 +1791,24 @@ impl ConnectionHub {
         mpsc::Receiver<WriterCommand>,
         Arc<tokio::sync::Mutex<tokio::time::Instant>>,
     ) {
+        let permit = self
+            .reserve_connection(identity.client_ip.clone(), 0, 0)
+            .expect("unlimited WebSocket connection reservation should succeed");
+        self.register_reserved(identity, permit).await
+    }
+
+    async fn register_reserved(
+        &self,
+        identity: ConnectionIdentity,
+        connection_permit: ConnectionPermit,
+    ) -> (
+        u64,
+        mpsc::Receiver<WriterCommand>,
+        Arc<tokio::sync::Mutex<tokio::time::Instant>>,
+    ) {
         let connection_id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = mpsc::channel(self.outbound_buffer_size);
         let last_pong_at = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
-        let client_ip = identity.client_ip.clone();
         let mut hub = self.state.write().await;
         hub.connections.insert(
             connection_id,
@@ -1427,15 +1820,9 @@ impl ConnectionHub {
                 sender: tx,
                 message_count: 0,
                 rate_window_start: tokio::time::Instant::now(),
+                connection_permit,
             },
         );
-        if let Some(ref ip) = client_ip {
-            let tracking_key = format!("ip:{ip}");
-            hub.user_connections
-                .entry(tracking_key)
-                .or_default()
-                .insert(connection_id);
-        }
         drop(hub);
 
         if let Some(diagnostics) = &self.diagnostics {
@@ -1586,7 +1973,7 @@ impl ConnectionHub {
         &self,
         connection_id: u64,
         guard: &GuardId,
-    ) -> std::result::Result<Option<Actor>, AuthError> {
+    ) -> std::result::Result<Option<CachedActor>, AuthError> {
         self.state
             .read()
             .await
@@ -1605,23 +1992,69 @@ impl ConnectionHub {
             .await
             .connections
             .get(&connection_id)
-            .map(|state| state.actors.clone())
+            .map(|state| {
+                state
+                    .actors
+                    .iter()
+                    .map(|(guard, cached)| (guard.clone(), cached.actor.clone()))
+                    .collect()
+            })
             .ok_or_else(|| AuthError::internal("websocket connection not found"))
+    }
+
+    async fn auth_snapshot(
+        &self,
+        connection_id: u64,
+    ) -> std::result::Result<ConnectionAuthSnapshot, AuthError> {
+        self.state
+            .read()
+            .await
+            .connections
+            .get(&connection_id)
+            .map(|state| ConnectionAuthSnapshot {
+                identity: state.identity.clone(),
+                actors: state.actors.clone(),
+                subscriptions: state.subscriptions.iter().cloned().collect(),
+            })
+            .ok_or_else(|| AuthError::internal("websocket connection not found"))
+    }
+
+    async fn connections_due_for_channel(
+        &self,
+        channel: &ChannelId,
+        interval: Duration,
+    ) -> Vec<u64> {
+        self.state
+            .read()
+            .await
+            .connections
+            .iter()
+            .filter(|(_, state)| {
+                state
+                    .subscriptions
+                    .iter()
+                    .any(|subscription| subscription.channel == *channel)
+                    && state.actors.values().any(|cached| cached.is_due(interval))
+            })
+            .map(|(connection_id, _)| *connection_id)
+            .collect()
     }
 
     async fn cache_actor(
         &self,
         connection_id: u64,
         actor: Actor,
+        credential_kind: ConnectionCredentialKind,
         max_connections_per_user: u32,
     ) -> std::result::Result<(), AuthError> {
         let actor_id = actor.id.clone();
         let guard = actor.guard.clone();
+        let actor_key = (guard.clone(), actor_id);
 
         let mut hub = self.state.write().await;
 
         if max_connections_per_user > 0 {
-            if let Some(existing) = hub.user_connections.get(&actor_id) {
+            if let Some(existing) = hub.actor_connections.get(&actor_key) {
                 let other_connections = existing.iter().filter(|id| **id != connection_id).count();
                 if other_connections >= max_connections_per_user as usize {
                     return Err(AuthError::forbidden_code(
@@ -1635,25 +2068,49 @@ impl ConnectionHub {
             .connections
             .get_mut(&connection_id)
             .ok_or_else(|| AuthError::internal("websocket connection not found"))?;
-        state.actors.insert(guard, actor);
+        state.connection_permit.mark_authenticated();
+        state.actors.insert(
+            guard,
+            CachedActor {
+                actor,
+                credential_kind,
+                validated_at: tokio::time::Instant::now(),
+            },
+        );
 
-        // Remove IP-based tracking (anonymous → authenticated transition)
-        if let Some(ref ip) = state.identity.client_ip {
-            let ip_key = format!("ip:{ip}");
-            if let Some(set) = hub.user_connections.get_mut(&ip_key) {
-                set.remove(&connection_id);
-                if set.is_empty() {
-                    hub.user_connections.remove(&ip_key);
-                }
-            }
-        }
-
-        // Track by actor ID
-        hub.user_connections
-            .entry(actor_id)
+        hub.actor_connections
+            .entry(actor_key)
             .or_default()
             .insert(connection_id);
 
+        Ok(())
+    }
+
+    async fn update_cached_actor(
+        &self,
+        connection_id: u64,
+        guard: &GuardId,
+        expected_actor_id: &str,
+        credential_kind: ConnectionCredentialKind,
+        actor: Actor,
+    ) -> std::result::Result<(), AuthError> {
+        let mut hub = self.state.write().await;
+        let state = hub
+            .connections
+            .get_mut(&connection_id)
+            .ok_or_else(|| AuthError::internal("websocket connection not found"))?;
+        let cached = state
+            .actors
+            .get_mut(guard)
+            .ok_or_else(|| AuthError::internal("websocket actor cache entry not found"))?;
+        if cached.actor.id != expected_actor_id || cached.credential_kind != credential_kind {
+            return Err(AuthError::unauthorized(
+                "websocket credential identity changed",
+            ));
+        }
+
+        cached.actor = actor;
+        cached.validated_at = tokio::time::Instant::now();
         Ok(())
     }
 
@@ -1724,7 +2181,12 @@ impl ConnectionHub {
         let to_remove: Vec<u64> = hub
             .connections
             .iter()
-            .filter(|(_, state)| state.actors.values().any(|a| a.id == actor_id))
+            .filter(|(_, state)| {
+                state
+                    .actors
+                    .values()
+                    .any(|cached| cached.actor.id == actor_id)
+            })
             .map(|(id, _)| *id)
             .collect();
 
@@ -1737,6 +2199,13 @@ impl ConnectionHub {
         }
 
         closed
+    }
+
+    async fn disconnect(&self, connection_id: u64) -> Option<ClosedConnection> {
+        let mut hub = self.state.write().await;
+        let state = hub.connections.remove(&connection_id)?;
+        let _ = state.sender.try_send(WriterCommand::Close);
+        Some(self.close_state(&mut hub, connection_id, state))
     }
 
     async fn send_to_many(
@@ -1781,13 +2250,10 @@ impl ConnectionHub {
             diagnostics.record_websocket_connection(WebSocketConnectionState::Closed);
         }
 
-        for actor in state.actors.values() {
-            remove_connection_tracking(&mut hub.user_connections, &actor.id, connection_id);
-        }
-        if let Some(ref ip) = state.identity.client_ip {
+        for (guard, cached) in &state.actors {
             remove_connection_tracking(
-                &mut hub.user_connections,
-                &format!("ip:{ip}"),
+                &mut hub.actor_connections,
+                &(guard.clone(), cached.actor.id.clone()),
                 connection_id,
             );
         }
@@ -1798,11 +2264,16 @@ impl ConnectionHub {
             "WebSocket connection closed"
         );
 
+        let actors = state
+            .actors
+            .into_iter()
+            .map(|(guard, cached)| (guard, cached.actor))
+            .collect();
         ClosedConnection {
             connection_id,
             subscriptions: state.subscriptions.into_iter().collect(),
             presence_entries: state.presence_entries,
-            actors: state.actors,
+            actors,
         }
     }
 }
@@ -1810,7 +2281,7 @@ impl ConnectionHub {
 #[derive(Default)]
 struct HubState {
     connections: HashMap<u64, ConnectionState>,
-    user_connections: HashMap<String, HashSet<u64>>,
+    actor_connections: HashMap<(GuardId, String), HashSet<u64>>,
 }
 
 enum HubSendError {
@@ -1826,15 +2297,17 @@ struct ClosedConnection {
     actors: HashMap<GuardId, Actor>,
 }
 
-fn remove_connection_tracking(
-    user_connections: &mut HashMap<String, HashSet<u64>>,
-    key: &str,
+fn remove_connection_tracking<K>(
+    connections: &mut HashMap<K, HashSet<u64>>,
+    key: &K,
     connection_id: u64,
-) {
-    if let Some(set) = user_connections.get_mut(key) {
+) where
+    K: Eq + std::hash::Hash,
+{
+    if let Some(set) = connections.get_mut(key) {
         set.remove(&connection_id);
         if set.is_empty() {
-            user_connections.remove(key);
+            connections.remove(key);
         }
     }
 }
@@ -1843,10 +2316,11 @@ struct ConnectionState {
     subscriptions: HashSet<SubscriptionKey>,
     presence_entries: Vec<PresenceEntry>,
     identity: ConnectionIdentity,
-    actors: HashMap<GuardId, Actor>,
+    actors: HashMap<GuardId, CachedActor>,
     sender: mpsc::Sender<WriterCommand>,
     message_count: u32,
     rate_window_start: tokio::time::Instant,
+    connection_permit: ConnectionPermit,
 }
 
 impl ConnectionState {
@@ -1881,6 +2355,32 @@ struct ConnectionIdentity {
     client_ip: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionCredentialKind {
+    Bearer,
+    Session,
+}
+
+#[derive(Debug, Clone)]
+struct CachedActor {
+    actor: Actor,
+    credential_kind: ConnectionCredentialKind,
+    validated_at: tokio::time::Instant,
+}
+
+impl CachedActor {
+    fn is_due(&self, interval: Duration) -> bool {
+        self.validated_at.elapsed() >= interval
+    }
+}
+
+#[derive(Clone)]
+struct ConnectionAuthSnapshot {
+    identity: ConnectionIdentity,
+    actors: HashMap<GuardId, CachedActor>,
+    subscriptions: Vec<SubscriptionKey>,
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct SubscriptionKey {
     channel: ChannelId,
@@ -1890,7 +2390,8 @@ struct SubscriptionKey {
 /// Tracks presence values that need cleanup on disconnect.
 #[derive(Debug, Clone)]
 struct PresenceEntry {
-    key: String,
+    aggregate_key: String,
+    scope_key: String,
     member_value: String,
     channel: ChannelId,
     room: Option<String>,
@@ -1977,6 +2478,97 @@ mod tests {
         assert!(matches!(
             hub.send(connection_id, WriterCommand::Json(message)).await,
             Err(HubSendError::Full)
+        ));
+    }
+
+    #[test]
+    fn websocket_connection_limiter_reserves_global_and_anonymous_ip_capacity() {
+        let limiter = ConnectionLimiter::default();
+        let mut first = limiter
+            .reserve(Some("203.0.113.10".to_string()), 1, 1)
+            .unwrap();
+
+        let global_error = limiter
+            .reserve(Some("198.51.100.2".to_string()), 1, 1)
+            .err()
+            .expect("global limit should reject the reservation");
+        assert_eq!(
+            global_error.to_string(),
+            "websocket global connection limit exceeded"
+        );
+
+        first.mark_authenticated();
+        assert_eq!(
+            limiter
+                .reserve(Some("198.51.100.2".to_string()), 1, 1)
+                .err()
+                .expect("authentication must not release global capacity")
+                .to_string(),
+            "websocket global connection limit exceeded"
+        );
+        drop(first);
+
+        let first = limiter
+            .reserve(Some("203.0.113.10".to_string()), 0, 1)
+            .unwrap();
+        assert_eq!(
+            limiter
+                .reserve(Some("203.0.113.10".to_string()), 0, 1)
+                .err()
+                .expect("same-IP anonymous capacity should be bounded")
+                .to_string(),
+            "websocket anonymous connection limit exceeded"
+        );
+        let other_ip = limiter
+            .reserve(Some("203.0.113.11".to_string()), 0, 1)
+            .unwrap();
+        drop(first);
+        let same_ip_after_drop = limiter
+            .reserve(Some("203.0.113.10".to_string()), 0, 1)
+            .unwrap();
+        drop((other_ip, same_ip_after_drop));
+    }
+
+    #[tokio::test]
+    async fn websocket_actor_connection_limit_is_scoped_by_guard() {
+        let hub = ConnectionHub::new(None, 1);
+        let (user_connection, _user_rx, _user_pong) =
+            hub.register(ConnectionIdentity::default()).await;
+        let (admin_connection, _admin_rx, _admin_pong) =
+            hub.register(ConnectionIdentity::default()).await;
+        let (second_user_connection, _second_user_rx, _second_user_pong) =
+            hub.register(ConnectionIdentity::default()).await;
+
+        hub.cache_actor(
+            user_connection,
+            Actor::new("42", GuardId::new("user")),
+            ConnectionCredentialKind::Bearer,
+            1,
+        )
+        .await
+        .unwrap();
+        hub.cache_actor(
+            admin_connection,
+            Actor::new("42", GuardId::new("admin")),
+            ConnectionCredentialKind::Bearer,
+            1,
+        )
+        .await
+        .unwrap();
+
+        let error = hub
+            .cache_actor(
+                second_user_connection,
+                Actor::new("42", GuardId::new("user")),
+                ConnectionCredentialKind::Bearer,
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AuthError::Forbidden(ref forbidden)
+                if forbidden.code() == Some(AuthErrorCode::MaxConnectionsPerUserExceeded)
         ));
     }
 
@@ -2163,7 +2755,14 @@ mod tests {
             "https://example.com".parse().unwrap(),
         );
 
-        assert!(origin_allowed(&headers, &[], false));
+        assert!(origin_allowed(
+            &test_app(),
+            &headers,
+            &[],
+            false,
+            "127.0.0.1:3010".parse().unwrap(),
+        )
+        .unwrap());
     }
 
     #[test]
@@ -2171,16 +2770,18 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::ORIGIN,
-            "https://example.com".parse().unwrap(),
+            "http://example.com".parse().unwrap(),
         );
         headers.insert(axum::http::header::HOST, "example.com".parse().unwrap());
+        let app = test_app();
+        let peer = "127.0.0.1:3010".parse().unwrap();
 
-        assert!(origin_allowed(&headers, &[], true));
-        assert!(origin_allowed(&HeaderMap::new(), &[], true));
+        assert!(origin_allowed(&app, &headers, &[], true, peer).unwrap());
+        assert!(origin_allowed(&app, &HeaderMap::new(), &[], true, peer).unwrap());
     }
 
     #[test]
-    fn websocket_empty_origin_allowlist_allows_forwarded_same_origin_in_production() {
+    fn websocket_empty_origin_allowlist_allows_trusted_forwarded_origin_in_production() {
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::ORIGIN,
@@ -2188,8 +2789,34 @@ mod tests {
         );
         headers.insert(axum::http::header::HOST, "127.0.0.1:3010".parse().unwrap());
         headers.insert("x-forwarded-host", "example.com".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
 
-        assert!(origin_allowed(&headers, &[], true));
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("foundry.toml"),
+            r#"
+                [http.trusted_proxy]
+                enabled = true
+                trusted_cidrs = ["203.0.113.0/24"]
+                headers = ["x-forwarded-for"]
+            "#,
+        )
+        .unwrap();
+        let app = AppContext::new(
+            Container::new(),
+            ConfigRepository::from_dir(directory.path()).unwrap(),
+            RuleRegistry::new(),
+        )
+        .unwrap();
+
+        assert!(origin_allowed(
+            &app,
+            &headers,
+            &[],
+            true,
+            "203.0.113.5:3010".parse().unwrap(),
+        )
+        .unwrap());
     }
 
     #[test]
@@ -2201,7 +2828,64 @@ mod tests {
         );
         headers.insert(axum::http::header::HOST, "example.com".parse().unwrap());
 
-        assert!(!origin_allowed(&headers, &[], true));
+        assert!(!origin_allowed(
+            &test_app(),
+            &headers,
+            &[],
+            true,
+            "127.0.0.1:3010".parse().unwrap(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn websocket_same_origin_requires_matching_scheme_and_effective_port() {
+        let app = test_app();
+        let peer = "127.0.0.1:3010".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "example.com".parse().unwrap());
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://example.com".parse().unwrap(),
+        );
+        assert!(!origin_allowed(&app, &headers, &[], true, peer).unwrap());
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "http://example.com:8080".parse().unwrap(),
+        );
+        assert!(!origin_allowed(&app, &headers, &[], true, peer).unwrap());
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "http://example.com:80".parse().unwrap(),
+        );
+        assert!(origin_allowed(&app, &headers, &[], true, peer).unwrap());
+    }
+
+    #[test]
+    fn websocket_untrusted_peer_cannot_spoof_forwarded_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://example.com".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::HOST,
+            "internal.test:3010".parse().unwrap(),
+        );
+        headers.insert("x-forwarded-host", "example.com".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+        assert!(!origin_allowed(
+            &test_app(),
+            &headers,
+            &[],
+            true,
+            "203.0.113.5:3010".parse().unwrap(),
+        )
+        .unwrap());
     }
 
     #[test]
@@ -2213,15 +2897,21 @@ mod tests {
         );
 
         assert!(origin_allowed(
+            &test_app(),
             &headers,
             &["https://example.com".to_string()],
-            true
-        ));
+            true,
+            "127.0.0.1:3010".parse().unwrap(),
+        )
+        .unwrap());
         assert!(!origin_allowed(
+            &test_app(),
             &headers,
             &["https://other.test".to_string()],
-            true
-        ));
+            true,
+            "127.0.0.1:3010".parse().unwrap(),
+        )
+        .unwrap());
     }
 
     #[tokio::test]
@@ -2545,7 +3235,7 @@ mod tests {
             .channel(
                 ChannelId::new("fail"),
                 |_context: WebSocketContext, _payload: serde_json::Value| async {
-                    Err(Error::message("handler failed"))
+                    Err(Error::http(422, "handler failed"))
                 },
             )
             .unwrap();
@@ -2573,6 +3263,44 @@ mod tests {
         assert_eq!(ack.payload["ack_id"], "ack-error");
         assert_eq!(ack.payload["status"], "error");
         assert_eq!(ack.payload["error"], "handler failed");
+    }
+
+    #[tokio::test]
+    async fn channel_handler_internal_error_ack_is_redacted() {
+        let mut registrar = WebSocketRegistrar::new();
+        registrar
+            .channel(
+                ChannelId::new("internal-failure"),
+                |_context: WebSocketContext, _payload: serde_json::Value| async {
+                    Err(Error::other(anyhow::anyhow!(
+                        "database password leaked from internal provider"
+                    )))
+                },
+            )
+            .unwrap();
+        let state = websocket_state(registrar.into_channels(), "ws-handler-internal-error");
+        let (connection_id, mut outbound, _last_pong) =
+            state.hub.register(ConnectionIdentity::default()).await;
+        subscribe(&state, connection_id, &mut outbound, "internal-failure").await;
+
+        let error = process_client_message(
+            &state,
+            connection_id,
+            serde_json::json!({
+                "action": "message",
+                "channel": "internal-failure",
+                "ack_id": "ack-internal-error",
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("database password"));
+        let ack = next_json(&mut outbound).await;
+        assert_eq!(ack.event, ACK_EVENT);
+        assert_eq!(ack.payload["status"], "error");
+        assert_eq!(ack.payload["error"], Error::internal_server_error_message());
     }
 
     #[tokio::test]
@@ -2621,10 +3349,7 @@ mod tests {
         assert_eq!(ack.event, ACK_EVENT);
         assert_eq!(ack.payload["ack_id"], "ack-panic");
         assert_eq!(ack.payload["status"], "error");
-        assert_eq!(
-            ack.payload["error"],
-            "websocket handler panicked: handler explode"
-        );
+        assert_eq!(ack.payload["error"], Error::internal_server_error_message());
 
         process_client_message(
             &state,
@@ -2699,10 +3424,7 @@ mod tests {
         assert_eq!(ack.event, ACK_EVENT);
         assert_eq!(ack.payload["ack_id"], "ack-factory-panic");
         assert_eq!(ack.payload["status"], "error");
-        assert_eq!(
-            ack.payload["error"],
-            "websocket handler panicked: handler factory explode"
-        );
+        assert_eq!(ack.payload["error"], Error::internal_server_error_message());
 
         process_client_message(
             &state,

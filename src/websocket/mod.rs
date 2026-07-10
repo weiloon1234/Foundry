@@ -19,13 +19,48 @@ pub(crate) fn presence_key(channel: &ChannelId) -> String {
     format!("ws:presence:{}", channel.as_str())
 }
 
-pub(crate) fn presence_member_value(actor_id: &str, channel: &ChannelId, joined_at: i64) -> String {
-    serde_json::to_string(&PresenceInfo {
-        actor_id: actor_id.to_string(),
-        channel: channel.clone(),
+pub(crate) fn presence_scope_key(channel: &ChannelId, room: Option<&str>) -> String {
+    match room {
+        Some(room) => format!(
+            "ws:presence:scope:{}:room:{}",
+            channel.as_str(),
+            crate::support::sha256_hex_str(room)
+        ),
+        None => format!("ws:presence:scope:{}:channel", channel.as_str()),
+    }
+}
+
+pub(crate) fn presence_member_value(
+    actor_id: &str,
+    channel: &ChannelId,
+    room: Option<&str>,
+    joined_at: i64,
+) -> String {
+    #[derive(Serialize)]
+    struct StoredPresenceMember<'a> {
+        actor_id: &'a str,
+        channel: &'a ChannelId,
+        room: Option<&'a str>,
+        joined_at: i64,
+        entry_id: uuid::Uuid,
+    }
+
+    serde_json::to_string(&StoredPresenceMember {
+        actor_id,
+        channel,
+        room,
         joined_at,
+        entry_id: uuid::Uuid::now_v7(),
     })
     .unwrap_or_default()
+}
+
+fn presence_members_for_room(members: Vec<String>, room: Option<&str>) -> Vec<PresenceInfo> {
+    members
+        .into_iter()
+        .filter_map(|raw| serde_json::from_str::<PresenceInfo>(&raw).ok())
+        .filter(|info| info.room.as_deref() == room)
+        .collect()
 }
 
 pub type WebSocketRouteRegistrar = Arc<dyn Fn(&mut WebSocketRegistrar) -> Result<()> + Send + Sync>;
@@ -57,6 +92,8 @@ fn websocket_registrar_panic_error(panic: Box<dyn std::any::Any + Send>) -> Erro
 pub struct PresenceInfo {
     pub actor_id: String,
     pub channel: ChannelId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
     pub joined_at: i64,
 }
 
@@ -194,24 +231,18 @@ impl WebSocketContext {
             .await
     }
 
-    /// Return all presence members for the current channel.
+    /// Return presence members for the current channel and room.
     pub async fn presence_members(&self) -> Result<Vec<PresenceInfo>> {
         let backend = RuntimeBackend::from_config(self.app.config())?;
-        let key = presence_key(&self.channel);
+        let key = presence_scope_key(&self.channel, self.room());
         let members = backend.smembers(&key).await?;
-        let mut infos = Vec::with_capacity(members.len());
-        for raw in members {
-            if let Ok(info) = serde_json::from_str::<PresenceInfo>(&raw) {
-                infos.push(info);
-            }
-        }
-        Ok(infos)
+        Ok(presence_members_for_room(members, self.room()))
     }
 
-    /// Return the number of presence members for the current channel.
+    /// Return the number of presence members for the current channel and room.
     pub async fn presence_count(&self) -> Result<usize> {
         let backend = RuntimeBackend::from_config(self.app.config())?;
-        let key = presence_key(&self.channel);
+        let key = presence_scope_key(&self.channel, self.room());
         backend.scard(&key).await
     }
 }
@@ -768,6 +799,35 @@ mod tests {
             ChannelId::new("chat"),
             None,
         )
+    }
+
+    #[test]
+    fn presence_members_are_scoped_to_the_current_room() {
+        let channel = ChannelId::new("chat");
+        let first_connection = super::presence_member_value("user-a", &channel, Some("room-a"), 1);
+        let second_connection = super::presence_member_value("user-a", &channel, Some("room-a"), 1);
+        assert_ne!(first_connection, second_connection);
+
+        let members = vec![
+            first_connection,
+            super::presence_member_value("user-b", &channel, Some("room-b"), 2),
+            super::presence_member_value("channel-user", &channel, None, 3),
+            "not-json".to_string(),
+        ];
+
+        let room_a = super::presence_members_for_room(members.clone(), Some("room-a"));
+        assert_eq!(room_a.len(), 1);
+        assert_eq!(room_a[0].actor_id, "user-a");
+
+        let channel_wide = super::presence_members_for_room(members, None);
+        assert_eq!(channel_wide.len(), 1);
+        assert_eq!(channel_wide[0].actor_id, "channel-user");
+
+        let room_a_key = super::presence_scope_key(&channel, Some("room-a"));
+        let room_b_key = super::presence_scope_key(&channel, Some("room-b"));
+        assert_ne!(room_a_key, room_b_key);
+        assert!(!room_a_key.contains("room-a"));
+        assert_ne!(room_a_key, super::presence_scope_key(&channel, None));
     }
 
     #[test]

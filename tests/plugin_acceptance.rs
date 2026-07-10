@@ -823,7 +823,18 @@ async fn plugin_shutdown_called_in_reverse_dependency_order() {
 
 const BOOT_FAIL_DEPENDENT_PLUGIN_ID: PluginId = PluginId::new("foundry.plugin.boot_fail_dependent");
 
-struct BootFailDependentPlugin;
+struct BootFailDependentPlugin {
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+struct FailingAfterPluginsProvider;
+
+#[async_trait]
+impl ServiceProvider for FailingAfterPluginsProvider {
+    async fn boot(&self, _app: &AppContext) -> Result<()> {
+        Err(Error::message("application provider boot failed"))
+    }
+}
 
 #[async_trait]
 impl foundry::plugin::Plugin for BootFailDependentPlugin {
@@ -843,6 +854,14 @@ impl foundry::plugin::Plugin for BootFailDependentPlugin {
     async fn boot(&self, _app: &AppContext) -> Result<()> {
         Err(foundry::foundation::Error::message("dependent boot failed"))
     }
+
+    async fn shutdown(&self, _app: &AppContext) -> Result<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push("dependent-shutdown".to_string());
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -850,7 +869,7 @@ async fn plugins_booted_before_a_boot_failure_are_shut_down() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let error = match App::builder()
         .register_plugin(ShutdownPlugin { log: log.clone() })
-        .register_plugin(BootFailDependentPlugin)
+        .register_plugin(BootFailDependentPlugin { log: log.clone() })
         .build_cli_kernel()
         .await
     {
@@ -861,6 +880,28 @@ async fn plugins_booted_before_a_boot_failure_are_shut_down() {
     assert!(error.to_string().contains("dependent boot failed"));
     // ShutdownPlugin booted before the failure, so its shutdown must run as
     // part of the bootstrap rollback.
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &["booted", "dependent-shutdown", "shutdown"]
+    );
+}
+
+#[tokio::test]
+async fn plugins_are_rolled_back_when_application_provider_boot_fails() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let error = match App::builder()
+        .register_plugin(ShutdownPlugin { log: log.clone() })
+        .register_provider(FailingAfterPluginsProvider)
+        .build_cli_kernel()
+        .await
+    {
+        Ok(_) => panic!("expected provider boot failure to fail bootstrap"),
+        Err(error) => error,
+    };
+
+    assert!(error
+        .to_string()
+        .contains("application provider boot failed"));
     assert_eq!(log.lock().unwrap().as_slice(), &["booted", "shutdown"]);
 }
 
@@ -891,8 +932,15 @@ async fn plugin_shutdown_panic_isolated_and_later_plugins_still_shutdown() {
         .await
         .unwrap();
 
-    kernel.app().shutdown_plugins().await.unwrap();
+    let error = kernel.app().shutdown_plugins().await.unwrap_err();
+    assert!(error.to_string().contains("shutdown boom"));
 
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &["panic-shutdown", "follower-shutdown"]
+    );
+
+    kernel.app().shutdown_plugins().await.unwrap();
     assert_eq!(
         log.lock().unwrap().as_slice(),
         &["panic-shutdown", "follower-shutdown"]

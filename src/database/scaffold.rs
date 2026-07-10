@@ -114,11 +114,13 @@ async fn make_migration_command(invocation: CommandInvocation) -> Result<()> {
         Local::now().format("%Y%m%d%H%M"),
         normalize_slug(name)
     );
-    let migration_path = migration_dir.join(format!("{basename}.rs"));
-
-    fs::create_dir_all(&migration_dir).map_err(Error::other)?;
-    ensure_writable(&migration_path, invocation.matches().get_flag("force"))?;
-    write_generated_file(&migration_path, render_migration_template())?;
+    let filename = format!("{basename}.rs");
+    let migration_path = write_scaffold_file(
+        &migration_dir,
+        &filename,
+        render_migration_template(),
+        invocation.matches().get_flag("force"),
+    )?;
 
     println!("wrote {}", migration_path.display());
     println!("next: rebuild the app before running db:migrate so Foundry discovers it");
@@ -130,11 +132,13 @@ async fn make_seeder_command(invocation: CommandInvocation) -> Result<()> {
     let name = required_name(invocation.matches())?;
     let seeder_dir = preferred_seeders_path(invocation.app(), &config)?;
     let basename = to_snake_case(name);
-    let seeder_path = seeder_dir.join(format!("{basename}.rs"));
-
-    fs::create_dir_all(&seeder_dir).map_err(Error::other)?;
-    ensure_writable(&seeder_path, invocation.matches().get_flag("force"))?;
-    write_generated_file(&seeder_path, render_seeder_template())?;
+    let filename = format!("{basename}.rs");
+    let seeder_path = write_scaffold_file(
+        &seeder_dir,
+        &filename,
+        render_seeder_template(),
+        invocation.matches().get_flag("force"),
+    )?;
 
     println!("wrote {}", seeder_path.display());
     println!("next: rebuild the app before running db:seed so Foundry discovers it");
@@ -146,11 +150,13 @@ async fn make_model_command(invocation: CommandInvocation) -> Result<()> {
     let pascal = to_pascal_case(name);
     let snake = to_snake_case(name);
     let model_dir = resolve_output_dir(invocation.matches(), "src/app/models")?;
-    let model_path = model_dir.join(format!("{snake}.rs"));
-
-    fs::create_dir_all(&model_dir).map_err(Error::other)?;
-    ensure_writable(&model_path, invocation.matches().get_flag("force"))?;
-    write_generated_file(&model_path, render_model_template(&pascal, &snake))?;
+    let filename = format!("{snake}.rs");
+    let model_path = write_scaffold_file(
+        &model_dir,
+        &filename,
+        render_model_template(&pascal, &snake),
+        invocation.matches().get_flag("force"),
+    )?;
 
     println!("wrote {}", model_path.display());
     println!("next: add fields, create a migration, and register the module from your app");
@@ -163,11 +169,13 @@ async fn make_job_command(invocation: CommandInvocation) -> Result<()> {
     let snake = to_snake_case(name);
     let screaming = to_screaming_snake_case(&snake);
     let job_dir = resolve_output_dir(invocation.matches(), "src/app/jobs")?;
-    let job_path = job_dir.join(format!("{snake}.rs"));
-
-    fs::create_dir_all(&job_dir).map_err(Error::other)?;
-    ensure_writable(&job_path, invocation.matches().get_flag("force"))?;
-    write_generated_file(&job_path, render_job_template(&pascal, &snake, &screaming))?;
+    let filename = format!("{snake}.rs");
+    let job_path = write_scaffold_file(
+        &job_dir,
+        &filename,
+        render_job_template(&pascal, &snake, &screaming),
+        invocation.matches().get_flag("force"),
+    )?;
 
     println!("wrote {}", job_path.display());
     println!("next: implement handle(), then register the job in a service provider");
@@ -180,13 +188,12 @@ async fn make_command_command(invocation: CommandInvocation) -> Result<()> {
     let snake = to_snake_case(name);
     let screaming = to_screaming_snake_case(&snake);
     let command_dir = resolve_output_dir(invocation.matches(), "src/app/commands")?;
-    let command_path = command_dir.join(format!("{snake}.rs"));
-
-    fs::create_dir_all(&command_dir).map_err(Error::other)?;
-    ensure_writable(&command_path, invocation.matches().get_flag("force"))?;
-    write_generated_file(
-        &command_path,
+    let filename = format!("{snake}.rs");
+    let command_path = write_scaffold_file(
+        &command_dir,
+        &filename,
         render_command_template(&pascal, &snake, &screaming),
+        invocation.matches().get_flag("force"),
     )?;
 
     println!("wrote {}", command_path.display());
@@ -242,8 +249,17 @@ fn resolve_path(path: &str) -> Result<PathBuf> {
     Ok(cwd.join(configured))
 }
 
-fn ensure_writable(path: &Path, force: bool) -> Result<()> {
-    ensure_generated_file_writable(path, force)
+fn write_scaffold_file(
+    output_dir: &Path,
+    filename: &str,
+    contents: impl AsRef<[u8]>,
+    force: bool,
+) -> Result<PathBuf> {
+    fs::create_dir_all(output_dir).map_err(Error::other)?;
+    let relative = Path::new(filename);
+    ensure_generated_file_writable(output_dir, relative, force)?;
+    write_generated_file(output_dir, relative, contents)?;
+    Ok(output_dir.join(relative))
 }
 
 fn render_migration_template() -> String {
@@ -343,7 +359,7 @@ fn render_model_template(pascal: &str, snake: &str) -> String {
     format!(
         "use foundry::prelude::*;\n\
          \n\
-         #[derive(Clone, Debug, foundry::Model)]\n\
+         #[derive(Debug, foundry::Model)]\n\
          #[foundry(table = \"{table_name}\")]\n\
          pub struct {pascal} {{\n\
          \x20   pub id: ModelId<{pascal}>,\n\
@@ -395,7 +411,7 @@ fn render_command_template(pascal: &str, snake: &str, screaming: &str) -> String
 mod tests {
     use super::{
         render_command_template, render_job_template, render_model_template, to_pascal_case,
-        to_screaming_snake_case,
+        to_screaming_snake_case, write_scaffold_file,
     };
 
     #[test]
@@ -428,6 +444,8 @@ mod tests {
         assert!(output.contains("pub struct User {"));
         assert!(output.contains("#[foundry(table = \"users\")]"));
         assert!(output.contains("pub id: ModelId<User>"));
+        assert!(output.contains("#[derive(Debug, foundry::Model)]"));
+        assert!(!output.contains("#[derive(Clone"));
     }
 
     #[test]
@@ -450,5 +468,24 @@ mod tests {
         assert!(output.contains("pub fn register("));
         assert!(output.contains("Command::new(\"sync_inventory\")"));
         assert!(!output.contains("TODO"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scaffold_writer_allows_symlinked_output_root() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let holder = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let output_root = holder.path().join("models");
+        symlink(target.path(), &output_root).unwrap();
+
+        write_scaffold_file(&output_root, "user.rs", "pub struct User;\n", false).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target.path().join("user.rs")).unwrap(),
+            "pub struct User;\n"
+        );
     }
 }

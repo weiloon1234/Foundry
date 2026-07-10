@@ -934,8 +934,15 @@ async fn migrate_locked(
         + 1;
 
     for migration in &pending {
-        run_migration_up(app.clone(), database.clone(), session, migration.as_ref()).await?;
-        record_applied_migration(session, &config, &migration.id(), next_batch).await?;
+        run_migration_up(
+            app.clone(),
+            database.clone(),
+            session,
+            &config,
+            migration.as_ref(),
+            next_batch,
+        )
+        .await?;
     }
 
     Ok(MigrationRunSummary {
@@ -976,8 +983,14 @@ async fn rollback_locked(
         .collect::<Vec<_>>();
 
     for migration in &rollback {
-        run_migration_down(app.clone(), database.clone(), session, migration.as_ref()).await?;
-        delete_applied_migration(session, &config, &migration.id()).await?;
+        run_migration_down(
+            app.clone(),
+            database.clone(),
+            session,
+            &config,
+            migration.as_ref(),
+        )
+        .await?;
     }
 
     Ok(MigrationRunSummary {
@@ -990,60 +1003,57 @@ async fn run_migration_up(
     app: AppContext,
     database: Arc<DatabaseManager>,
     session: &DatabaseSession,
+    config: &DatabaseConfig,
     migration: &dyn DynMigration,
+    batch: i64,
 ) -> Result<()> {
     let id = migration.id();
     if !migration_run_in_transaction(migration, &id)? {
-        return run_database_lifecycle_callback("migration", &id, "up", || {
+        run_database_lifecycle_callback("migration", &id, "up", || {
             migration.up(&app, &database, session)
         })
-        .await;
+        .await?;
+        return record_applied_migration(session, config, &id, batch).await;
     }
 
     session.begin_transaction().await?;
-    let result = run_database_lifecycle_callback("migration", &id, "up", || {
-        migration.up(&app, &database, session)
-    })
-    .await;
-    match result {
-        Ok(()) => session.commit_transaction().await,
-        Err(error) => match session.rollback_transaction().await {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(Error::message(format!(
-                "{error}; rollback failed: {rollback_error}"
-            ))),
-        },
+    let result = async {
+        run_database_lifecycle_callback("migration", &id, "up", || {
+            migration.up(&app, &database, session)
+        })
+        .await?;
+        record_applied_migration(session, config, &id, batch).await
     }
+    .await;
+    finish_lifecycle_transaction(session, result).await
 }
 
 async fn run_migration_down(
     app: AppContext,
     database: Arc<DatabaseManager>,
     session: &DatabaseSession,
+    config: &DatabaseConfig,
     migration: &dyn DynMigration,
 ) -> Result<()> {
     let id = migration.id();
     if !migration_run_in_transaction(migration, &id)? {
-        return run_database_lifecycle_callback("migration", &id, "down", || {
+        run_database_lifecycle_callback("migration", &id, "down", || {
             migration.down(&app, &database, session)
         })
-        .await;
+        .await?;
+        return delete_applied_migration(session, config, &id).await;
     }
 
     session.begin_transaction().await?;
-    let result = run_database_lifecycle_callback("migration", &id, "down", || {
-        migration.down(&app, &database, session)
-    })
-    .await;
-    match result {
-        Ok(()) => session.commit_transaction().await,
-        Err(error) => match session.rollback_transaction().await {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(Error::message(format!(
-                "{error}; rollback failed: {rollback_error}"
-            ))),
-        },
+    let result = async {
+        run_database_lifecycle_callback("migration", &id, "down", || {
+            migration.down(&app, &database, session)
+        })
+        .await?;
+        delete_applied_migration(session, config, &id).await
     }
+    .await;
+    finish_lifecycle_transaction(session, result).await
 }
 
 async fn run_seeder(
@@ -1065,6 +1075,10 @@ async fn run_seeder(
         seeder.run(&app, &database, session)
     })
     .await;
+    finish_lifecycle_transaction(session, result).await
+}
+
+async fn finish_lifecycle_transaction(session: &DatabaseSession, result: Result<()>) -> Result<()> {
     match result {
         Ok(()) => session.commit_transaction().await,
         Err(error) => match session.rollback_transaction().await {

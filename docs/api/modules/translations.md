@@ -39,4 +39,3 @@ trait HasTranslations
 fn current_locale(app: &AppContext) -> String
 fn translation_join(alias: impl Into<String>) -> TranslationJoin
 ```
-

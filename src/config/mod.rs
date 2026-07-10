@@ -558,6 +558,10 @@ pub struct WebSocketConfig {
     pub path: String,
     pub heartbeat_interval_seconds: u64,
     pub heartbeat_timeout_seconds: u64,
+    /// Maximum time a guarded WebSocket connection may reuse a cached actor
+    /// before Foundry revalidates its bearer token or session. Values below one
+    /// second are treated as one second.
+    pub auth_revalidation_interval_seconds: u64,
     /// Maximum accepted WebSocket message bytes. `0` leaves the transport
     /// default in place.
     pub max_message_size_bytes: usize,
@@ -568,6 +572,13 @@ pub struct WebSocketConfig {
     /// in place.
     pub max_write_buffer_size_bytes: usize,
     pub max_messages_per_second: u32,
+    /// Maximum simultaneous WebSocket connections across the process. `0`
+    /// disables this cap.
+    pub max_connections_global: u32,
+    /// Maximum simultaneous anonymous WebSocket connections per resolved
+    /// client IP. The count is released after the connection authenticates.
+    /// `0` disables this cap.
+    pub max_connections_per_ip: u32,
     pub max_connections_per_user: u32,
     /// Maximum active subscriptions per connection. `0` disables this cap.
     pub max_subscriptions_per_connection: usize,
@@ -613,10 +624,13 @@ impl Default for WebSocketConfig {
             path: "/ws".to_string(),
             heartbeat_interval_seconds: 30,
             heartbeat_timeout_seconds: 10,
+            auth_revalidation_interval_seconds: 30,
             max_message_size_bytes: 1_048_576,
             max_frame_size_bytes: 1_048_576,
             max_write_buffer_size_bytes: 1_048_576,
             max_messages_per_second: 50,
+            max_connections_global: 10_000,
+            max_connections_per_ip: 100,
             max_connections_per_user: 5,
             max_subscriptions_per_connection: 100,
             max_channel_length: 128,
@@ -1043,10 +1057,18 @@ impl Default for HashingConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct CryptConfig {
     pub key: String,
+}
+
+impl std::fmt::Debug for CryptConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CryptConfig")
+            .field("key", &crate::support::redaction::REDACTED)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1436,7 +1458,7 @@ mod tests {
 
     use super::{
         AppConfig, AuditConfig, AuthConfig, CacheConfig, CacheDriver, CacheErrorMode,
-        ConfigRepository, DatabaseConfig, DatatableConfig, Environment, HttpConfig,
+        ConfigRepository, CryptConfig, DatabaseConfig, DatatableConfig, Environment, HttpConfig,
         HttpRateLimitByConfig, JobsConfig, LoggingConfig, ObservabilityConfig, RedisConfig,
         RuntimeConfig, SchedulerConfig, TypeScriptConfig, WebSocketConfig,
         CLOUDFLARE_TRUSTED_CIDRS,
@@ -1647,6 +1669,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(strong.signing_key_bytes().unwrap(), vec![7u8; 32]);
+    }
+
+    #[test]
+    fn secret_config_debug_output_is_redacted() {
+        let crypt = CryptConfig {
+            key: "encryption-key-that-must-not-leak".to_string(),
+        };
+        let output = format!("{crypt:?}");
+
+        assert!(output.contains("[redacted]"));
+        assert!(!output.contains("encryption-key-that-must-not-leak"));
     }
 
     #[test]
@@ -2032,10 +2065,13 @@ mod tests {
 
         assert_eq!(websocket.heartbeat_interval_seconds, 30);
         assert_eq!(websocket.heartbeat_timeout_seconds, 10);
+        assert_eq!(websocket.auth_revalidation_interval_seconds, 30);
         assert_eq!(websocket.max_message_size_bytes, 1_048_576);
         assert_eq!(websocket.max_frame_size_bytes, 1_048_576);
         assert_eq!(websocket.max_write_buffer_size_bytes, 1_048_576);
         assert_eq!(websocket.max_messages_per_second, 50);
+        assert_eq!(websocket.max_connections_global, 10_000);
+        assert_eq!(websocket.max_connections_per_ip, 100);
         assert_eq!(websocket.max_connections_per_user, 5);
         assert_eq!(websocket.max_subscriptions_per_connection, 100);
         assert_eq!(websocket.max_channel_length, 128);

@@ -43,7 +43,8 @@ use crate::storage::{StorageDriverRegistryBuilder, StorageManager};
 use crate::support::runtime::RuntimeBackend;
 use crate::support::sync::{lock_unpoisoned, mutex_into_inner_unpoisoned};
 use crate::support::{
-    Clock, CryptManager, GuardId, HashManager, RouteId, Timezone, ValidationRuleId,
+    Clock, CryptManager, GuardId, HashManager, MiddlewareGroupId, RouteId, Timezone,
+    ValidationRuleId,
 };
 use crate::validation::{RuleRegistry, ValidationRule};
 use crate::websocket::{WebSocketPublisher, WebSocketRouteRegistrar};
@@ -64,31 +65,10 @@ pub struct AppTransaction {
 }
 
 async fn finish_kernel_run(app: AppContext, result: Result<()>) -> Result<()> {
-    let kernel_failed = result.is_err();
-    let mut cleanup_error = None;
-
-    if let Err(error) = app.shutdown_background_tasks().await {
-        tracing::warn!(
-            error = %error,
-            "background task shutdown failed"
-        );
-        if !kernel_failed && cleanup_error.is_none() {
-            cleanup_error = Some(error);
-        }
-    }
-
-    if let Err(error) = app.shutdown_plugins().await {
-        tracing::warn!(
-            error = %error,
-            "plugin shutdown failed"
-        );
-        if !kernel_failed && cleanup_error.is_none() {
-            cleanup_error = Some(error);
-        }
-    }
+    let cleanup_result = app.shutdown_runtime().await;
 
     match result {
-        Ok(()) => cleanup_error.map_or(Ok(()), Err),
+        Ok(()) => cleanup_result,
         Err(error) => Err(error),
     }
 }
@@ -316,15 +296,23 @@ impl AppContext {
             Ok(list) => list,
             Err(_) => return Ok(()), // no plugins registered
         };
-        for plugin in &list.0 {
-            if let Err(e) = crate::plugin::shutdown_plugin(plugin, self).await {
+        let plugins = {
+            let mut plugins = lock_unpoisoned(&list.0, "plugin shutdown list");
+            std::mem::take(&mut *plugins)
+        };
+        let mut first_error = None;
+        for plugin in &plugins {
+            if let Err(error) = crate::plugin::shutdown_plugin(plugin, self).await {
                 tracing::warn!(
-                    error = %e,
+                    error = %error,
                     "plugin shutdown failed"
                 );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     pub(crate) fn managed_background_tasks(&self) -> Result<Arc<ManagedBackgroundTasks>> {
@@ -362,10 +350,10 @@ impl AppContext {
         Ok(Some(handle))
     }
 
-    pub(crate) async fn shutdown_background_tasks(&self) -> Result<()> {
+    pub(crate) async fn shutdown_background_tasks(&self) {
         let tasks = match self.managed_background_tasks() {
             Ok(tasks) => tasks,
-            Err(_) => return Ok(()),
+            Err(_) => return,
         };
         let timeout = self
             .config()
@@ -373,7 +361,11 @@ impl AppContext {
             .map(|config| Duration::from_millis(config.background_shutdown_timeout_ms))
             .unwrap_or_else(|_| Duration::from_millis(30_000));
         tasks.shutdown(timeout).await;
-        Ok(())
+    }
+
+    pub(crate) async fn shutdown_runtime(&self) -> Result<()> {
+        self.shutdown_background_tasks().await;
+        self.shutdown_plugins().await
     }
 
     pub(crate) fn job_runtime(&self) -> Result<Arc<JobRuntime>> {
@@ -423,21 +415,16 @@ impl AppTransaction {
     /// Buffer a queued notification that will only be dispatched after a successful `commit()`.
     ///
     /// Selected channel payloads are pre-rendered immediately (at call time) so
-    /// the notification/notifiable do not need to outlive the transaction.
+    /// the notification/notifiable do not need to outlive the transaction. Rendering
+    /// or routing failures are returned and no callback is registered.
     pub fn notify_after_commit(
         &self,
         notifiable: &dyn crate::notifications::Notifiable,
         notification: &dyn crate::notifications::Notification,
-    ) {
-        match crate::notifications::try_build_notification_job(notifiable, notification) {
-            Ok(job) => self.dispatch_after_commit(job),
-            Err(error) => {
-                tracing::error!(
-                    error = %error,
-                    "after-commit notification payload rendering failed"
-                );
-            }
-        }
+    ) -> Result<()> {
+        let job = crate::notifications::build_notification_job(notifiable, notification)?;
+        self.dispatch_after_commit(job);
+        Ok(())
     }
 
     /// Register an arbitrary async callback to run after a successful `commit()`.
@@ -658,7 +645,7 @@ impl ModelWriteExecutor for AppTransaction {
 }
 
 /// Plugin instances stored in reverse dependency order for graceful shutdown.
-struct PluginShutdownList(Vec<Arc<dyn Plugin>>);
+struct PluginShutdownList(Mutex<Vec<Arc<dyn Plugin>>>);
 
 pub struct App;
 
@@ -679,7 +666,7 @@ pub struct AppBuilder {
     websocket_routes: Vec<WebSocketRouteRegistrar>,
     validation_rules: Vec<(ValidationRuleId, Arc<dyn ValidationRule>)>,
     middlewares: Vec<MiddlewareConfig>,
-    middleware_groups: std::collections::HashMap<String, Vec<MiddlewareConfig>>,
+    middleware_groups: Vec<(MiddlewareGroupId, Vec<MiddlewareConfig>)>,
     error_reporters: Vec<Arc<dyn ErrorReporter>>,
     observability: Option<ObservabilityOptions>,
     spa_dir: Option<PathBuf>,
@@ -704,7 +691,7 @@ impl AppBuilder {
             websocket_routes: Vec::new(),
             validation_rules: Vec::new(),
             middlewares: Vec::new(),
-            middleware_groups: std::collections::HashMap::new(),
+            middleware_groups: Vec::new(),
             error_reporters: Vec::new(),
             observability: None,
             spa_dir: None,
@@ -826,18 +813,19 @@ impl AppBuilder {
     /// Register a named middleware group for reuse on routes.
     ///
     /// ```ignore
+    /// const API_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("api");
+    ///
     /// App::builder()
-    ///     .middleware_group("api", vec![
+    ///     .middleware_group(API_MIDDLEWARE, vec![
     ///         RateLimit::new(100).per_minute().build(),
     ///         Compression::new().build(),
     ///     ])
     /// ```
-    pub fn middleware_group(
-        mut self,
-        name: impl Into<String>,
-        middlewares: Vec<MiddlewareConfig>,
-    ) -> Self {
-        self.middleware_groups.insert(name.into(), middlewares);
+    pub fn middleware_group<I>(mut self, id: I, middlewares: Vec<MiddlewareConfig>) -> Self
+    where
+        I: Into<MiddlewareGroupId>,
+    {
+        self.middleware_groups.push((id.into(), middlewares));
         self
     }
 
@@ -1201,25 +1189,30 @@ impl AppBuilder {
             .singleton_arc(notification_channel_registry)?;
 
         // Register middleware groups for route-level resolution
-        let groups = Arc::new(crate::http::middleware::MiddlewareGroups(middleware_groups));
+        let mut groups = crate::http::middleware::MiddlewareGroups::default();
+        for (id, middlewares) in middleware_groups {
+            groups.register(id, middlewares)?;
+        }
+        let groups = Arc::new(groups);
         app.container().singleton_arc(groups)?;
 
-        // Register i18n if configured
-        if let Ok(i18n_config) = app.config().i18n() {
-            if !i18n_config.resource_path.is_empty() {
-                let i18n_manager = crate::i18n::I18nManager::load(&i18n_config)?;
-                app.container().singleton_arc(Arc::new(i18n_manager))?;
-            }
+        // Register i18n if configured. Invalid values must fail bootstrap rather
+        // than silently disabling localization.
+        let i18n_config = app.config().i18n()?;
+        if !i18n_config.resource_path.is_empty() {
+            let i18n_manager = crate::i18n::I18nManager::load(&i18n_config)?;
+            app.container().singleton_arc(Arc::new(i18n_manager))?;
         }
 
-        let collect_route_metadata = profile.routes || profile.commands;
-        let mut boot_routes = Vec::new();
-        if collect_route_metadata {
-            boot_routes.extend(prepared_plugins.routes);
-            boot_routes.extend(routes);
-            let route_registry = Arc::new(crate::http::collect_named_routes(&boot_routes)?);
-            app.container().singleton_arc(route_registry)?;
-        }
+        // Route callbacks are application bootstrap code. Execute them exactly
+        // once, then share the frozen result across URL generation, HTTP, and
+        // client-contract export in every runtime profile.
+        let mut boot_route_registrars = prepared_plugins.routes;
+        boot_route_registrars.extend(routes);
+        let prepared_routes =
+            crate::http::PreparedHttpRoutes::from_registrars(&boot_route_registrars)?;
+        app.container()
+            .singleton_arc(Arc::new(prepared_routes.named_routes().clone()))?;
 
         // Freeze registries that providers populated during register() before boot()
         // so boot hooks can resolve the same runtime services as handlers and jobs.
@@ -1268,31 +1261,24 @@ impl AppBuilder {
         let mut booted_plugins = Vec::with_capacity(prepared_plugins.instances.len());
         for plugin in &prepared_plugins.instances {
             if let Err(error) = crate::plugin::boot_plugin(plugin, &app).await {
-                // Shut down already-booted plugins in reverse order so
-                // resources acquired by earlier boot() calls don't leak; the
-                // shutdown list below is only registered on full success.
-                for booted in booted_plugins.iter().rev() {
-                    if let Err(shutdown_error) = crate::plugin::shutdown_plugin(booted, &app).await
-                    {
-                        tracing::warn!(
-                            error = %shutdown_error,
-                            "plugin shutdown failed while rolling back boot failure"
-                        );
-                    }
-                }
+                rollback_booted_plugins(&app, &booted_plugins, Some(plugin)).await;
                 return Err(error);
             }
             booted_plugins.push(plugin.clone());
         }
-        // Store plugin instances in reverse dependency order for shutdown
-        let mut shutdown_order = prepared_plugins.instances.clone();
-        shutdown_order.reverse();
-        app.container()
-            .singleton(PluginShutdownList(shutdown_order))?;
 
         for provider in &providers {
-            boot_service_provider(provider.as_ref(), &app).await?;
+            if let Err(error) = boot_service_provider(provider.as_ref(), &app).await {
+                rollback_booted_plugins(&app, &booted_plugins, None).await;
+                return Err(error);
+            }
         }
+
+        // Store plugin instances in reverse dependency order only after every
+        // application provider has booted successfully.
+        booted_plugins.reverse();
+        app.container()
+            .singleton(PluginShutdownList(Mutex::new(booted_plugins)))?;
 
         diagnostics.mark_bootstrap_complete();
 
@@ -1317,7 +1303,7 @@ impl AppBuilder {
             let mut type_export_websocket_routes = prepared_plugins.websocket_routes.clone();
             type_export_websocket_routes.extend(websocket_routes.clone());
             boot_commands.push(crate::typescript::builtin_cli_registrar(
-                boot_routes.clone(),
+                prepared_routes.manifest().to_vec(),
                 type_export_websocket_routes,
             ));
             boot_commands.extend(prepared_plugins.commands);
@@ -1338,7 +1324,7 @@ impl AppBuilder {
 
         Ok(BootArtifacts {
             app,
-            routes: boot_routes,
+            routes: prepared_routes,
             commands: boot_commands,
             schedules: boot_schedules,
             middlewares: boot_middlewares,
@@ -1384,7 +1370,7 @@ impl AppBuilder {
 
 struct BootArtifacts {
     app: AppContext,
-    routes: Vec<RouteRegistrar>,
+    routes: crate::http::PreparedHttpRoutes,
     commands: Vec<CommandRegistrar>,
     schedules: Vec<ScheduleRegistrar>,
     middlewares: Vec<MiddlewareConfig>,
@@ -1483,6 +1469,22 @@ fn build_rule_registry(
     Ok(rules)
 }
 
+async fn rollback_booted_plugins(
+    app: &AppContext,
+    booted: &[Arc<dyn Plugin>],
+    partially_booted: Option<&Arc<dyn Plugin>>,
+) {
+    let plugins = partially_booted.into_iter().chain(booted.iter().rev());
+    for plugin in plugins {
+        if let Err(shutdown_error) = crate::plugin::shutdown_plugin(plugin, app).await {
+            tracing::warn!(
+                error = %shutdown_error,
+                "plugin shutdown failed while rolling back bootstrap"
+            );
+        }
+    }
+}
+
 fn register_builtin_readiness_checks(
     registry: &ReadinessRegistryHandle,
     backend_kind: RuntimeBackendKind,
@@ -1559,18 +1561,23 @@ mod tests {
     use std::fs;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
     use serde::Serialize;
     use tempfile::tempdir;
+    use tower::ServiceExt;
 
     use super::{finish_kernel_run, run_after_commit_callbacks, App};
     use crate::database::AfterCommitCallback;
     use crate::events::{Event, EventContext, EventListener};
     use crate::foundation::{AppContext, Error, Result, ServiceProvider, ServiceRegistrar};
-    use crate::support::{EventId, RouteId};
+    use crate::support::{EventId, MiddlewareGroupId, RouteId};
 
     struct TestProvider {
         order: Arc<Mutex<Vec<&'static str>>>,
@@ -1750,6 +1757,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_middleware_groups_fail_bootstrap() {
+        const API_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("api");
+
+        let result = App::builder()
+            .middleware_group(API_MIDDLEWARE, Vec::new())
+            .middleware_group(API_MIDDLEWARE, Vec::new())
+            .build_cli_kernel()
+            .await;
+        let error = result
+            .err()
+            .expect("duplicate middleware groups should fail bootstrap");
+
+        assert_eq!(
+            error.to_string(),
+            "middleware group `api` is already registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_i18n_config_fails_bootstrap() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("foundry.toml"),
+            "[i18n]\ndefault_locale = 42\n",
+        )
+        .unwrap();
+
+        let error = App::builder()
+            .load_config_dir(dir.path())
+            .build_cli_kernel()
+            .await
+            .err()
+            .expect("malformed i18n config should fail bootstrap");
+
+        assert!(error.to_string().contains("invalid type"));
+        assert!(error.to_string().contains("string"));
+    }
+
+    #[tokio::test]
+    async fn http_route_registrars_execute_once_and_share_the_served_route_plan() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registrar_calls = calls.clone();
+        let kernel = App::builder()
+            .register_routes(move |routes| {
+                let invocation = registrar_calls.fetch_add(1, Ordering::SeqCst);
+                let path = if invocation == 0 { "/first" } else { "/second" };
+                routes.route_named(RouteId::new("once.show"), path, get(route_url_health));
+                Ok(())
+            })
+            .build_http_kernel()
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            kernel
+                .app()
+                .route_url(RouteId::new("once.show"), &[])
+                .unwrap(),
+            "/first"
+        );
+
+        let router = kernel.build_router().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let first = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/first")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second = router
+            .oneshot(
+                Request::builder()
+                    .uri("/second")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn named_routes_are_available_in_worker_profile() {
+        let kernel = App::builder()
+            .register_routes(|routes| {
+                routes.route_named(
+                    RouteId::new("jobs.status"),
+                    "/jobs/:id",
+                    get(route_url_health),
+                );
+                Ok(())
+            })
+            .build_worker_kernel()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            kernel
+                .app()
+                .route_url(RouteId::new("jobs.status"), &[("id", "42")])
+                .unwrap(),
+            "/jobs/42"
+        );
+    }
+
+    #[tokio::test]
     async fn providers_boot_after_core_services_are_registered() {
         let dir = tempdir().unwrap();
         fs::write(
@@ -1894,7 +2013,7 @@ mod tests {
             .unwrap();
 
         started_rx.await.unwrap();
-        kernel.app().shutdown_background_tasks().await.unwrap();
+        kernel.app().shutdown_background_tasks().await;
 
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
@@ -1956,7 +2075,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        kernel.app().shutdown_background_tasks().await.unwrap();
+        kernel.app().shutdown_background_tasks().await;
     }
 
     #[tokio::test]
@@ -1964,7 +2083,7 @@ mod tests {
         let kernel = App::builder().build_cli_kernel().await.unwrap();
         let handle = crate::jobs::spawn_worker(kernel.app().clone()).unwrap();
 
-        kernel.app().shutdown_background_tasks().await.unwrap();
+        kernel.app().shutdown_background_tasks().await;
 
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
@@ -2004,7 +2123,7 @@ mod tests {
             handle.abort_handle(),
         );
 
-        kernel.app().shutdown_background_tasks().await.unwrap();
+        kernel.app().shutdown_background_tasks().await;
 
         let error = tokio::time::timeout(Duration::from_secs(1), handle)
             .await
@@ -2018,7 +2137,7 @@ mod tests {
         let kernel = App::builder().build_cli_kernel().await.unwrap();
         let tasks = kernel.app().managed_background_tasks().unwrap();
 
-        kernel.app().shutdown_background_tasks().await.unwrap();
+        kernel.app().shutdown_background_tasks().await;
 
         let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
         let (_completed_tx, completed_rx) = tokio::sync::oneshot::channel();

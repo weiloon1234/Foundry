@@ -79,6 +79,24 @@ impl SessionManager {
     /// Validate a session ID and return the Actor if valid.
     /// Extends TTL if sliding expiry is enabled.
     pub async fn validate(&self, session_id: &str) -> Result<Option<Actor>> {
+        self.validate_with_sliding_expiry(session_id, self.config.sliding_expiry)
+            .await
+    }
+
+    /// Validate a session without extending its TTL.
+    ///
+    /// Long-lived transports use this to observe the same expiry as ordinary
+    /// HTTP traffic without turning background credential checks into session
+    /// activity.
+    pub(crate) async fn validate_without_touch(&self, session_id: &str) -> Result<Option<Actor>> {
+        self.validate_with_sliding_expiry(session_id, false).await
+    }
+
+    async fn validate_with_sliding_expiry(
+        &self,
+        session_id: &str,
+        extend_sliding_expiry: bool,
+    ) -> Result<Option<Actor>> {
         if !is_valid_session_id(session_id) {
             return Ok(None);
         }
@@ -97,7 +115,7 @@ impl SessionManager {
 
         let data: SessionData = serde_json::from_str(&json).map_err(Error::other)?;
 
-        if self.config.sliding_expiry {
+        if extend_sliding_expiry {
             let ttl_secs = self.session_ttl_secs(data.remember);
             conn.expire(&session_key, ttl_secs).await?;
             let index_key = self

@@ -27,9 +27,15 @@ pub struct TestApp {
 impl TestApp {
     /// Create a builder for configuring the test application.
     pub fn builder() -> TestAppBuilder {
-        TestAppBuilder {
-            inner: App::builder(),
-        }
+        Self::from_builder(App::builder())
+    }
+
+    /// Create a test app from the same [`AppBuilder`] used by a runtime bootstrap.
+    ///
+    /// This keeps shared providers, plugins, middleware, validation rules, and routes
+    /// on the production builder instead of duplicating them in test setup.
+    pub fn from_builder(builder: AppBuilder) -> TestAppBuilder {
+        TestAppBuilder { inner: builder }
     }
 
     /// Access the underlying AppContext for direct service resolution.
@@ -44,6 +50,16 @@ impl TestApp {
         }
     }
 
+    /// Gracefully stop managed background tasks and registered plugins.
+    ///
+    /// Call this at the end of tests that register plugins or start framework-managed
+    /// workers so their shutdown hooks complete before the test runtime exits.
+    pub async fn shutdown(self) -> Result<()> {
+        let Self { app, router } = self;
+        drop(router);
+        app.shutdown_runtime().await
+    }
+
     /// Seed a presence member into the Redis-backed presence set for testing.
     ///
     /// Only available in tests — reaches into the framework's internal presence
@@ -56,9 +72,11 @@ impl TestApp {
         joined_at: i64,
     ) -> crate::foundation::Result<()> {
         let backend = crate::support::runtime::RuntimeBackend::from_config(self.app.config())?;
-        let key = crate::websocket::presence_key(channel);
-        let member = crate::websocket::presence_member_value(actor_id, channel, joined_at);
-        backend.sadd(&key, &member).await
+        let aggregate_key = crate::websocket::presence_key(channel);
+        let scope_key = crate::websocket::presence_scope_key(channel, None);
+        let member = crate::websocket::presence_member_value(actor_id, channel, None, joined_at);
+        backend.sadd(&aggregate_key, &member).await?;
+        backend.sadd(&scope_key, &member).await
     }
 
     /// Read the remaining TTL (seconds) on the replay history list for a channel.
@@ -73,7 +91,7 @@ impl TestApp {
     }
 }
 
-/// Builder for TestApp.
+/// Builder for [`TestApp`].
 pub struct TestAppBuilder {
     inner: AppBuilder,
 }

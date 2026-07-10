@@ -7,6 +7,8 @@ Multi-channel notifications: email, database, broadcast
 ## foundry::notifications
 
 ```rust
+pub const NOTIFICATION_BROADCAST_CHANNEL: ChannelId;
+pub const NOTIFICATION_BROADCAST_EVENT: ChannelEventId;
 pub const NOTIFY_BROADCAST: NotificationChannelId;
 pub const NOTIFY_DATABASE: NotificationChannelId;
 pub const NOTIFY_EMAIL: NotificationChannelId;
@@ -28,8 +30,8 @@ trait Notification
   fn to_channel(
 trait NotificationChannel
   fn send<'life0, 'life1, 'life2, 'life3, 'async_trait>(
-fn build_notification_job( notifiable: &dyn Notifiable, notification: &dyn Notification, ) -> SendNotificationJob
+fn build_notification_job( notifiable: &dyn Notifiable, notification: &dyn Notification, ) -> Result<SendNotificationJob>
 async fn notify( app: &AppContext, notifiable: &dyn Notifiable, notification: &dyn Notification, ) -> Result<()>
 async fn notify_queued( app: &AppContext, notifiable: &dyn Notifiable, notification: &dyn Notification, ) -> Result<()>
+fn register_notification_websocket_channel<G>( registrar: &mut WebSocketRegistrar, guard: G, ) -> Result<()>
 ```
-

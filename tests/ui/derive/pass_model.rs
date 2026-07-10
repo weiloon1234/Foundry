@@ -70,6 +70,9 @@ impl User {
 fn main() {
     let _ = User::ID;
     let _ = User::EMAIL;
+    let _ = User::EMAIL.ilike("%@example.com");
+    let _ = User::NICKNAME.like("foundry%");
+    let _ = User::update().set_null(User::NICKNAME);
     let _ = User::table_meta();
     let _ = User::create();
     let user = User {

@@ -224,6 +224,30 @@ mod validate_derive {
         pub website: Option<String>,
     }
 
+    #[derive(Debug, Deserialize, Validate)]
+    pub struct RequiredOptionalProfile {
+        #[validate(required, email)]
+        pub email: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, Validate)]
+    pub struct TypedScalarInput {
+        #[validate(integer, min_numeric(18), max_numeric(120))]
+        pub age: i32,
+        #[validate(min_numeric(0))]
+        pub score: Option<i64>,
+        #[validate(in_list("true"))]
+        pub enabled: bool,
+    }
+
+    #[derive(Debug, Deserialize, Validate)]
+    pub struct TypedCollectionInput {
+        #[validate(required, each(integer, min_numeric(0)))]
+        pub scores: Vec<i32>,
+        #[validate(each(integer, min_numeric(0)))]
+        pub adjustments: Option<Vec<i32>>,
+    }
+
     #[tokio::test]
     async fn derive_option_none_passes() {
         let app = test_app();
@@ -259,6 +283,136 @@ mod validate_derive {
         input.validate(&mut validator).await.unwrap();
         let errors = validator.finish().unwrap_err();
         assert_eq!(errors.errors[0].code, "email");
+    }
+
+    #[tokio::test]
+    async fn derive_required_option_none_fails_required() {
+        let app = test_app();
+        let input = RequiredOptionalProfile { email: None };
+        let mut validator = Validator::new(app);
+
+        input.validate(&mut validator).await.unwrap();
+
+        let errors = validator.finish().unwrap_err();
+        assert_eq!(errors.errors.len(), 1);
+        assert_eq!(errors.errors[0].field, "email");
+        assert_eq!(errors.errors[0].code, "required");
+    }
+
+    #[tokio::test]
+    async fn derive_typed_scalars_validate_through_string_rules() {
+        let app = test_app();
+        let valid = TypedScalarInput {
+            age: 42,
+            score: None,
+            enabled: true,
+        };
+        let mut validator = Validator::new(app.clone());
+        valid.validate(&mut validator).await.unwrap();
+        assert!(validator.finish().is_ok());
+
+        let invalid = TypedScalarInput {
+            age: 17,
+            score: Some(-1),
+            enabled: false,
+        };
+        let mut validator = Validator::new(app);
+        invalid.validate(&mut validator).await.unwrap();
+        let errors = validator.finish().unwrap_err();
+
+        assert!(errors
+            .errors
+            .iter()
+            .any(|error| error.field == "age" && error.code == "min_numeric"));
+        assert!(errors
+            .errors
+            .iter()
+            .any(|error| error.field == "score" && error.code == "min_numeric"));
+        assert!(errors
+            .errors
+            .iter()
+            .any(|error| error.field == "enabled" && error.code == "in_list"));
+    }
+
+    #[tokio::test]
+    async fn derive_each_supports_typed_and_optional_vectors() {
+        let app = test_app();
+        let valid = TypedCollectionInput {
+            scores: vec![0, 10],
+            adjustments: None,
+        };
+        let mut validator = Validator::new(app.clone());
+        valid.validate(&mut validator).await.unwrap();
+        assert!(validator.finish().is_ok());
+
+        let invalid = TypedCollectionInput {
+            scores: vec![-1],
+            adjustments: Some(vec![5, -2]),
+        };
+        let mut validator = Validator::new(app);
+        invalid.validate(&mut validator).await.unwrap();
+        let errors = validator.finish().unwrap_err();
+
+        assert!(errors
+            .errors
+            .iter()
+            .any(|error| error.field == "scores[0]" && error.code == "min_numeric"));
+        assert!(errors
+            .errors
+            .iter()
+            .any(|error| error.field == "adjustments[1]" && error.code == "min_numeric"));
+    }
+
+    #[tokio::test]
+    async fn derive_required_collection_rejects_empty_vector_before_each() {
+        let app = test_app();
+        let input = TypedCollectionInput {
+            scores: Vec::new(),
+            adjustments: Some(Vec::new()),
+        };
+        let mut validator = Validator::new(app);
+
+        input.validate(&mut validator).await.unwrap();
+
+        let errors = validator.finish().unwrap_err();
+        assert_eq!(errors.errors.len(), 1);
+        assert_eq!(errors.errors[0].field, "scores");
+        assert_eq!(errors.errors[0].code, "required");
+    }
+
+    #[test]
+    fn derive_option_rules_export_the_same_nullable_semantics() {
+        let required_schema = foundry::inventory::iter::<foundry::typescript::TsValidation>
+            .into_iter()
+            .find(|registration| registration.name == "RequiredOptionalProfile")
+            .map(|registration| (registration.schema_fn)())
+            .expect("RequiredOptionalProfile validation schema should be registered");
+        let required_email = required_schema
+            .fields
+            .iter()
+            .find(|field| field.name == "email")
+            .unwrap();
+        assert!(required_email
+            .rules
+            .iter()
+            .any(|rule| rule.code == "required"));
+        assert!(!required_email
+            .rules
+            .iter()
+            .any(|rule| rule.code == "nullable"));
+
+        let optional_schema = foundry::inventory::iter::<foundry::typescript::TsValidation>
+            .into_iter()
+            .find(|registration| registration.name == "TypedCollectionInput")
+            .map(|registration| (registration.schema_fn)())
+            .expect("TypedCollectionInput validation schema should be registered");
+        let adjustments = optional_schema
+            .fields
+            .iter()
+            .find(|field| field.name == "adjustments")
+            .unwrap();
+        assert!(adjustments.rules.iter().any(|rule| rule.code == "nullable"));
+        assert!(adjustments.rules.iter().any(|rule| rule.code == "each"));
     }
 
     // --- Nullable and bail ---
@@ -450,6 +604,12 @@ mod file_validation {
         pub avatar: Option<foundry::storage::UploadedFile>,
     }
 
+    #[derive(Debug, Deserialize, Validate)]
+    pub struct RequiredAvatarUpload {
+        #[validate(required, image)]
+        pub avatar: Option<foundry::storage::UploadedFile>,
+    }
+
     fn make_uploaded_file(
         content: &[u8],
         name: &str,
@@ -546,6 +706,20 @@ mod file_validation {
         let mut validator = Validator::new(app);
         input.validate(&mut validator).await.unwrap();
         assert!(validator.finish().is_ok());
+    }
+
+    #[tokio::test]
+    async fn derive_required_optional_file_rejects_none() {
+        let app = test_app();
+        let input = RequiredAvatarUpload { avatar: None };
+        let mut validator = Validator::new(app);
+
+        input.validate(&mut validator).await.unwrap();
+
+        let errors = validator.finish().unwrap_err();
+        assert_eq!(errors.errors.len(), 1);
+        assert_eq!(errors.errors[0].field, "avatar");
+        assert_eq!(errors.errors[0].code, "required");
     }
 
     // --- Struct with small max_file_size for size rejection test ---

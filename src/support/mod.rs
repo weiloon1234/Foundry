@@ -30,9 +30,9 @@ pub use token::Token;
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pub use identifiers::{
-    ChannelEventId, ChannelId, CommandId, EventId, GuardId, JobId, MigrationId, ModelId,
-    NotificationChannelId, PermissionId, PluginAssetId, PluginId, PluginScaffoldId, PolicyId,
-    ProbeId, QueueId, RoleId, RouteId, ScheduleId, SeederId, ValidationRuleId,
+    ChannelEventId, ChannelId, CommandId, EventId, GuardId, JobId, MiddlewareGroupId, MigrationId,
+    ModelId, NotificationChannelId, PermissionId, PluginAssetId, PluginId, PluginScaffoldId,
+    PolicyId, ProbeId, QueueId, RoleId, RouteId, ScheduleId, SeederId, ValidationRuleId,
 };
 
 pub fn boxed<F, T>(future: F) -> BoxFuture<T>

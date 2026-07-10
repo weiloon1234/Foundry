@@ -40,7 +40,12 @@ pub enum SettingType {
     Image,
     /// JSON editor for structured data.
     Json,
-    /// Password field (masked input).
+    /// Password-style masked input.
+    ///
+    /// This controls presentation only; the generic settings table stores JSON
+    /// and does not encrypt this value. Do not use it for credentials or other
+    /// secrets. Store those in the deployment secret manager or encrypt them
+    /// explicitly with [`crate::support::CryptManager`].
     Password,
     /// Code editor. Parameters: `language` (e.g., `"css"`, `"html"`, `"javascript"`).
     Code,
@@ -196,13 +201,17 @@ impl Setting {
     }
 
     /// Get a setting as a typed value via serde deserialization.
-    /// Returns `None` if the key doesn't exist or deserialization fails.
+    ///
+    /// Returns `None` only when the key does not exist. A stored value that does
+    /// not match `T` is returned as an error so configuration drift is visible.
     pub async fn get_as<T: serde::de::DeserializeOwned>(
         app: &AppContext,
         key: &str,
     ) -> Result<Option<T>> {
         match Self::get(app, key).await? {
-            Some(value) => Ok(serde_json::from_value(value).ok()),
+            Some(value) => serde_json::from_value(value)
+                .map(Some)
+                .map_err(crate::foundation::Error::other),
             None => Ok(None),
         }
     }

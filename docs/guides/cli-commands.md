@@ -336,6 +336,10 @@ guarded by `storage.attachment_orphan_delete_enabled = true`; the default is aud
 current planned generated files (`index.md`, `root.md`, and `modules/*.md`), so colocated notes or
 manual docs are preserved.
 
+Generated-output commands reject symlinked descendants before creating directories, writing files,
+or removing manifest-owned files. A caller-selected output root may itself be a symlink, so linked
+workspace and split-repository layouts remain supported.
+
 ---
 
 ## Command ID Naming Convention

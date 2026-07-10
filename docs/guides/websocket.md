@@ -47,8 +47,11 @@ Clients connect to `ws://host:3010/ws` and subscribe to channels by sending:
 ### Basic Channel
 
 ```rust
-r.channel(ChannelId::new("notifications"), NotificationHandler)?;
+r.channel(ChannelId::new("chat"), ChatHandler)?;
 ```
+
+For per-user notification broadcasts, use `register_notification_websocket_channel` rather than a
+public basic channel; it enforces guard and room ownership checks.
 
 ### Channel with Options
 
@@ -141,8 +144,8 @@ let user = ctx.resolve_actor::<User>().await?;
 ctx.publish(EVENT_ID, json!({ "data": "value" })).await?;
 
 // Presence
-let members = ctx.presence_members().await?;  // Vec<PresenceInfo>
-let count = ctx.presence_count().await?;      // usize
+let members = ctx.presence_members().await?;  // current channel + room
+let count = ctx.presence_count().await?;      // current channel + room
 ```
 
 ---
@@ -198,7 +201,7 @@ Query in handler:
 async fn handle(&self, ctx: WebSocketContext, _payload: Value) -> Result<()> {
     let members = ctx.presence_members().await?;
     for member in &members {
-        // member.actor_id, member.channel, member.joined_at
+        // member.actor_id, member.channel, member.room, member.joined_at
     }
 
     let online_count = ctx.presence_count().await?;
@@ -362,10 +365,13 @@ port = 3010
 path = "/ws"
 heartbeat_interval_seconds = 30       # server pings client
 heartbeat_timeout_seconds = 10        # disconnect if no pong
+auth_revalidation_interval_seconds = 30 # max cached credential age; minimum 1 second
 max_message_size_bytes = 1048576      # inbound message cap; 0 uses transport default
 max_frame_size_bytes = 1048576        # inbound frame cap; 0 uses transport default
 max_write_buffer_size_bytes = 1048576 # socket write buffer cap; 0 uses transport default
 max_messages_per_second = 50          # per-connection flood protection
+max_connections_global = 10000        # process-wide connections; 0 = unlimited
+max_connections_per_ip = 100          # anonymous connections per resolved IP; 0 = unlimited
 max_connections_per_user = 5          # multi-device limit
 max_subscriptions_per_connection = 100 # active subscriptions per connection; 0 = unlimited
 max_channel_length = 128              # client-supplied channel id bytes
@@ -381,7 +387,7 @@ history_buffer_size = 50              # recent messages retained per channel
 history_ttl_seconds = 604800          # auto-reap idle history after 7 days
 ```
 
-If `allowed_origins` is empty, Foundry allows same-origin browser handshakes in production/staging and remains permissive outside production-like environments. If `allowed_origins` is non-empty, browser handshakes must include an `Origin` header that exactly matches one configured value. Use this with session-cookie authentication to prevent cross-site WebSocket handshakes.
+If `allowed_origins` is empty, Foundry allows same-origin browser handshakes in production/staging and remains permissive outside production-like environments. Same-origin checks compare scheme, host, and effective port (`80` for HTTP and `443` for HTTPS). Forwarded host and protocol headers are used only when the TCP peer matches `[http.trusted_proxy]`; configure that trust when TLS terminates at a reverse proxy. Handshakes without an `Origin` header remain available for non-browser clients. If `allowed_origins` is non-empty, browser handshakes must include an `Origin` header that exactly matches one configured value. Use this with session-cookie authentication to prevent cross-site WebSocket handshakes.
 
 Foundry accepts bearer tokens in the query string by default because browser
 WebSocket clients cannot set custom `Authorization` headers. The decoded token
@@ -393,6 +399,18 @@ proxies and hosting platforms may log full URLs.
 WebSocket client IP metadata follows the HTTP trusted-proxy config. Forwarded
 IP headers are honored only when `[http.trusted_proxy]` is enabled and the TCP
 peer matches a trusted CIDR; otherwise Foundry uses the socket peer IP.
+
+Connection admission is reserved before the WebSocket upgrade. The global cap
+protects process capacity, while the per-IP cap limits anonymous sockets using
+the resolved client IP. Once a connection authenticates, it leaves the IP
+bucket and is limited by the typed `(guard, actor ID)` user bucket, so identical
+actor IDs in different guards do not collide.
+
+Guarded connections revalidate bearer tokens and sessions at most every
+`auth_revalidation_interval_seconds`. Revoked or expired credentials close the
+socket before later protected broadcasts are delivered, and refreshed actors
+replace cached roles and permissions. These background checks never extend a
+sliding session TTL; only ordinary authenticated activity does.
 
 ---
 

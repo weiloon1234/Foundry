@@ -57,6 +57,12 @@ The configured `typescript.output_dir` is the supported frontend import path. `t
 tracks Foundry-owned output in `.foundry-types-manifest.json` and cleans only those generated files on
 later runs, so colocated manual `.ts` files are not deleted. If you see raw ts-rs files in a root
 `bindings/` directory, treat them as manual or stale output rather than a second source of truth.
+Foundry rejects symlinked files or directories beneath the selected output root before cleanup or
+generation. The selected root itself may be a symlink, which supports linked frontend workspaces.
+Before changing any generated file, Foundry also verifies that every DTO, AppEnum, framework
+runtime, route helper, and SDK action owns a distinct output path. Exact and ASCII case-only path
+collisions fail with both owners named, so custom `#[ts(export_to = "...")]` paths cannot silently
+overwrite another generated module on case-sensitive or case-insensitive filesystems.
 
 ---
 

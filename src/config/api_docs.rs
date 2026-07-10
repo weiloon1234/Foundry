@@ -7,10 +7,13 @@ use std::{fs, process::Command};
 use regex::Regex;
 
 use crate::cli::CommandRegistrar;
-use crate::config::api_docs_metadata::{append_module_notes, module_description};
+use crate::config::api_docs_metadata::{
+    append_module_notes, ensure_single_trailing_newline, module_description,
+};
 use crate::foundation::Error;
 use crate::support::generated_manifest::{
-    clean_manifest_files, safe_manifest_path_with_extension, write_generated_file, write_manifest,
+    clean_manifest_files, create_generated_dir_all, safe_manifest_path_with_extension,
+    write_generated_file, write_manifest,
 };
 use crate::support::CommandId;
 
@@ -73,8 +76,7 @@ fn generate_api_docs(output_dir: &str) -> Result<(), Error> {
 
     // Prepare output directories
     let out = PathBuf::from(output_dir);
-    let modules_dir = out.join("modules");
-    fs::create_dir_all(&modules_dir).map_err(Error::other)?;
+    create_generated_dir_all(&out, Path::new("modules"))?;
     let planned_files = planned_api_doc_files(&groups);
     clean_api_docs_manifest_files(&out, &planned_files)?;
 
@@ -105,7 +107,7 @@ fn generate_api_docs(output_dir: &str) -> Result<(), Error> {
 
         let lines = content.lines().count();
         let file = "root.md";
-        write_generated_file(&out.join(file), &content)?;
+        write_generated_file(&out, Path::new(file), &content)?;
         output_files.insert(file.to_string());
         index_entries.push((
             "root".into(),
@@ -151,9 +153,10 @@ fn generate_api_docs(output_dir: &str) -> Result<(), Error> {
 
         if has_content {
             append_module_notes(group_key, &mut content);
+            ensure_single_trailing_newline(&mut content);
             let lines = content.lines().count();
             let file = format!("modules/{group_key}.md");
-            write_generated_file(&out.join(&file), &content)?;
+            write_generated_file(&out, Path::new(&file), &content)?;
             output_files.insert(file);
             index_entries.push((group_key.to_string(), desc, lines));
         }
@@ -213,7 +216,7 @@ fn generate_api_docs(output_dir: &str) -> Result<(), Error> {
     )
     .unwrap();
 
-    write_generated_file(&out.join("index.md"), &index)?;
+    write_generated_file(&out, Path::new("index.md"), &index)?;
     output_files.insert("index.md".to_string());
     write_manifest(&out, API_DOCS_MANIFEST, &output_files)?;
 
@@ -954,6 +957,28 @@ mod tests {
         assert!(!modules_dir.join("old.md").exists());
         assert!(dir.path().join("manual.md").exists());
         assert!(modules_dir.join("manual.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_docs_cleanup_refuses_symlinked_modules_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("old.md");
+        fs::write(&outside_file, "outside").unwrap();
+        symlink(outside.path(), dir.path().join("modules")).unwrap();
+        fs::write(
+            dir.path().join(API_DOCS_MANIFEST),
+            serde_json::to_string(&vec!["modules/old.md"]).unwrap(),
+        )
+        .unwrap();
+
+        let error = clean_api_docs_manifest_files(dir.path(), &BTreeSet::new()).unwrap_err();
+
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(fs::read_to_string(outside_file).unwrap(), "outside");
     }
 
     #[test]

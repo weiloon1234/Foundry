@@ -194,6 +194,66 @@ async fn session_check(actor: CurrentActor) -> impl IntoResponse {
     }))
 }
 
+async fn public_status() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+fn grouped_typed_routes(registrar: &mut HttpRegistrar) -> Result<()> {
+    registrar.group_with_options(
+        "/typed",
+        HttpRouteOptions::new()
+            .guard(app::ids::AuthGuard::Admin)
+            .permission(app::ids::Ability::ReportsView),
+        |routes| {
+            routes.get(RouteId::new("typed.reports"), "/reports", reports, |_| {});
+            routes.get(
+                RouteId::new("typed.public"),
+                "/public",
+                public_status,
+                |route| {
+                    route.public();
+                },
+            );
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn typed_routes_in_guarded_groups_enforce_defaults_and_allow_explicit_public_routes() {
+    let app = TestApp::builder()
+        .register_provider(app::providers::AppServiceProvider)
+        .register_routes(grouped_typed_routes)
+        .build()
+        .await
+        .unwrap();
+
+    let unauthorized = app.client().get("/typed/reports").send().await.unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let forbidden = app
+        .client()
+        .get("/typed/reports")
+        .bearer_auth("guest-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let allowed = app
+        .client()
+        .get("/typed/reports")
+        .bearer_auth("ops-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+
+    let public = app.client().get("/typed/public").send().await.unwrap();
+    assert_eq!(public.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn http_route_authorizer_runs_after_permissions_and_can_return_forbidden() {
     let counter = Arc::new(AtomicUsize::new(0));

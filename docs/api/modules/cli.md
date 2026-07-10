@@ -16,4 +16,3 @@ struct CommandRegistry
   fn command<I, F, Fut>( &mut self, id: I, command: Command, handler: F, ) -> Result<&mut Self>
 struct RegisteredCommand
 ```
-

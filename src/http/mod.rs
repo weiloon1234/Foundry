@@ -18,11 +18,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::MethodRouter;
 use axum::Router;
 
-use crate::auth::{token::actor_has_mfa_pending, AccessScope, Actor, AuthError, Authenticatable};
+use crate::auth::{
+    token::{actor_has_mfa_pending, mfa_pending_auth_error},
+    AccessScope, Actor, AuthError, Authenticatable,
+};
 use crate::foundation::{AppContext, Error, Result};
 use crate::http::middleware::MiddlewareConfig;
 use crate::logging::{catch_future_panic, catch_sync_panic, panic_payload_message, AuthOutcome};
-use crate::support::{GuardId, PermissionId, RouteId};
+use crate::support::{GuardId, MiddlewareGroupId, PermissionId, RouteId};
 pub use crate::validation::{JsonValidated, Validated};
 
 pub type RouteRegistrar = Arc<dyn Fn(&mut HttpRegistrar) -> Result<()> + Send + Sync>;
@@ -41,8 +44,37 @@ pub(crate) fn build_registrar(registrars: &[RouteRegistrar]) -> Result<HttpRegis
     Ok(registrar)
 }
 
-pub(crate) fn collect_named_routes(registrars: &[RouteRegistrar]) -> Result<routes::RouteRegistry> {
-    Ok(build_registrar(registrars)?.named_routes)
+pub(crate) struct PreparedHttpRoutes {
+    registrar: HttpRegistrar,
+    manifest: Vec<RouteManifestEntry>,
+}
+
+impl PreparedHttpRoutes {
+    pub(crate) fn from_registrars(registrars: &[RouteRegistrar]) -> Result<Self> {
+        let registrar = build_registrar(registrars)?;
+        let manifest = registrar.collect_route_manifest()?;
+        Ok(Self {
+            registrar,
+            manifest,
+        })
+    }
+
+    pub(crate) fn registrar(&self) -> HttpRegistrar {
+        HttpRegistrar {
+            registrations: self.registrar.registrations.clone(),
+            named_routes: self.registrar.named_routes.clone(),
+            default_route_options: self.registrar.default_route_options.clone(),
+            registration_error: None,
+        }
+    }
+
+    pub(crate) fn named_routes(&self) -> &routes::RouteRegistry {
+        &self.registrar.named_routes
+    }
+
+    pub(crate) fn manifest(&self) -> &[RouteManifestEntry] {
+        &self.manifest
+    }
 }
 
 fn run_route_registrar(registrar: &RouteRegistrar, routes: &mut HttpRegistrar) -> Result<()> {
@@ -88,6 +120,7 @@ pub struct RouteManifestEntry {
     pub permissions: Vec<PermissionId>,
     pub summary: Option<String>,
     pub request: Option<&'static str>,
+    pub(crate) request_schema_json: Option<serde_json::Value>,
     pub responses: Vec<RouteManifestResponse>,
 }
 
@@ -134,7 +167,7 @@ impl HttpAuthorizeContext {
 pub struct HttpRouteOptions {
     pub access: AccessScope,
     middlewares: Vec<MiddlewareConfig>,
-    middleware_group_name: Option<String>,
+    middleware_group_id: Option<MiddlewareGroupId>,
     pub(crate) authorize: Option<HttpAuthorizeCallback>,
     pub(crate) post_auth_rate_limit: Option<middleware::RateLimit>,
     pub(crate) allow_mfa_pending_token: bool,
@@ -148,7 +181,7 @@ impl Default for HttpRouteOptions {
         Self {
             access: AccessScope::default(),
             middlewares: Vec::new(),
-            middleware_group_name: None,
+            middleware_group_id: None,
             authorize: None,
             post_auth_rate_limit: None,
             allow_mfa_pending_token: false,
@@ -247,8 +280,11 @@ impl HttpRouteOptions {
     ///
     /// The group must have been registered via `AppBuilder::middleware_group()`.
     /// Group middlewares are prepended before any per-route middlewares.
-    pub fn middleware_group(mut self, name: impl Into<String>) -> Self {
-        self.middleware_group_name = Some(name.into());
+    pub fn middleware_group<I>(mut self, id: I) -> Self
+    where
+        I: Into<MiddlewareGroupId>,
+    {
+        self.middleware_group_id = Some(id.into());
         self
     }
 
@@ -340,8 +376,8 @@ impl HttpRouteOptions {
         middlewares.extend(self.middlewares);
         self.middlewares = middlewares;
 
-        if self.middleware_group_name.is_none() {
-            self.middleware_group_name = defaults.middleware_group_name.clone();
+        if self.middleware_group_id.is_none() {
+            self.middleware_group_id = defaults.middleware_group_id.clone();
         }
         if self.authorize.is_none() {
             self.authorize = defaults.authorize.clone();
@@ -442,6 +478,7 @@ impl HttpResourceRoutes {
     }
 }
 
+#[derive(Clone)]
 struct RouteRegistration {
     name: Option<RouteId>,
     path: String,
@@ -451,6 +488,7 @@ struct RouteRegistration {
     inherit_parent_defaults_on_merge: bool,
 }
 
+#[derive(Clone)]
 enum HttpRegistration {
     Route(Box<RouteRegistration>),
     Nest { path: String, router: HttpRouter },
@@ -577,8 +615,11 @@ impl<'a> HttpScope<'a> {
         self
     }
 
-    pub fn middleware_group(&mut self, name: impl Into<String>) -> &mut Self {
-        self.state.options.middleware_group_name = Some(name.into());
+    pub fn middleware_group<I>(&mut self, id: I) -> &mut Self
+    where
+        I: Into<MiddlewareGroupId>,
+    {
+        self.state.options.middleware_group_id = Some(id.into());
         self
     }
 
@@ -739,8 +780,8 @@ pub struct HttpRouteBuilder {
 }
 
 impl HttpRouteBuilder {
-    fn root(method: &str) -> Self {
-        let mut options = HttpRouteOptions::default();
+    fn from_defaults(defaults: &HttpRouteOptions, method: &str) -> Self {
+        let mut options = defaults.clone();
         mutate_doc(&mut options, |doc| doc.method(method));
 
         Self {
@@ -750,13 +791,7 @@ impl HttpRouteBuilder {
     }
 
     fn from_scope(scope: &ResolvedHttpScopeState, method: &str) -> Self {
-        let mut options = scope.options.clone();
-        mutate_doc(&mut options, |doc| doc.method(method));
-
-        Self {
-            options,
-            explicit_tags_started: false,
-        }
+        Self::from_defaults(&scope.options, method)
     }
 
     fn finish(self) -> HttpRouteOptions {
@@ -808,8 +843,11 @@ impl HttpRouteBuilder {
         self
     }
 
-    pub fn middleware_group(&mut self, name: impl Into<String>) -> &mut Self {
-        self.options.middleware_group_name = Some(name.into());
+    pub fn middleware_group<I>(&mut self, id: I) -> &mut Self
+    where
+        I: Into<MiddlewareGroupId>,
+    {
+        self.options.middleware_group_id = Some(id.into());
         self
     }
 
@@ -1162,7 +1200,7 @@ impl HttpRegistrar {
     where
         I: Into<RouteId>,
     {
-        let mut route = HttpRouteBuilder::root(method);
+        let mut route = HttpRouteBuilder::from_defaults(&self.default_route_options, method);
         if let Err(error) =
             run_http_registration_callback("http route configure callback", &mut route, |route| {
                 configure(route);
@@ -1384,7 +1422,7 @@ impl HttpRegistrar {
         docs
     }
 
-    pub fn into_router(self, app: AppContext) -> Router {
+    pub fn into_router(self, app: AppContext) -> Result<Router> {
         self.into_router_with_middlewares(app, Vec::new())
     }
 
@@ -1392,7 +1430,29 @@ impl HttpRegistrar {
         self,
         app: AppContext,
         middlewares: Vec<middleware::MiddlewareConfig>,
-    ) -> Router {
+    ) -> Result<Router> {
+        let referenced_group_ids = self
+            .registrations
+            .iter()
+            .filter_map(|registration| match registration {
+                HttpRegistration::Route(route) => route.options.middleware_group_id.as_ref(),
+                HttpRegistration::Nest { .. } | HttpRegistration::Merge { .. } => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let middleware_groups = if referenced_group_ids.is_empty() {
+            None
+        } else {
+            let groups = app.resolve::<middleware::MiddlewareGroups>()?;
+            for id in referenced_group_ids {
+                if groups.get(id).is_none() {
+                    return Err(Error::message(format!(
+                        "middleware group `{id}` is not registered"
+                    )));
+                }
+            }
+            Some(groups)
+        };
+
         let mut router = Router::<AppContext>::new();
 
         for registration in self.registrations {
@@ -1407,12 +1467,16 @@ impl HttpRegistrar {
                     let audit_area = options.resolved_audit_area().map(ToOwned::to_owned);
                     let mut route_middlewares = Vec::new();
                     // Expand middleware group if specified
-                    if let Some(ref group_name) = options.middleware_group_name {
-                        if let Ok(groups) = app.resolve::<middleware::MiddlewareGroups>() {
-                            if let Some(group_mws) = groups.get(group_name) {
-                                route_middlewares.extend(group_mws.clone());
-                            }
-                        }
+                    if let Some(ref group_id) = options.middleware_group_id {
+                        let group_mws = middleware_groups
+                            .as_ref()
+                            .and_then(|groups| groups.get(group_id))
+                            .ok_or_else(|| {
+                                Error::message(format!(
+                                    "middleware group `{group_id}` is not registered"
+                                ))
+                            })?;
+                        route_middlewares.extend(group_mws.clone());
                     }
                     route_middlewares.extend(options.middlewares.clone());
                     if !options.requires_auth() {
@@ -1492,12 +1556,12 @@ impl HttpRegistrar {
         // Apply user-registered middleware (CORS, security headers, rate limit, etc.)
         router = middleware::apply_ordered_middlewares(router, middlewares, &app);
 
-        router
+        Ok(router
             .layer(axum_middleware::from_fn_with_state(
                 app.clone(),
                 crate::logging::request_context_middleware,
             ))
-            .with_state(app)
+            .with_state(app))
     }
 
     fn route_named_resolved(
@@ -1612,6 +1676,8 @@ impl HttpRegistrar {
                 permissions: route.options.permissions_set().into_iter().collect(),
                 summary: doc.and_then(|doc| doc.summary.clone()),
                 request: doc.and_then(|doc| doc.request.as_ref().map(|schema| schema.name)),
+                request_schema_json: doc
+                    .and_then(|doc| doc.request.as_ref().map(|schema| (schema.schema_fn)())),
                 responses,
             });
         }
@@ -1708,8 +1774,7 @@ async fn http_auth_middleware(
 
     if actor_has_mfa_pending(&actor) && !state.options.allow_mfa_pending_token {
         record_auth_outcome(&state.app, AuthOutcome::Forbidden);
-        return AuthError::forbidden("Multi-factor authentication verification is required.")
-            .into_response();
+        return mfa_pending_auth_error().into_response();
     }
 
     let permissions = state.options.permissions_set();
@@ -1886,9 +1951,12 @@ mod tests {
     use crate::auth::Actor;
     use crate::config::ConfigRepository;
     use crate::foundation::{AppContext, Container};
-    use crate::http::middleware::{RateLimit, RateLimitWindow};
-    use crate::support::{GuardId, PermissionId, RouteId};
+    use crate::http::middleware::{MiddlewareGroups, RateLimit, RateLimitWindow};
+    use crate::support::{GuardId, MiddlewareGroupId, PermissionId, RouteId};
     use crate::validation::RuleRegistry;
+
+    const API_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("api");
+    const MISSING_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("missing");
 
     async fn ok() -> &'static str {
         "ok"
@@ -2055,6 +2123,47 @@ mod tests {
             .expect("route docs should be present");
         assert_eq!(doc.tags, vec!["users".to_string()]);
         assert_eq!(doc.summary.as_deref(), Some("List users"));
+    }
+
+    #[test]
+    fn group_with_options_applies_defaults_to_typed_routes_and_allows_public_override() {
+        let mut registrar = HttpRegistrar::new();
+        registrar
+            .group_with_options(
+                "/api",
+                HttpRouteOptions::new()
+                    .guard(GuardId::new("api"))
+                    .permission(PermissionId::new("users:view"))
+                    .tag("users"),
+                |routes| {
+                    routes.get(RouteId::new("users.index"), "/users", ok, |_| {});
+                    routes.get(RouteId::new("users.login"), "/login", ok, |route| {
+                        route.public();
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        let users = route_by_path(&registrar, "/api/users");
+        assert_eq!(users.options.guard_id(), Some(&GuardId::new("api")));
+        assert_eq!(
+            users.options.permissions_set(),
+            BTreeSet::from([PermissionId::new("users:view")])
+        );
+        assert_eq!(
+            users.options.doc.as_ref().expect("docs should exist").tags,
+            vec!["users".to_string()]
+        );
+
+        let login = route_by_path(&registrar, "/api/login");
+        assert!(!login.options.requires_auth());
+        assert!(login.options.guard_id().is_none());
+        assert!(login.options.permissions_set().is_empty());
+        assert_eq!(
+            login.options.doc.as_ref().expect("docs should exist").tags,
+            vec!["users".to_string()]
+        );
     }
 
     #[test]
@@ -2332,6 +2441,34 @@ mod tests {
     }
 
     #[test]
+    fn router_rejects_unregistered_middleware_group() {
+        let app = AppContext::new(
+            Container::new(),
+            ConfigRepository::empty(),
+            RuleRegistry::new(),
+        )
+        .unwrap();
+        app.container()
+            .singleton(MiddlewareGroups::default())
+            .unwrap();
+        let mut registrar = HttpRegistrar::new();
+        registrar.route_with_options(
+            "/admin",
+            get(ok),
+            HttpRouteOptions::new().middleware_group(MISSING_MIDDLEWARE),
+        );
+
+        let error = registrar
+            .into_router(app)
+            .expect_err("an unknown middleware group should fail router construction");
+
+        assert_eq!(
+            error.to_string(),
+            "middleware group `missing` is not registered"
+        );
+    }
+
+    #[test]
     fn scope_inherits_defaults_across_nested_scopes() {
         let mut registrar = HttpRegistrar::new();
         registrar
@@ -2341,7 +2478,7 @@ mod tests {
                     .guard(GuardId::new("admin"))
                     .audit_area("admin")
                     .permission(PermissionId::new("users.view"))
-                    .middleware_group("api")
+                    .middleware_group(API_MIDDLEWARE)
                     .rate_limit(RateLimit::new(60).per_minute().by_actor())
                     .tag("admin:users")
                     .summary("Admin users")
@@ -2372,7 +2509,10 @@ mod tests {
             route.options.permissions_set(),
             BTreeSet::from([PermissionId::new("users.view")])
         );
-        assert_eq!(route.options.middleware_group_name.as_deref(), Some("api"));
+        assert_eq!(
+            route.options.middleware_group_id.as_ref(),
+            Some(&API_MIDDLEWARE)
+        );
         assert_eq!(rate_limit.max(), 60);
         assert!(matches!(rate_limit.window(), RateLimitWindow::Minute));
         assert_eq!(doc.method.as_deref(), Some("get"));

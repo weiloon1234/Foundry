@@ -62,9 +62,12 @@ double-underscore names, for example `DATABASE__URL`.
 
 ### HTTP-Specific
 
+Define reusable middleware groups with a semantic constant, for example
+`const API_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("api");`.
+
 ```rust
     .register_middleware(MiddlewareConfig::from(Compression))
-    .middleware_group("api", vec![...])
+    .middleware_group(API_MIDDLEWARE, vec![...])
     .enable_observability()                  // guarded health, diagnostics, and OpenAPI
     .serve_spa("frontend/dist")              // SPA fallback for client-side routing
 ```

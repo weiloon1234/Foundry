@@ -57,4 +57,3 @@ fn spawn_worker(app: AppContext) -> Result<JoinHandle<()>>
 - Job handler panics are handled as normal job failures and use the existing retry/dead-letter flow.
 - `job_history` is pruned by workers with a distributed lock; consumer apps do not need to register a cleanup scheduler.
 - `spawn_worker(app)` is managed by the app lifecycle and remains capped by `app.background_shutdown_timeout_ms`.
-

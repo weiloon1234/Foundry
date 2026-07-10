@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Expr, ExprLit, Fields, Lit, Path, Variant};
 
@@ -315,6 +315,13 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             key_override.unwrap_or(variant_snake.clone())
         };
 
+        if key_str.is_empty() {
+            return Err(syn::Error::new_spanned(
+                variant,
+                "AppEnum keys cannot be empty",
+            ));
+        }
+
         // Duplicate key check
         if !seen_keys.insert(key_str.clone()) {
             return Err(syn::Error::new_spanned(
@@ -333,6 +340,31 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             aliases,
             discriminant,
         });
+    }
+
+    // Keys and aliases share one parsing namespace. Validate after collecting
+    // every key so an alias cannot silently shadow a later variant's key.
+    let mut parse_values = variant_infos
+        .iter()
+        .map(|variant| (variant.key_str.clone(), variant.ident.to_string()))
+        .collect::<HashMap<_, _>>();
+    for (variant, info) in data.variants.iter().zip(&variant_infos) {
+        for alias in &info.aliases {
+            if alias.is_empty() {
+                return Err(syn::Error::new_spanned(
+                    variant,
+                    "AppEnum aliases cannot be empty",
+                ));
+            }
+            if let Some(existing) = parse_values.insert(alias.clone(), info.ident.to_string()) {
+                return Err(syn::Error::new_spanned(
+                    variant,
+                    format!(
+                        "AppEnum alias '{alias}' conflicts with the key or alias for variant `{existing}`"
+                    ),
+                ));
+            }
+        }
     }
 
     // Generate all impl blocks

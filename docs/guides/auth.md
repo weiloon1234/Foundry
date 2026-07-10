@@ -588,7 +588,8 @@ async fn admin_login(
 
 Pending tokens carry the reserved `auth:mfa_pending` ability. Guarded routes reject them by
 default; only routes marked with `allow_mfa_pending_token()` can accept them. The `/auth/mfa/verify`
-handler exchanges a pending token for a normal full-access token pair.
+handler exchanges a pending token for a normal full-access token pair. Pending refresh tokens are
+intentionally non-renewable: clients must complete MFA within the challenge TTL.
 
 ```toml
 [auth.mfa]

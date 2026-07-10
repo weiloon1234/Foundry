@@ -48,6 +48,36 @@ async fn test_database() -> Option<DatabaseManager> {
     )
 }
 
+#[tokio::test]
+async fn failed_session_query_resets_statement_timeout_before_pool_reuse() {
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let database = DatabaseManager::from_config(&DatabaseConfig {
+        url,
+        max_connections: 1,
+        ..DatabaseConfig::default()
+    })
+    .await
+    .unwrap();
+
+    database
+        .raw_query_with(
+            "SELECT * FROM foundry_table_that_does_not_exist",
+            &[],
+            QueryExecutionOptions::default().with_timeout(Duration::from_millis(1234)),
+        )
+        .await
+        .unwrap_err();
+
+    let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+        .fetch_one(database.pool().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(statement_timeout, "0");
+}
+
 struct TestAppRuntime {
     _dir: TempDir,
     app: AppContext,

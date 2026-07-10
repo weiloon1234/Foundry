@@ -28,17 +28,38 @@ impl DistributedLock {
     pub async fn acquire(&self, key: &str, ttl: Duration) -> Result<Option<LockGuard>> {
         validate_lock_key(key)?;
         let lock_key = format!("lock:{key}");
+        self.acquire_validated_storage_key(&lock_key, ttl).await
+    }
+
+    /// Acquire an already-namespaced runtime storage key.
+    ///
+    /// Framework subsystems use this to preserve deployed coordination keys while
+    /// sharing the same owner-token, renewal, and compare-and-delete semantics.
+    pub(crate) async fn acquire_storage_key(
+        &self,
+        lock_key: &str,
+        ttl: Duration,
+    ) -> Result<Option<LockGuard>> {
+        validate_lock_key(lock_key)?;
+        self.acquire_validated_storage_key(lock_key, ttl).await
+    }
+
+    async fn acquire_validated_storage_key(
+        &self,
+        lock_key: &str,
+        ttl: Duration,
+    ) -> Result<Option<LockGuard>> {
         let owner = uuid::Uuid::now_v7().to_string();
         let ttl_secs = ttl.as_secs().max(1);
 
         let acquired = self
             .backend
-            .set_nx_value(&lock_key, &owner, ttl_secs)
+            .set_nx_value(lock_key, &owner, ttl_secs)
             .await?;
         if acquired {
             Ok(Some(LockGuard {
                 backend: self.backend.clone(),
-                key: lock_key,
+                key: lock_key.to_string(),
                 owner,
             }))
         } else {
@@ -54,9 +75,10 @@ impl DistributedLock {
         wait_timeout: Duration,
     ) -> Result<LockGuard> {
         validate_lock_key(key)?;
+        let lock_key = format!("lock:{key}");
         let deadline = tokio::time::Instant::now() + wait_timeout;
         loop {
-            if let Some(guard) = self.acquire(key, ttl).await? {
+            if let Some(guard) = self.acquire_validated_storage_key(&lock_key, ttl).await? {
                 return Ok(guard);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -266,6 +288,21 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn storage_key_acquisition_preserves_exact_key() {
+        let backend = backend();
+        let lock = DistributedLock::new(backend.clone());
+        let guard = lock
+            .acquire_storage_key("schedule:nightly", Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(backend.key_exists("schedule:nightly").await.unwrap());
+        assert!(!backend.key_exists("lock:schedule:nightly").await.unwrap());
+        assert!(guard.release().await.unwrap());
     }
 
     #[tokio::test]

@@ -33,4 +33,3 @@ struct ImageProcessor
   fn save_as<P: AsRef<Path>>( &self, path: P, format: ImageFormat, ) -> Result<()>
   fn to_bytes(&self, format: ImageFormat) -> Result<Vec<u8>>
 ```
-

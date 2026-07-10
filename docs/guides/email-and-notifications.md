@@ -272,6 +272,11 @@ app.notify_queued(&user, &OrderShipped {
 }).await?;
 ```
 
+Immediate delivery attempts every selected channel, then returns an error containing every failed
+or unregistered channel. Queued notifications pre-render before dispatch; worker delivery errors
+are returned from the job so the normal retry and dead-letter policy applies. Keep queued channel
+adapters idempotent because retrying a multi-channel job can replay channels that already succeeded.
+
 ### Within Transactions
 
 Notifications dispatched after successful commit:
@@ -284,11 +289,14 @@ let mut tx = app.begin_transaction().await?;
 tx.notify_after_commit(&user, &OrderShipped {
     order_id: order.id.to_string(),
     tracking_number: tracking.clone(),
-});
+})?;
 
 tx.commit().await?;
 // Notification is sent only after commit succeeds
 ```
+
+`notify_after_commit` renders the queued payload immediately and returns an error if a renderer or
+routing callback fails. No after-commit job is registered in that case.
 
 ### Built-in Channels
 
@@ -297,6 +305,21 @@ tx.commit().await?;
 | Email | `NOTIFY_EMAIL` | Sends via `to_email()` using the email system |
 | Database | `NOTIFY_DATABASE` | Stores `to_database()` JSON in `notifications` table |
 | Broadcast | `NOTIFY_BROADCAST` | Publishes `to_broadcast()` JSON via WebSocket |
+
+Register the broadcast WebSocket channel with the guarded helper:
+
+```rust
+fn websocket_routes(registrar: &mut WebSocketRegistrar) -> Result<()> {
+    register_notification_websocket_channel(registrar, ids::AuthGuard::Api)?;
+    Ok(())
+}
+```
+
+Clients subscribe to `NOTIFICATION_BROADCAST_CHANNEL` with their authenticated actor ID as the
+room. The helper rejects missing or different rooms, does not accept client messages, and includes
+the `notification` event in generated realtime contracts. The value returned by
+`Notifiable::notification_id()` must match `Actor::id`; use a custom guarded channel and ownership
+authorizer when those identities intentionally differ.
 
 ### Custom Channels
 
@@ -344,3 +367,7 @@ fn to_channel(&self, channel: &str, _notifiable: &dyn Notifiable) -> Option<Valu
     }
 }
 ```
+
+For queued custom channels, Foundry serializes the routing value returned by
+`route_notification_for()` under its typed `NotificationChannelId`, alongside the rendered custom
+payload. The worker-side adapter therefore receives the same routing value as immediate delivery.

@@ -22,7 +22,6 @@ struct BoundHttpServer
   fn local_addr(&self) -> SocketAddr
   async fn serve(self) -> Result<()>
 struct HttpKernel
-  fn new( app: AppContext, routes: Vec<RouteRegistrar>, middlewares: Vec<MiddlewareConfig>, observability: Option<ObservabilityOptions>, spa_dir: Option<PathBuf>, ) -> Self
   fn app(&self) -> &AppContext
   fn build_router(&self) -> Result<Router>
   async fn bind(self) -> Result<BoundHttpServer>
@@ -64,4 +63,3 @@ struct WorkerKernel
   async fn run(self) -> Result<()>
   async fn run_once(&self) -> Result<bool>
 ```
-

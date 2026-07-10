@@ -851,7 +851,7 @@ let mut tx = app.begin_transaction().await?;
 // ... create order ...
 
 tx.dispatch_after_commit(SendOrderConfirmation { order_id: order.id.to_string() });
-tx.notify_after_commit(&user, &OrderPlacedNotification { /* ... */ });
+tx.notify_after_commit(&user, &OrderPlacedNotification { /* ... */ })?;
 tx.after_commit(|app| async move {
     // custom cleanup
     Ok(())
@@ -961,6 +961,11 @@ tooling should fail instead of waiting behind another migration process. If the 
 contains an applied migration that is not registered in the current binary, `db:migrate:status`
 reports it and `db:migrate:status --json` includes it under `missing_applied`; migrate/rollback
 remain strict and stop until the binary or migration files are corrected.
+
+Migrations run in a transaction by default. Foundry commits each migration's `up` or `down` SQL
+and its migration-ledger insert or delete atomically. Override `run_in_transaction()` only for SQL
+that PostgreSQL does not allow inside a transaction; ledger updates for those migrations remain
+nontransactional by design.
 
 For source-free servers, run `doctor --deploy --json` from the compiled binary before stopping
 services. The command uses the server-managed `.env`, checks migration drift through the same

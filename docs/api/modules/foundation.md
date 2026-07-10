@@ -36,7 +36,7 @@ struct AppBuilder
   fn register_middleware(self, config: MiddlewareConfig) -> Self
   fn register_error_reporter<R>(self) -> Self
   fn register_error_reporter_instance( self, reporter: Arc<dyn ErrorReporter>, ) -> Self
-  fn middleware_group( self, name: impl Into<String>, middlewares: Vec<MiddlewareConfig>, ) -> Self
+  fn middleware_group<I>( self, id: I, middlewares: Vec<MiddlewareConfig>, ) -> Self
   fn enable_observability(self) -> Self
   fn enable_public_observability(self) -> Self
   fn enable_observability_with(self, options: ObservabilityOptions) -> Self
@@ -101,7 +101,7 @@ struct AppTransaction
   fn set_actor(&mut self, actor: Actor)
   fn actor(&self) -> Option<&Actor>
   fn dispatch_after_commit<J: Job>(&self, job: J)
-  fn notify_after_commit( &self, notifiable: &dyn Notifiable, notification: &dyn Notification, )
+  fn notify_after_commit( &self, notifiable: &dyn Notifiable, notification: &dyn Notification, ) -> Result<()>
   fn after_commit<F, Fut>(&self, callback: F)
   async fn commit(self) -> Result<()>
   async fn rollback(self) -> Result<()>

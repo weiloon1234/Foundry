@@ -56,6 +56,12 @@ pub(crate) fn append_module_notes(group_key: &str, content: &mut String) {
     writeln!(content).unwrap();
 }
 
+pub(crate) fn ensure_single_trailing_newline(content: &mut String) {
+    let trimmed_len = content.trim_end().len();
+    content.truncate(trimmed_len);
+    content.push('\n');
+}
+
 fn module_notes(group_key: &str) -> &'static [&'static str] {
     match group_key {
         "config" => &[
@@ -138,7 +144,14 @@ fn module_notes(group_key: &str) -> &'static [&'static str] {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_module_notes, module_description};
+    use super::{append_module_notes, ensure_single_trailing_newline, module_description};
+
+    #[test]
+    fn generated_markdown_has_one_trailing_newline() {
+        let mut content = "content\n\n\n".to_string();
+        ensure_single_trailing_newline(&mut content);
+        assert_eq!(content, "content\n");
+    }
 
     #[test]
     fn module_descriptions_cover_recent_public_modules() {

@@ -360,6 +360,15 @@ CronExpression::weekly()?
 CronExpression::monthly()?
 ```
 
+Clock-driven scheduler execution (`run`, `run_once`, and `tick`) interprets cron fields in the
+configured `[app] timezone`. Fixed-interval schedules continue to use elapsed time. The explicit
+`tick_at` and `run_once_at` test hooks retain UTC cron semantics so an injected `DateTime` has a
+stable interpretation independent of app configuration.
+
+IANA daylight-saving transitions follow Foundry's local-datetime policy: a cron wall time that is
+nonexistent during a spring-forward gap or ambiguous during a fall-back overlap is skipped. Choose
+a non-transition time for work that must run every calendar day.
+
 ### Schedule Options
 
 ```rust
@@ -415,8 +424,10 @@ shutdown_timeout_ms = 30000    # active schedule drain timeout on shutdown (0 = 
 
 Schedule handler errors and panics are treated as schedule failures and run the configured
 `on_failure` hook. `before`, `after`, and `on_failure` hook errors or panics are logged without
-crashing the scheduler task, and `without_overlapping` locks are released even when a handler fails
-or panics.
+crashing the scheduler task. `without_overlapping` uses an owner-token lock, renews its lease while
+the handler is running, and releases it safely even when a handler fails or panics. If the lock
+backend is unavailable, the invocation is skipped rather than run without overlap protection. Use
+`without_overlapping_for(Duration::from_secs(...))` to customize the one-hour default lease.
 
 ### Running the Scheduler
 
@@ -571,7 +582,7 @@ let mut tx = app.begin_transaction().await?;
 // This notification uses events internally
 tx.notify_after_commit(&customer, &OrderPlacedNotification {
     order_id: order.id.to_string(),
-});
+})?;
 
 tx.commit().await?;
 // Events/notifications fire only after commit succeeds

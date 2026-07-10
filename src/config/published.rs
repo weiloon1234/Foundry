@@ -783,6 +783,14 @@ const WEBSOCKET_FIELDS: &[PublishedField] = &[
     field("heartbeat_interval_seconds", "30", "30", false, false, None),
     field("heartbeat_timeout_seconds", "10", "10", false, false, None),
     field(
+        "auth_revalidation_interval_seconds",
+        "30",
+        "30",
+        false,
+        false,
+        Some("Maximum cached WebSocket credential age; minimum effective value is 1 second"),
+    ),
+    field(
         "max_message_size_bytes",
         "1048576",
         "1048576",
@@ -807,6 +815,22 @@ const WEBSOCKET_FIELDS: &[PublishedField] = &[
         Some("0 = use transport default"),
     ),
     field("max_messages_per_second", "50", "50", false, false, None),
+    field(
+        "max_connections_global",
+        "10000",
+        "10000",
+        false,
+        false,
+        Some("0 = unlimited process-wide WebSocket connections"),
+    ),
+    field(
+        "max_connections_per_ip",
+        "100",
+        "100",
+        false,
+        false,
+        Some("0 = unlimited anonymous connections per resolved client IP"),
+    ),
     field("max_connections_per_user", "5", "5", false, false, None),
     field(
         "max_subscriptions_per_connection",
@@ -2033,6 +2057,9 @@ mod tests {
         assert!(output.contains("# max_message_size_bytes = 1048576  # 0 = use transport default"));
         assert!(output.contains("# max_frame_size_bytes = 1048576"));
         assert!(output.contains("# max_write_buffer_size_bytes = 1048576"));
+        assert!(output.contains("# auth_revalidation_interval_seconds = 30"));
+        assert!(output.contains("# max_connections_global = 10000"));
+        assert!(output.contains("# max_connections_per_ip = 100"));
         assert!(output.contains(
             "# max_subscriptions_per_connection = 100  # 0 = unlimited active subscriptions per connection"
         ));
@@ -2045,6 +2072,9 @@ mod tests {
         assert!(output.contains("# query_token_max_length = 4096"));
         assert!(output.contains("# allowed_origins = []  # Exact Origin allow-list"));
         assert!(env.contains("# WEBSOCKET__MAX_MESSAGE_SIZE_BYTES=1048576"));
+        assert!(env.contains("# WEBSOCKET__AUTH_REVALIDATION_INTERVAL_SECONDS=30"));
+        assert!(env.contains("# WEBSOCKET__MAX_CONNECTIONS_GLOBAL=10000"));
+        assert!(env.contains("# WEBSOCKET__MAX_CONNECTIONS_PER_IP=100"));
         assert!(env.contains("# WEBSOCKET__MAX_SUBSCRIPTIONS_PER_CONNECTION=100"));
         assert!(env.contains("# WEBSOCKET__QUERY_TOKEN_ENABLED=true"));
         assert!(env.contains("# WEBSOCKET__QUERY_TOKEN_MAX_LENGTH=4096"));

@@ -63,6 +63,23 @@ trait PivotAttacher<To>: Send + Sync {
 
 type AnyPivotAttacher<To> = Arc<dyn PivotAttacher<To>>;
 
+mod belongs_to_foreign_key {
+    pub trait Sealed<Key> {}
+
+    impl<Key> Sealed<Key> for Key {}
+    impl<Key> Sealed<Key> for Option<Key> {}
+}
+
+/// Marker for a `belongs_to` foreign key that is either `Key` or `Option<Key>`.
+///
+/// This trait is sealed and exists to preserve compile-time key compatibility
+/// while allowing nullable foreign-key columns.
+#[doc(hidden)]
+pub trait BelongsToForeignKey<Key>: belongs_to_foreign_key::Sealed<Key> {}
+
+impl<Key> BelongsToForeignKey<Key> for Key {}
+impl<Key> BelongsToForeignKey<Key> for Option<Key> {}
+
 #[derive(Clone)]
 pub struct RelationDef<From, To: 'static> {
     name: String,
@@ -1151,8 +1168,8 @@ where
     }
 }
 
-pub fn belongs_to<From, To, Key>(
-    foreign_key: Column<From, Key>,
+pub fn belongs_to<From, To, ForeignKey, Key>(
+    foreign_key: Column<From, ForeignKey>,
     owner_key: Column<To, Key>,
     parent_key: fn(&From) -> Option<Key>,
     attach: fn(&mut From, Option<To>),
@@ -1160,6 +1177,7 @@ pub fn belongs_to<From, To, Key>(
 where
     From: Model,
     To: Model,
+    ForeignKey: BelongsToForeignKey<Key> + 'static,
     Key: ToDbValue + 'static,
 {
     RelationDef {
@@ -1738,8 +1756,9 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{
-        has_many, infer_collection_relation_name, infer_singular_relation_name, many_to_many,
-        RelationLoader, PIVOT_ALIAS_PREFIX, RELATION_AGGREGATE_ALIAS, RELATION_GROUP_KEY_ALIAS,
+        belongs_to, has_many, infer_collection_relation_name, infer_singular_relation_name,
+        many_to_many, RelationLoader, PIVOT_ALIAS_PREFIX, RELATION_AGGREGATE_ALIAS,
+        RELATION_GROUP_KEY_ALIAS,
     };
     use crate::database::{
         DbRecord, DbValue, FromDbValue, Loaded, Projection, QueryExecutionOptions, QueryExecutor,
@@ -1815,6 +1834,20 @@ mod tests {
         pivot: Loaded<RelationContextPivot>,
     }
 
+    #[derive(Debug, PartialEq, crate::Model)]
+    #[foundry(table = "nullable_relation_parents", primary_key_strategy = "manual")]
+    struct NullableRelationParent {
+        id: i64,
+    }
+
+    #[derive(Debug, PartialEq, crate::Model)]
+    #[foundry(table = "nullable_relation_children", primary_key_strategy = "manual")]
+    struct NullableRelationChild {
+        id: i64,
+        parent_id: Option<i64>,
+        parent: Loaded<Option<NullableRelationParent>>,
+    }
+
     #[derive(Clone, Debug, PartialEq, crate::Projection)]
     struct RelationContextPivot {
         #[foundry(db_type = "text")]
@@ -1838,6 +1871,21 @@ mod tests {
             "category"
         );
         assert_eq!(infer_singular_relation_name("products"), "product");
+    }
+
+    #[test]
+    fn belongs_to_accepts_nullable_foreign_key_columns() {
+        let relation = belongs_to(
+            NullableRelationChild::PARENT_ID,
+            NullableRelationParent::ID,
+            |child: &NullableRelationChild| child.parent_id,
+            |child, parent| child.parent = Loaded::new(parent),
+        );
+
+        assert_eq!(
+            relation.node().kind,
+            crate::database::RelationKind::BelongsTo
+        );
     }
 
     #[tokio::test]

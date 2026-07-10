@@ -5,11 +5,13 @@ pub(crate) mod job;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::auth::{Actor, AuthError};
 use crate::database::{DbValue, Query};
 use crate::email::EmailMessage;
 use crate::foundation::{AppContext, Error, Result};
 use crate::support::sync::lock_unpoisoned;
-use crate::support::{ChannelEventId, ChannelId, NotificationChannelId};
+use crate::support::{ChannelEventId, ChannelId, GuardId, NotificationChannelId};
+use crate::websocket::{WebSocketChannelOptions, WebSocketContext, WebSocketRegistrar};
 
 pub use channel::{
     BroadcastNotificationChannel, DatabaseNotificationChannel, EmailNotificationChannel,
@@ -21,6 +23,47 @@ const NOTIFICATIONS_TABLE: &str = "notifications";
 
 pub const NOTIFICATION_BROADCAST_CHANNEL: ChannelId = ChannelId::new("notifications");
 pub const NOTIFICATION_BROADCAST_EVENT: ChannelEventId = ChannelEventId::new("notification");
+
+/// Register the built-in, server-only notification WebSocket channel.
+///
+/// Subscriptions require `guard` and a room equal to the authenticated actor ID. A
+/// [`Notifiable::notification_id`] used with broadcast delivery must therefore return
+/// the same stable value as [`Actor::id`].
+pub fn register_notification_websocket_channel<G>(
+    registrar: &mut WebSocketRegistrar,
+    guard: G,
+) -> Result<()>
+where
+    G: Into<GuardId>,
+{
+    registrar.channel_with_options(
+        NOTIFICATION_BROADCAST_CHANNEL,
+        |_context: WebSocketContext, _payload: serde_json::Value| async {
+            Err(Error::http(
+                405,
+                "the notification channel does not accept client messages",
+            ))
+        },
+        WebSocketChannelOptions::new()
+            .guard(guard)
+            .authorize(|context, _channel, room| async move {
+                let actor = context.actor().ok_or_else(|| {
+                    AuthError::unauthorized("authentication is required for notifications")
+                })?;
+                authorize_notification_room(actor, room.as_deref())
+            })
+            .outgoing_event::<_, serde_json::Value>(NOTIFICATION_BROADCAST_EVENT),
+    )?;
+    Ok(())
+}
+
+fn authorize_notification_room(actor: &Actor, room: Option<&str>) -> Result<()> {
+    if room == Some(actor.id.as_str()) {
+        Ok(())
+    } else {
+        Err(AuthError::forbidden("notification room is not available").into())
+    }
+}
 
 pub(crate) async fn store_database_notification(
     app: &AppContext,
@@ -180,7 +223,10 @@ pub const NOTIFY_BROADCAST: NotificationChannelId = NotificationChannelId::new("
 // Dispatch Functions
 // ---------------------------------------------------------------------------
 
-/// Send a notification synchronously (all channels await'd in sequence).
+/// Send a notification synchronously, attempting every channel in sequence.
+///
+/// Any failed or unregistered channels are returned together after the remaining
+/// channels have been attempted.
 pub async fn notify(
     app: &AppContext,
     notifiable: &dyn Notifiable,
@@ -189,71 +235,53 @@ pub async fn notify(
     let registry = app.resolve::<NotificationChannelRegistry>()?;
     let channels = callback::notification_channels(notification)?;
     let notification_type = callback::notification_type(notification)?;
+    let mut failures = Vec::new();
 
     for channel_id in channels {
-        if let Some(channel) = registry.get(&channel_id) {
-            if let Err(error) = callback::send_channel_adapter(
-                &channel_id,
-                channel.as_ref(),
-                app,
-                notifiable,
-                notification,
-            )
-            .await
-            {
-                tracing::error!(
-                    channel = %channel_id,
-                    notification_type = %notification_type,
-                    error = %error,
-                    "notification channel delivery failed"
-                );
-            }
-        } else {
-            tracing::warn!(
-                channel = %channel_id,
-                "notification channel not registered, skipping"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Dispatch a notification asynchronously via the job queue.
-///
-/// Pre-renders selected channel payloads immediately, then dispatches a
-/// `SendNotificationJob` to the worker. Returns immediately without
-/// waiting for delivery.
-///
-/// ```ignore
-/// app.notify_queued(&user, &OrderShipped { order_id: "123".into() }).await?;
-/// ```
-/// Pre-render all notification payloads and wrap in a job for async dispatch.
-pub fn build_notification_job(
-    notifiable: &dyn Notifiable,
-    notification: &dyn Notification,
-) -> SendNotificationJob {
-    match try_build_notification_job(notifiable, notification) {
-        Ok(job) => job,
-        Err(error) => {
+        let Some(channel) = registry.get(&channel_id) else {
             tracing::error!(
-                error = %error,
-                "notification job payload rendering failed"
+                channel = %channel_id,
+                notification_type = %notification_type,
+                "notification channel is not registered"
             );
-            SendNotificationJob {
-                notifiable_id: String::new(),
-                notification_type: "unknown".to_string(),
-                channels: Vec::new(),
-                email_payload: None,
-                database_payload: None,
-                broadcast_payload: None,
-                custom_payloads: Vec::new(),
-            }
+            failures.push(format!("channel `{channel_id}` is not registered"));
+            continue;
+        };
+
+        if let Err(error) = callback::send_channel_adapter(
+            &channel_id,
+            channel.as_ref(),
+            app,
+            notifiable,
+            notification,
+        )
+        .await
+        {
+            tracing::error!(
+                channel = %channel_id,
+                notification_type = %notification_type,
+                error = %error,
+                "notification channel delivery failed"
+            );
+            failures.push(format!("channel `{channel_id}`: {error}"));
         }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::message(format!(
+            "notification `{notification_type}` delivery failed: {}",
+            failures.join("; ")
+        )))
     }
 }
 
-pub(crate) fn try_build_notification_job(
+/// Pre-render all notification payloads and wrap them in a job for async dispatch.
+///
+/// Rendering, routing, and notification callback failures are returned without
+/// constructing a partial job.
+pub fn build_notification_job(
     notifiable: &dyn Notifiable,
     notification: &dyn Notification,
 ) -> Result<SendNotificationJob> {
@@ -275,15 +303,19 @@ pub(crate) fn try_build_notification_job(
     };
 
     let mut custom_payloads = Vec::new();
+    let mut custom_routes = Vec::new();
     for channel_id in &channels {
-        if !is_builtin_notification_channel(channel_id) {
-            if let Some(data) = callback::notification_channel_payload(
-                notification,
-                channel_id.as_ref(),
-                notifiable,
-            )? {
-                custom_payloads.push((channel_id.clone(), data));
-            }
+        if is_builtin_notification_channel(channel_id) {
+            continue;
+        }
+
+        if let Some(route) = callback::route_notification_for(notifiable, channel_id.as_ref())? {
+            custom_routes.push((channel_id.clone(), route));
+        }
+        if let Some(data) =
+            callback::notification_channel_payload(notification, channel_id.as_ref(), notifiable)?
+        {
+            custom_payloads.push((channel_id.clone(), data));
         }
     }
 
@@ -295,6 +327,7 @@ pub(crate) fn try_build_notification_job(
         database_payload,
         broadcast_payload,
         custom_payloads,
+        custom_routes,
     })
 }
 
@@ -309,12 +342,20 @@ fn is_builtin_notification_channel(channel: &NotificationChannelId) -> bool {
     channel == &NOTIFY_EMAIL || channel == &NOTIFY_DATABASE || channel == &NOTIFY_BROADCAST
 }
 
+/// Dispatch a notification asynchronously via the job queue.
+///
+/// Selected channel payloads are pre-rendered before a `SendNotificationJob`
+/// is dispatched. Returns after enqueueing without waiting for delivery.
+///
+/// ```ignore
+/// app.notify_queued(&user, &OrderShipped { order_id: "123".into() }).await?;
+/// ```
 pub async fn notify_queued(
     app: &AppContext,
     notifiable: &dyn Notifiable,
     notification: &dyn Notification,
 ) -> Result<()> {
-    let job = try_build_notification_job(notifiable, notification)?;
+    let job = build_notification_job(notifiable, notification)?;
     app.jobs()?.dispatch(job).await
 }
 
@@ -347,6 +388,43 @@ mod tests {
         AppContext::new(container, ConfigRepository::empty(), RuleRegistry::new()).unwrap()
     }
 
+    fn queued_job(channel: NotificationChannelId) -> SendNotificationJob {
+        SendNotificationJob {
+            notifiable_id: "user-1".to_string(),
+            notification_type: "test.notification".to_string(),
+            channels: vec![channel],
+            email_payload: None,
+            database_payload: None,
+            broadcast_payload: None,
+            custom_payloads: Vec::new(),
+            custom_routes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn notification_room_requires_the_authenticated_actor_id() {
+        let actor = Actor::new("user-1", GuardId::new("api"));
+
+        authorize_notification_room(&actor, Some("user-1")).unwrap();
+        for room in [None, Some("user-2"), Some("")] {
+            let error = authorize_notification_room(&actor, room).unwrap_err();
+            assert_eq!(error.to_string(), "notification room is not available");
+        }
+    }
+
+    #[test]
+    fn notification_websocket_registration_uses_the_canonical_channel() {
+        let mut registrar = WebSocketRegistrar::new();
+        register_notification_websocket_channel(&mut registrar, GuardId::new("api")).unwrap();
+
+        let error = register_notification_websocket_channel(&mut registrar, GuardId::new("api"))
+            .expect_err("the canonical channel should already be registered");
+        assert_eq!(
+            error.to_string(),
+            "websocket channel `notifications` already registered"
+        );
+    }
+
     struct TestNotifiable;
 
     impl Notifiable for TestNotifiable {
@@ -356,6 +434,18 @@ mod tests {
 
         fn route_notification_for(&self, channel: &str) -> Option<String> {
             (channel == "email").then_some("user@example.com".to_string())
+        }
+    }
+
+    struct RoutedNotifiable;
+
+    impl Notifiable for RoutedNotifiable {
+        fn notification_id(&self) -> String {
+            "user-2".to_string()
+        }
+
+        fn route_notification_for(&self, channel: &str) -> Option<String> {
+            (channel == "sms").then_some("+60123456789".to_string())
         }
     }
 
@@ -558,6 +648,43 @@ mod tests {
         }
     }
 
+    struct FailingChannel;
+
+    #[async_trait]
+    impl NotificationChannel for FailingChannel {
+        async fn send(
+            &self,
+            _app: &AppContext,
+            _notifiable: &dyn Notifiable,
+            _notification: &dyn Notification,
+        ) -> Result<()> {
+            Err(Error::message("adapter unavailable"))
+        }
+    }
+
+    struct RoutingChannel {
+        deliveries: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    #[async_trait]
+    impl NotificationChannel for RoutingChannel {
+        async fn send(
+            &self,
+            _app: &AppContext,
+            notifiable: &dyn Notifiable,
+            notification: &dyn Notification,
+        ) -> Result<()> {
+            let route = notifiable
+                .route_notification_for("sms")
+                .ok_or_else(|| Error::message("missing SMS route"))?;
+            let payload = notification
+                .to_channel("sms", notifiable)
+                .ok_or_else(|| Error::message("missing SMS payload"))?;
+            self.deliveries.lock().unwrap().push((route, payload));
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn notification_channel_panic_isolated_and_later_channels_continue() {
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -572,8 +699,58 @@ mod tests {
         ]);
         let notification = TestNotification::new(vec![panic_id, ok_id]);
 
-        notify(&app, &TestNotifiable, &notification).await.unwrap();
+        let error = notify(&app, &TestNotifiable, &notification)
+            .await
+            .unwrap_err();
 
+        assert!(error
+            .to_string()
+            .contains("notification channel `panic` delivery panicked: channel exploded"));
+        assert_eq!(log.lock().unwrap().as_slice(), ["sent"]);
+    }
+
+    #[tokio::test]
+    async fn immediate_notification_reports_missing_channel_and_continues() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let missing_id = NotificationChannelId::new("missing");
+        let ok_id = NotificationChannelId::new("ok");
+        let app = test_app(vec![(
+            ok_id.clone(),
+            Arc::new(RecordingChannel { log: log.clone() }),
+        )]);
+        let notification = TestNotification::new(vec![missing_id, ok_id]);
+
+        let error = notify(&app, &TestNotifiable, &notification)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("channel `missing` is not registered"));
+        assert_eq!(log.lock().unwrap().as_slice(), ["sent"]);
+    }
+
+    #[tokio::test]
+    async fn immediate_notification_reports_adapter_error_and_continues() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let fail_id = NotificationChannelId::new("fail");
+        let ok_id = NotificationChannelId::new("ok");
+        let app = test_app(vec![
+            (fail_id.clone(), Arc::new(FailingChannel)),
+            (
+                ok_id.clone(),
+                Arc::new(RecordingChannel { log: log.clone() }),
+            ),
+        ]);
+        let notification = TestNotification::new(vec![fail_id, ok_id]);
+
+        let error = notify(&app, &TestNotifiable, &notification)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("channel `fail`: adapter unavailable"));
         assert_eq!(log.lock().unwrap().as_slice(), ["sent"]);
     }
 
@@ -722,7 +899,7 @@ mod tests {
     #[test]
     fn queued_builder_only_renders_selected_builtin_channels() {
         let job =
-            try_build_notification_job(&TestNotifiable, &PanickingUnselectedRenderersNotification)
+            build_notification_job(&TestNotifiable, &PanickingUnselectedRenderersNotification)
                 .unwrap();
 
         assert_eq!(job.channels, vec![NOTIFY_DATABASE]);
@@ -732,6 +909,137 @@ mod tests {
             Some(json!({ "selected": "database" }))
         );
         assert!(job.broadcast_payload.is_none());
+    }
+
+    #[test]
+    fn queued_builder_propagates_custom_route_panic() {
+        let notification = TestNotification::new(vec![NotificationChannelId::new("sms")]);
+
+        let error = build_notification_job(&PanickingRouteNotifiable, &notification).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("notification notifiable route callback for `sms` panicked: route exploded"));
+    }
+
+    #[tokio::test]
+    async fn queued_custom_route_survives_serialization_and_reaches_adapter() {
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let channel_id = NotificationChannelId::new("sms");
+        let app = test_app(vec![(
+            channel_id.clone(),
+            Arc::new(RoutingChannel {
+                deliveries: deliveries.clone(),
+            }),
+        )]);
+        let notification = TestNotification::new(vec![channel_id.clone()]);
+        let job = build_notification_job(&RoutedNotifiable, &notification).unwrap();
+        let serialized = serde_json::to_string(&job).unwrap();
+        let job: SendNotificationJob = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            job.custom_routes,
+            vec![(channel_id, "+60123456789".to_string())]
+        );
+        job.deliver(&app).await.unwrap();
+
+        assert_eq!(
+            deliveries.lock().unwrap().as_slice(),
+            [("+60123456789".to_string(), json!({ "channel": "sms" }))]
+        );
+    }
+
+    #[test]
+    fn queued_job_deserializes_payloads_created_before_custom_routes() {
+        let mut serialized = serde_json::to_value(queued_job(NOTIFY_DATABASE)).unwrap();
+        serialized.as_object_mut().unwrap().remove("custom_routes");
+
+        let job: SendNotificationJob = serde_json::from_value(serialized).unwrap();
+
+        assert!(job.custom_routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_builtin_delivery_resolution_failures_are_returned() {
+        let app = test_app(Vec::new());
+
+        let mut email_job = queued_job(NOTIFY_EMAIL);
+        email_job.email_payload = Some(EmailMessage::new("Test notification"));
+        let mut database_job = queued_job(NOTIFY_DATABASE);
+        database_job.database_payload = Some(json!({ "ok": true }));
+        let mut broadcast_job = queued_job(NOTIFY_BROADCAST);
+        broadcast_job.broadcast_payload = Some(json!({ "ok": true }));
+
+        for (channel, job) in [
+            ("email", email_job),
+            ("database", database_job),
+            ("broadcast", broadcast_job),
+        ] {
+            let error = job.deliver(&app).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("channel `{channel}` delivery failed")),
+                "unexpected {channel} error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_missing_channel_registry_is_returned() {
+        let app = AppContext::new(
+            Container::new(),
+            ConfigRepository::empty(),
+            RuleRegistry::new(),
+        )
+        .unwrap();
+
+        let error = queued_job(NOTIFY_DATABASE).deliver(&app).await.unwrap_err();
+
+        assert!(error.to_string().contains(
+            "queued notification `test.notification` channel registry resolution failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_custom_delivery_error_is_returned() {
+        let channel_id = NotificationChannelId::new("sms");
+        let app = test_app(vec![(channel_id.clone(), Arc::new(FailingChannel))]);
+        let notification = TestNotification::new(vec![channel_id]);
+        let job = build_notification_job(&RoutedNotifiable, &notification).unwrap();
+
+        let error = job.deliver(&app).await.unwrap_err();
+
+        assert!(error.to_string().contains(
+            "queued notification `test.notification` channel `sms` delivery failed: adapter unavailable"
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_custom_delivery_panic_is_returned() {
+        let channel_id = NotificationChannelId::new("sms");
+        let app = test_app(vec![(channel_id.clone(), Arc::new(PanickingChannel))]);
+        let notification = TestNotification::new(vec![channel_id]);
+        let job = build_notification_job(&RoutedNotifiable, &notification).unwrap();
+
+        let error = job.deliver(&app).await.unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("notification channel `sms` delivery panicked: channel exploded"));
+    }
+
+    #[tokio::test]
+    async fn queued_missing_custom_channel_is_returned() {
+        let app = test_app(Vec::new());
+        let notification = TestNotification::new(vec![NotificationChannelId::new("unregistered")]);
+        let job = build_notification_job(&TestNotifiable, &notification).unwrap();
+
+        let error = job.deliver(&app).await.unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("notification channel `unregistered` is not registered"));
     }
 
     #[tokio::test]
@@ -748,13 +1056,16 @@ mod tests {
     }
 
     #[test]
-    fn public_notification_job_builder_does_not_panic_on_renderer_panic() {
+    fn public_notification_job_builder_returns_renderer_panic() {
         let result = catch_unwind(AssertUnwindSafe(|| {
             build_notification_job(&TestNotifiable, &PanickingCustomPayloadNotification)
         }));
 
-        let job = result.expect("builder should isolate notification renderer panics");
-        assert!(job.channels.is_empty());
-        assert_eq!(job.notification_type, "unknown");
+        let error = result
+            .expect("builder should isolate notification renderer panics")
+            .unwrap_err();
+        assert!(error.to_string().contains(
+            "notification custom channel `sms` renderer panicked: custom renderer exploded"
+        ));
     }
 }

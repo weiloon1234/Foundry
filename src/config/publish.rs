@@ -273,10 +273,10 @@ fn publish_sample_config(
     };
 
     for (filename, _) in &files {
-        let file_path = path.join(filename);
-        if let Err(error) = ensure_generated_file_writable(&file_path, force) {
-            if !force && generated_file_exists_without_symlink(&file_path) {
-                return Ok(ConfigPublishOutcome::Exists(file_path));
+        let relative = Path::new(filename);
+        if let Err(error) = ensure_generated_file_writable(path, relative, force) {
+            if !force && generated_file_exists_without_symlink(path, relative) {
+                return Ok(ConfigPublishOutcome::Exists(path.join(relative)));
             }
             return Err(error);
         }
@@ -284,9 +284,9 @@ fn publish_sample_config(
 
     let mut written = Vec::with_capacity(files.len());
     for (filename, contents) in files {
-        let file_path = path.join(filename);
-        write_generated_file(&file_path, contents)?;
-        written.push(file_path);
+        let relative = Path::new(filename);
+        write_generated_file(path, relative, contents)?;
+        written.push(path.join(relative));
     }
 
     Ok(ConfigPublishOutcome::Written(written))
@@ -305,16 +305,16 @@ fn publish_framework_files(
 
     let mut published = 0;
     for (name, contents) in files {
-        let file_path = path.join(name);
-        if let Err(error) = ensure_generated_file_writable(&file_path, force) {
-            if !force && generated_file_exists_without_symlink(&file_path) {
+        let relative = Path::new(name);
+        if let Err(error) = ensure_generated_file_writable(path, relative, force) {
+            if !force && generated_file_exists_without_symlink(path, relative) {
                 println!("  skip  {} (exists)", name);
                 continue;
             }
             return Err(error);
         }
 
-        write_generated_file(&file_path, contents)?;
+        write_generated_file(path, relative, contents)?;
         println!("  create  {}", name);
         published += 1;
     }

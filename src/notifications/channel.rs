@@ -11,6 +11,8 @@ use super::{
 ///
 /// Framework provides built-in channels (email, database, broadcast).
 /// Projects can register custom channels via `register_notification_channel()`.
+/// Returning an error fails immediate delivery and makes queued jobs eligible
+/// for their configured retry and dead-letter policy.
 #[async_trait]
 pub trait NotificationChannel: Send + Sync + 'static {
     async fn send(

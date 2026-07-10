@@ -28,4 +28,3 @@ trait EventListener: Event>
 fn dispatch_job<E, J, F>(mapper: F) -> JobDispatchListener<E, J, F>
 fn publish_websocket<E, F>(mapper: F) -> WebSocketPublishListener<E, F>
 ```
-

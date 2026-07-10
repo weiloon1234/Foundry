@@ -571,6 +571,23 @@ pub struct Column<M, T> {
     _marker: PhantomData<fn() -> (M, T)>,
 }
 
+mod text_column_type {
+    pub trait Sealed {}
+
+    impl Sealed for String {}
+    impl Sealed for Option<String> {}
+}
+
+/// Marker for column value types that support SQL text predicates.
+///
+/// This trait is sealed; it exists so invalid expressions such as `bool_column.ilike(...)`
+/// fail at compile time.
+#[doc(hidden)]
+pub trait TextColumnType: text_column_type::Sealed {}
+
+impl TextColumnType for String {}
+impl TextColumnType for Option<String> {}
+
 impl<M, T> Column<M, T> {
     pub const fn new(table: &'static str, name: &'static str, db_type: DbType) -> Self {
         Self {
@@ -720,7 +737,12 @@ impl<M, T> Column<M, T> {
     pub fn is_not_null(&self) -> Condition {
         Condition::is_not_null(self.column_ref())
     }
+}
 
+impl<M, T> Column<M, T>
+where
+    T: TextColumnType,
+{
     pub fn like(&self, value: impl Into<String>) -> Condition {
         Condition::compare(
             Expr::column(self.column_ref()),
@@ -1068,7 +1090,7 @@ impl<M> CreateDraft<M> {
         self
     }
 
-    pub fn set_null<T>(&mut self, column: Column<M, T>) -> &mut Self {
+    pub fn set_null<T>(&mut self, column: Column<M, Option<T>>) -> &mut Self {
         upsert_assignment(
             &mut self.values,
             column.column_ref(),
@@ -1124,7 +1146,7 @@ impl<M> UpdateDraft<M> {
         self
     }
 
-    pub fn set_null<T>(&mut self, column: Column<M, T>) -> &mut Self {
+    pub fn set_null<T>(&mut self, column: Column<M, Option<T>>) -> &mut Self {
         upsert_assignment(
             &mut self.values,
             column.column_ref(),
@@ -1278,6 +1300,14 @@ pub trait Model: Clone + Send + Sync + Sized + 'static {
     fn model_restore() -> RestoreModel<Self> {
         UpdateModel::new_restore(Self::table_meta())
     }
+}
+
+/// Model contract that preserves the concrete primary-key type for typed lookups.
+///
+/// `#[derive(Model)]` implements this automatically. Manual model implementations only need to
+/// implement it when using `ModelQuery::find`, `find_or_fail`, or `find_many`.
+pub trait TypedPrimaryKey: Model {
+    type PrimaryKey: ToDbValue;
 }
 
 pub trait PersistedModel: Model {

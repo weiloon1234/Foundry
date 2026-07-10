@@ -6,21 +6,21 @@ use tokio::net::TcpListener;
 use crate::config::ServerConfig;
 use crate::foundation::{AppContext, Error, Result};
 use crate::http::middleware::MiddlewareConfig;
-use crate::http::RouteRegistrar;
+use crate::http::PreparedHttpRoutes;
 use crate::logging::ObservabilityOptions;
 
 pub struct HttpKernel {
     app: AppContext,
-    routes: Vec<RouteRegistrar>,
+    routes: PreparedHttpRoutes,
     middlewares: Vec<MiddlewareConfig>,
     observability: Option<ObservabilityOptions>,
     spa_dir: Option<PathBuf>,
 }
 
 impl HttpKernel {
-    pub fn new(
+    pub(crate) fn new(
         app: AppContext,
-        routes: Vec<RouteRegistrar>,
+        routes: PreparedHttpRoutes,
         middlewares: Vec<MiddlewareConfig>,
         observability: Option<ObservabilityOptions>,
         spa_dir: Option<PathBuf>,
@@ -39,7 +39,7 @@ impl HttpKernel {
     }
 
     pub fn build_router(&self) -> Result<axum::Router> {
-        let mut registrar = crate::http::build_registrar(&self.routes)?;
+        let mut registrar = self.routes.registrar();
         if let Some(options) = &self.observability {
             let obs_config = self.app.config().observability()?;
             if obs_config.enabled {
@@ -64,11 +64,6 @@ impl HttpKernel {
             }
         }
 
-        // Store the named route registry in the container for URL generation
-        let route_registry = std::sync::Arc::new(registrar.named_routes.clone());
-        // Ignore error if already registered (e.g. build_router called multiple times)
-        let _ = self.app.container().singleton_arc(route_registry);
-
         let http_config = self.app.config().http()?;
         let mut middlewares = crate::http::middleware::configured_global_middlewares(
             &http_config,
@@ -76,7 +71,7 @@ impl HttpKernel {
         )?;
         middlewares.extend(self.middlewares.clone());
 
-        let mut router = registrar.into_router_with_middlewares(self.app.clone(), middlewares);
+        let mut router = registrar.into_router_with_middlewares(self.app.clone(), middlewares)?;
 
         if let Some(ref spa_dir) = self.spa_dir {
             router = router.fallback_service(crate::http::spa::spa_fallback(spa_dir.clone()));
@@ -127,6 +122,7 @@ impl BoundHttpServer {
 }
 
 async fn bind_listener(server: &ServerConfig) -> Result<TcpListener> {
-    let addr = format!("{}:{}", server.host, server.port);
-    TcpListener::bind(addr).await.map_err(Error::other)
+    TcpListener::bind((server.host.as_str(), server.port))
+        .await
+        .map_err(Error::other)
 }

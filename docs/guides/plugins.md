@@ -375,7 +375,7 @@ cargo run -- admin:create
 
 Plugin asset and scaffold paths are always resolved inside the selected target directory. Foundry
 rejects absolute paths, `..` traversal, Windows-style separators, control characters, and symlinked
-output paths before writing files.
+descendants before writing files. The selected target directory itself may be a symlink.
 
 ```
 GET /admin/dashboard     → Admin dashboard (requires admin guard)

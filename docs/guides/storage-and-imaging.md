@@ -8,9 +8,8 @@ File storage with local + S3 backends, multipart uploads, and a chainable image 
 
 ```rust
 // Upload a file from a handler
-async fn upload(State(app): State<AppContext>, form: MultipartForm) -> Result<impl IntoResponse> {
-    let file = form.file("avatar")?;
-    let stored = file.store(&app, "avatars").await?;
+async fn upload(State(app): State<AppContext>, file: UploadedFile) -> Result<impl IntoResponse> {
+    let stored = file.store_and_cleanup(&app, "avatars").await?;
     Ok(Json(json!({ "url": stored.url })))
 }
 ```
@@ -58,9 +57,11 @@ secret = "..."
 visibility = "public"
 ```
 
+For S3 disks, `visibility` describes the disk's application-level access intent; Foundry does not translate it into an `x-amz-acl` object ACL. New AWS buckets disable ACLs by default, and S3-compatible providers such as Cloudflare R2 do not support that header. Configure public access with the bucket policy, public bucket/custom-domain settings, or CDN represented by `url`. This keeps uploads compatible with [AWS bucket-owner-enforced object ownership](https://docs.aws.amazon.com/AmazonS3/latest/userguide/about-object-ownership.html) and [Cloudflare R2's S3 API](https://developers.cloudflare.com/r2/api/s3/api/). When `put_file` supplies a content type, the S3 adapter stores it as the object's `Content-Type` metadata.
+
 Upload caps are storage-level guardrails for `UploadedFile`, `MultipartForm`, and derive-generated multipart DTOs. Route-level validators and file rules still own product-specific limits such as avatar size, gallery count, and allowed MIME types.
 
-Foundry streams multipart files to OS temp files named `foundry-upload-*`. Failed multipart extraction removes temp files that Foundry already created; successful request temp files are pruned by worker maintenance using the retention settings above, so consumers do not need to add a scheduler job. Stored attachments/files are not pruned by this temp cleanup.
+Foundry streams multipart files to OS temp files named `foundry-upload-*`. Failed multipart extraction removes files that Foundry already created. For a final store, the consuming `store*_and_cleanup` methods remove the Foundry-owned temp file immediately on both success and failure. The borrowed `store*` methods intentionally retain it for workflows that read, transform, attach, or store the upload more than once; call `remove_uploaded_temp_file` when that work finishes. Worker maintenance prunes any stale remainder using the retention settings above, so consumers do not need to add a scheduler job. Stored attachments/files are not pruned by this temp cleanup.
 
 Uploaded filenames are metadata, not trusted paths. Foundry strips Unix/Windows path components, removes control characters, trims unsafe wrapper whitespace/quotes, caps display filename length, and falls back to `upload` when no safe name remains. Generated storage names stay UUID-based and only preserve a sanitized extension.
 
@@ -86,9 +87,13 @@ async fn create_post(
     form: MultipartForm,
 ) -> Result<impl IntoResponse> {
     let title = form.text("title").unwrap_or("Untitled");
-    let cover = form.file("cover")?;
+    // Clone the metadata handle because MultipartForm exposes borrowed files.
+    // This endpoint does not need the temporary bytes after this store.
+    let cover = form.file("cover")?.clone();
 
-    let stored = cover.store(&app, "posts/covers").await?;
+    let stored = cover
+        .store_and_cleanup(&app, "posts/covers")
+        .await?;
 
     Ok(Json(json!({
         "title": title,
@@ -101,21 +106,28 @@ async fn create_post(
 ### UploadedFile Methods
 
 ```rust
-let file: &UploadedFile = form.file("avatar")?;
+let file: UploadedFile = uploaded_file;
 
-// Store with auto-generated name (UUIDv7 + original extension)
-let stored = file.store(&app, "avatars").await?;
+// Final use: consume the handle and clean up Foundry's temp file after
+// either a successful or failed storage attempt.
+let stored = file.store_and_cleanup(&app, "avatars").await?;
 // → avatars/01912a4b-7c8d-7000-abcd-ef1234567890.jpg
+```
 
-// Store with custom name
-let stored = file.store_as(&app, "avatars", "profile.jpg").await?;
-// → avatars/profile.jpg
+The consuming variants mirror every storage target:
 
-// Store on a specific disk
-let stored = file.store_on(&app, "s3", "avatars").await?;
+- `store_and_cleanup(app, dir)`
+- `store_as_and_cleanup(app, dir, name)`
+- `store_on_and_cleanup(app, disk, dir)`
+- `store_as_on_and_cleanup(app, disk, dir, name)`
 
-// Store on specific disk with custom name
-let stored = file.store_as_on(&app, "s3", "avatars", "profile.jpg").await?;
+Use the borrowed variants when the same temporary file is still needed:
+
+```rust
+let file: &UploadedFile = form.file("avatar")?;
+let original = file.store(&app, "avatars").await?;
+let archive = file.store_on(&app, "s3", "archive").await?;
+remove_uploaded_temp_file(file).await;
 
 // File metadata
 file.original_name;    // Option<String> — "photo.jpg"
@@ -124,14 +136,16 @@ file.size;             // u64 — bytes
 file.original_extension(); // Option<String> — "jpg"
 ```
 
+Consuming cleanup only deletes paths created inside Foundry's private upload temp directory; manually constructed `UploadedFile` values that point elsewhere are never deleted. If storage and cleanup both fail, the storage error remains the returned error. If storage succeeds but cleanup fails, the method returns the cleanup error and the stored object may already exist.
+
 `content_type` is client-supplied metadata. Validation helpers such as `is_image` and `allowed_mimes` inspect file bytes first when possible.
 
 ### Multiple File Uploads
 
 ```rust
 let files = form.files("documents");  // &[UploadedFile]
-for file in files {
-    file.store(&app, "documents").await?;
+for file in files.iter().cloned() {
+    file.store_and_cleanup(&app, "documents").await?;
 }
 ```
 

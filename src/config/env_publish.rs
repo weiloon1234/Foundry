@@ -42,9 +42,10 @@ pub(crate) fn env_publish_cli_registrar() -> CommandRegistrar {
                     std::fs::create_dir_all(path).map_err(Error::other)?;
                 }
 
-                let file_path = path.join(".env.example");
-                if let Err(error) = ensure_generated_file_writable(&file_path, force) {
-                    if !force && generated_file_exists_without_symlink(&file_path) {
+                let relative = Path::new(".env.example");
+                let file_path = path.join(relative);
+                if let Err(error) = ensure_generated_file_writable(path, relative, force) {
+                    if !force && generated_file_exists_without_symlink(path, relative) {
                         println!(
                             ".env.example already exists at {}. Use --force to overwrite.",
                             file_path.display()
@@ -54,7 +55,7 @@ pub(crate) fn env_publish_cli_registrar() -> CommandRegistrar {
                     return Err(error);
                 }
 
-                write_generated_file(&file_path, sample_env())?;
+                write_generated_file(path, relative, sample_env())?;
                 println!("Published .env.example to {}", file_path.display());
 
                 Ok(())

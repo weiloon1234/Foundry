@@ -359,6 +359,17 @@ pub struct CreateUser {
 | `max_numeric(N)` | `"maximum": N` |
 | `app_enum` on `AppEnum` field | Enum values auto-resolved from `AppEnum::schema()` |
 
+`Option<T>` fields are nullable by default unless their rules include `required`. For example,
+`Option<String>` with `#[validate(email)]` accepts `None`, while
+`#[validate(required, email)]` rejects `None`. Foundry exports the same implicit-nullable decision
+to generated TypeScript validation metadata, including optional vectors and uploaded files.
+
+Typed scalar values are converted to their string representation before string-backed validation
+rules run, so numeric rules can be applied directly to fields such as `i32` and `Option<i64>`.
+`each(...)` likewise supports typed `Vec<T>` and `Option<Vec<T>>` values. Collection-level rules are
+still evaluated alongside `each(...)`; in particular, `#[validate(required, each(...))]` rejects an
+empty vector instead of silently skipping `required`.
+
 ### Manual (full control)
 
 For complex validation logic that can't be expressed in attributes:

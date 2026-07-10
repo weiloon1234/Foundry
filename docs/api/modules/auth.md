@@ -211,4 +211,3 @@ trait HasToken: Authenticatable
   fn sync_token_abilities_with<'life0, 'life1, 'async_trait, E>(
 fn actor_has_mfa_pending(actor: &Actor) -> bool
 ```
-

@@ -163,7 +163,7 @@ mod app {
             registrar.channel(
                 ids::FAIL_CHANNEL,
                 |_context: WebSocketContext, _payload: serde_json::Value| async move {
-                    Err(Error::message("handler failed"))
+                    Err(Error::http(422, "handler failed"))
                 },
             )?;
             registrar.channel_with_options(

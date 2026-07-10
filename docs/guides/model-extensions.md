@@ -735,8 +735,13 @@ let app_settings = Setting::by_prefix(&app, "app.").await?;
 | `File` | File upload | `allowed_mimes`, `max_size_kb` |
 | `Image` | Image upload | `allowed_mimes`, `max_size_kb`, `max_width`, `max_height` |
 | `Json` | JSON editor | — |
-| `Password` | Masked input | — |
+| `Password` | Masked input | Presentation only; do not store credentials or secrets |
 | `Code` | Code editor | `language` |
+
+`SettingType::Password` only selects a masked admin widget. Settings values are JSON and are not
+encrypted automatically. Keep credentials in your deployment's secret manager, or explicitly
+encrypt application-owned sensitive values with `app.crypt()` before persistence. Never mark a
+sensitive setting public.
 
 ### Setting Fields
 

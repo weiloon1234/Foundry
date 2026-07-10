@@ -90,6 +90,7 @@ typed_identifier!(PolicyId);
 typed_identifier!(PermissionId);
 typed_identifier!(RoleId);
 typed_identifier!(RouteId);
+typed_identifier!(MiddlewareGroupId);
 typed_identifier!(ValidationRuleId);
 typed_identifier!(ChannelId);
 typed_identifier!(ChannelEventId);
@@ -206,7 +207,7 @@ impl<M> ts_rs::TS for ModelId<M> {
     }
 }
 
-impl<M> crate::openapi::ApiSchema for ModelId<M> {
+impl<M: 'static> crate::openapi::ApiSchema for ModelId<M> {
     fn schema() -> serde_json::Value {
         serde_json::json!({"type": "string", "format": "uuid"})
     }
@@ -258,8 +259,8 @@ impl<M> From<ModelId<M>> for Uuid {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelId, GuardId, MigrationId, ModelId, PluginAssetId, PluginId, PluginScaffoldId,
-        ProbeId, QueueId, RouteId, SeederId,
+        ChannelId, GuardId, MiddlewareGroupId, MigrationId, ModelId, PluginAssetId, PluginId,
+        PluginScaffoldId, ProbeId, QueueId, RouteId, SeederId,
     };
     use uuid::Uuid;
 
@@ -273,6 +274,7 @@ mod tests {
         const READINESS: ProbeId = ProbeId::new("ready.database");
         const DEFAULT_QUEUE: QueueId = QueueId::new("default");
         const ROUTE: RouteId = RouteId::new("users.show");
+        const API_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("api");
         const PLUGIN: PluginId = PluginId::new("foundry.plugin");
         const ASSET: PluginAssetId = PluginAssetId::new("config");
         const SCAFFOLD: PluginScaffoldId = PluginScaffoldId::new("dashboard");
@@ -284,6 +286,7 @@ mod tests {
         assert_eq!(READINESS.as_str(), "ready.database");
         assert_eq!(DEFAULT_QUEUE.as_str(), "default");
         assert_eq!(ROUTE.as_str(), "users.show");
+        assert_eq!(API_MIDDLEWARE.as_str(), "api");
         assert_eq!(PLUGIN.as_str(), "foundry.plugin");
         assert_eq!(ASSET.as_str(), "config");
         assert_eq!(SCAFFOLD.as_str(), "dashboard");

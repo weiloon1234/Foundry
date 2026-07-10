@@ -9,7 +9,9 @@ use std::process::Command;
 #[path = "../../../src/config/api_docs_metadata.rs"]
 mod api_docs_metadata;
 
-use api_docs_metadata::{append_module_notes, module_description};
+use api_docs_metadata::{
+    append_module_notes, ensure_single_trailing_newline, module_description,
+};
 
 fn main() {
     let project_root = find_project_root();
@@ -119,6 +121,7 @@ fn main() {
 
         if has_content {
             append_module_notes(group_key, &mut content);
+            ensure_single_trailing_newline(&mut content);
             let lines = content.lines().count();
             fs::write(modules_dir.join(format!("{group_key}.md")), &content)
                 .expect("failed to write module file");

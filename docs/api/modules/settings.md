@@ -34,4 +34,3 @@ struct Setting
   async fn public(app: &AppContext) -> Result<Vec<Setting>>
   async fn groups(app: &AppContext) -> Result<Vec<String>>
 ```
-

@@ -73,4 +73,3 @@ trait HasAttachments
 fn available_attachment_locales(app: &AppContext) -> Result<Vec<String>>
 fn localized_attachment_collection(collection: &str, locale: &str) -> String
 ```
-

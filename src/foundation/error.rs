@@ -119,7 +119,7 @@ impl Error {
         }
     }
 
-    fn public_message(&self) -> String {
+    pub(crate) fn public_message(&self) -> String {
         let status = self.status_code();
         if status.is_server_error() {
             return Self::internal_server_error_message().to_string();

@@ -118,6 +118,10 @@ struct LocalDateTime
   fn sub_seconds(self, seconds: i64) -> Self
   fn add_days(self, days: i64) -> Self
   fn sub_days(self, days: i64) -> Self
+struct MiddlewareGroupId
+  const fn new(value: &'static str) -> Self
+  fn owned(value: impl Into<String>) -> Self
+  fn as_str(&self) -> &str
 struct MigrationId
   const fn new(value: &'static str) -> Self
   fn owned(value: impl Into<String>) -> Self
@@ -213,4 +217,3 @@ struct LockHeartbeat
 
 - `run_blocking(label, work)` isolates CPU-heavy or blocking synchronous work on Tokio's blocking pool and maps task panics into Foundry errors.
 - `HashManager::hash()` and `HashManager::check()` remain synchronous; wrap password hashing or checking in `run_blocking` inside async handlers or model mutators.
-

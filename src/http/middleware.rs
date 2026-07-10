@@ -22,6 +22,7 @@ use crate::config::{
 use crate::foundation::{AppContext, Error, Result};
 use crate::logging::RuntimeBackendKind;
 use crate::support::runtime::RuntimeBackend;
+use crate::support::MiddlewareGroupId;
 
 // ---------------------------------------------------------------------------
 // RealIp extension
@@ -133,16 +134,16 @@ impl MiddlewareConfig {
 // apply_ordered_middlewares
 // ---------------------------------------------------------------------------
 
-/// Sort middleware configs by priority (ascending) and apply them to the router.
+/// Sort middleware configs by priority and apply them to the router.
 ///
-/// Lower priority values wrap the router first, so they become the outermost
-/// layers and run first on incoming requests.
+/// Axum's most recently applied layer is outermost and runs first on incoming
+/// requests, so higher priorities must be applied first and lower priorities last.
 pub(crate) fn apply_ordered_middlewares(
     mut router: axum::Router<AppContext>,
     mut middlewares: Vec<MiddlewareConfig>,
     app: &AppContext,
 ) -> axum::Router<AppContext> {
-    middlewares.sort_by_key(|m| m.priority());
+    middlewares.sort_by_key(|middleware| std::cmp::Reverse(middleware.priority()));
     for mw in middlewares {
         router = mw.apply(router, app);
     }
@@ -1774,11 +1775,15 @@ impl TrustedProxy {
     }
 
     pub(crate) fn resolve_ip(&self, headers: &HeaderMap, peer_ip: IpAddr) -> IpAddr {
-        if self.trust_all || self.trusted_cidrs.iter().any(|cidr| cidr.contains(peer_ip)) {
+        if self.trusts_peer(peer_ip) {
             resolve_real_ip(headers, &self.headers).unwrap_or(peer_ip)
         } else {
             peer_ip
         }
+    }
+
+    pub(crate) fn trusts_peer(&self, peer_ip: IpAddr) -> bool {
+        self.trust_all || self.trusted_cidrs.iter().any(|cidr| cidr.contains(peer_ip))
     }
 
     /// Convert into a `MiddlewareConfig`.
@@ -1878,6 +1883,16 @@ pub(crate) fn resolve_real_ip_from_trusted_proxy_config(
         return Ok(peer_ip);
     }
     Ok(TrustedProxy::from_config(config)?.resolve_ip(headers, peer_ip))
+}
+
+pub(crate) fn is_trusted_proxy_peer_from_config(
+    peer_ip: IpAddr,
+    config: &HttpTrustedProxyConfig,
+) -> Result<bool> {
+    if !config.enabled {
+        return Ok(false);
+    }
+    Ok(TrustedProxy::from_config(config)?.trusts_peer(peer_ip))
 }
 
 fn default_proxy_headers() -> Vec<HeaderName> {
@@ -2070,11 +2085,25 @@ async fn etag_middleware(request: Request, next: Next) -> Response {
 
 /// Named middleware groups registered on `AppBuilder`.
 #[derive(Clone, Debug, Default)]
-pub struct MiddlewareGroups(pub std::collections::HashMap<String, Vec<MiddlewareConfig>>);
+pub struct MiddlewareGroups(pub HashMap<MiddlewareGroupId, Vec<MiddlewareConfig>>);
 
 impl MiddlewareGroups {
-    pub fn get(&self, name: &str) -> Option<&Vec<MiddlewareConfig>> {
-        self.0.get(name)
+    pub fn get(&self, id: &MiddlewareGroupId) -> Option<&Vec<MiddlewareConfig>> {
+        self.0.get(id)
+    }
+
+    pub fn register<I>(&mut self, id: I, middlewares: Vec<MiddlewareConfig>) -> Result<()>
+    where
+        I: Into<MiddlewareGroupId>,
+    {
+        let id = id.into();
+        if self.0.contains_key(&id) {
+            return Err(Error::message(format!(
+                "middleware group `{id}` is already registered"
+            )));
+        }
+        self.0.insert(id, middlewares);
+        Ok(())
     }
 }
 
@@ -2128,6 +2157,23 @@ mod tests {
 
     async fn csrf_token_handler(CsrfToken(token): CsrfToken) -> axum::Json<serde_json::Value> {
         axum::Json(serde_json::json!({ "token": token }))
+    }
+
+    #[test]
+    fn middleware_groups_use_typed_ids_and_reject_duplicates() {
+        const API_MIDDLEWARE: MiddlewareGroupId = MiddlewareGroupId::new("api");
+
+        let mut groups = MiddlewareGroups::default();
+        groups.register(API_MIDDLEWARE, Vec::new()).unwrap();
+
+        assert!(groups.get(&API_MIDDLEWARE).is_some());
+        let error = groups
+            .register(API_MIDDLEWARE, Vec::new())
+            .expect_err("duplicate middleware group should fail");
+        assert_eq!(
+            error.to_string(),
+            "middleware group `api` is already registered"
+        );
     }
 
     // ---- Csrf tests ----
@@ -2918,5 +2964,41 @@ mod tests {
                 "Compression",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn ordered_middlewares_resolve_trusted_proxy_ip_before_rate_limiting() {
+        let app = test_app();
+        let router = apply_ordered_middlewares(
+            axum::Router::<AppContext>::new().route("/", get(ok_handler)),
+            vec![
+                RateLimit::new(1).per_minute().build(),
+                TrustedProxy::new().trust_all().build(),
+            ],
+            &app,
+        )
+        .with_state(app);
+
+        let request = |forwarded_ip: &'static str| {
+            let mut request = HttpRequest::builder()
+                .uri("/")
+                .header(X_REAL_IP, forwarded_ip)
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(ConnectInfoAddr(
+                "127.0.0.1:8080".parse().expect("valid proxy address"),
+            ));
+            request
+        };
+
+        let first = router
+            .clone()
+            .oneshot(request("203.0.113.10"))
+            .await
+            .unwrap();
+        let second = router.oneshot(request("203.0.113.11")).await.unwrap();
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
     }
 }

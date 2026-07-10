@@ -95,4 +95,3 @@ trait Plugin
   fn boot<'life0, 'life1, 'async_trait>(
   fn shutdown<'life0, 'life1, 'async_trait>(
 ```
-

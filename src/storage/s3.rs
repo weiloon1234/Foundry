@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{Attribute, ObjectStore, ObjectStoreExt, PutOptions};
 
 use crate::foundation::{Error, Result};
 use crate::support::DateTime;
@@ -55,6 +55,16 @@ impl S3StorageAdapter {
             .unwrap_or(path)
             .to_string()
     }
+
+    fn put_options(content_type: Option<&str>, _visibility: StorageVisibility) -> PutOptions {
+        let mut options = PutOptions::default();
+        if let Some(content_type) = content_type {
+            options
+                .attributes
+                .insert(Attribute::ContentType, content_type.to_string().into());
+        }
+        options
+    }
 }
 
 #[async_trait]
@@ -64,12 +74,16 @@ impl StorageAdapter for S3StorageAdapter {
         path: &str,
         bytes: &[u8],
         content_type: Option<&str>,
-        _visibility: StorageVisibility,
+        visibility: StorageVisibility,
     ) -> Result<StoredFile> {
         let path = normalize_path(path)?;
         let object_path = ObjectPath::from(path.as_str());
         self.inner
-            .put(&object_path, bytes.to_vec().into())
+            .put_opts(
+                &object_path,
+                bytes.to_vec().into(),
+                Self::put_options(content_type, visibility),
+            )
             .await
             .map_err(Error::other)?;
 
@@ -204,5 +218,40 @@ impl StorageAdapter for S3StorageAdapter {
 
         objects.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(objects)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use object_store::Attribute;
+
+    use super::{S3StorageAdapter, StorageVisibility};
+
+    #[test]
+    fn put_options_include_content_type_object_metadata() {
+        let options = S3StorageAdapter::put_options(Some("image/webp"), StorageVisibility::Private);
+
+        assert_eq!(
+            options
+                .attributes
+                .get(&Attribute::ContentType)
+                .map(|value| value.as_ref()),
+            Some("image/webp")
+        );
+    }
+
+    #[test]
+    fn put_options_leave_content_type_unset_when_not_provided() {
+        let options = S3StorageAdapter::put_options(None, StorageVisibility::Private);
+
+        assert!(options.attributes.is_empty());
+    }
+
+    #[test]
+    fn put_options_do_not_translate_visibility_into_an_object_acl() {
+        let private = S3StorageAdapter::put_options(None, StorageVisibility::Private);
+        let public = S3StorageAdapter::put_options(None, StorageVisibility::Public);
+
+        assert_eq!(private, public);
     }
 }

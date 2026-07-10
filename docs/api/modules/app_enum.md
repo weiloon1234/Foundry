@@ -25,4 +25,3 @@ trait FoundryAppEnum: Clone
 fn to_snake_case(name: &str) -> String
 fn to_title_text(name: &str) -> String
 ```
-
