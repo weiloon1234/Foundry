@@ -45,8 +45,66 @@ App::builder()
 ```
 
 `config:publish` creates grouped TOML files such as `00-app.toml`, `10-http.toml`, and
-`40-runtime.toml`. Environment variables still override the merged config with the same
-double-underscore names, for example `DATABASE__URL`.
+`40-runtime.toml`. Environment variables override the merged config through the
+explicit `FOUNDRY__` namespace, for example `FOUNDRY__DATABASE__URL`.
+
+The descriptive environment label and security posture are separate:
+
+```toml
+[app]
+environment = "preview-eu"
+security_tier = "strict" # "strict" or "relaxed"
+```
+
+`development`/`testing` default to relaxed and `production`/`staging` default to
+strict. A custom environment without an explicit tier fails closed to strict;
+`doctor` warns until the choice is confirmed explicitly, and `doctor --strict`
+fails. Security-sensitive framework decisions use the resolved tier rather than
+guessing from the label.
+
+Legacy unprefixed names such as `DATABASE__URL` remain honored at lower
+precedence during migration. `doctor` reports them, and reports unknown
+framework TOML keys or unknown `FOUNDRY__` overlays so typos cannot hide in
+deploy configuration.
+
+Encryption keys can be rotated without making existing ciphertext unreadable:
+
+```toml
+[crypt]
+key = "NEW_BASE64_KEY"
+previous_keys = ["OLD_BASE64_KEY"]
+```
+
+New values are always encrypted with `key`; `previous_keys` are tried only
+during decryption, newest first. After stored ciphertext has been rewritten or
+expired, remove keys that are no longer needed. The equivalent environment
+override is `FOUNDRY__CRYPT__PREVIOUS_KEYS='["OLD_BASE64_KEY"]'`.
+
+Foundry installs its tracing subscriber during bootstrap and returns subscriber,
+file-writer, and OpenTelemetry setup errors instead of silently continuing. An
+embedding host that already owns the global subscriber must opt out explicitly:
+
+```rust
+App::builder()
+    .use_external_tracing_subscriber()
+```
+
+That mode leaves event emission intact but disables Foundry-owned stdout, file,
+and OpenTelemetry subscriber setup. JSON file logging uses a bounded background
+writer so request tasks never block on disk I/O:
+
+```toml
+[logging]
+log_dir = "logs"
+file_queue_capacity = 8192
+file_max_record_bytes = 65536
+file_flush_timeout_ms = 5000
+```
+
+When the queue is full, the newest record is dropped; oversized records are
+dropped whole. `AppContext::shutdown()` flushes accepted records within the
+configured deadline. Queue, drop, rejection, write-error, and flush-timeout
+counters are exposed through `RuntimeSnapshot.logging` and `/_foundry/metrics`.
 
 ### Registration
 
@@ -497,6 +555,23 @@ PROCESS=websocket cargo run         # WebSocket server
 PROCESS=cli cargo run -- db:migrate # CLI command
 ```
 
+The built-in CLI `dev` command reuses this exact selector to run local
+processes together:
+
+```bash
+PROCESS=cli cargo run -- dev                 # all four long-running processes
+PROCESS=cli cargo run -- dev http worker     # selected processes only
+PROCESS=cli cargo run -- dev http worker --max-restarts 2 --restart-backoff-ms 500
+```
+
+Each child is the current application executable with `PROCESS` set to
+`http`, `worker`, `scheduler`, or `websocket`, and its output is prefixed with
+that process name. Ctrl+C stops all children, and an early clean exit also
+stops its siblings rather than leaving a partial development stack. Restarts
+are disabled by default; when enabled, they are count-bounded and use
+exponential backoff capped at 60 seconds. This requires the `main.rs` selector
+above and does not generate or install a starter application.
+
 ---
 
 ## Graceful Shutdown
@@ -509,6 +584,12 @@ On Ctrl+C or SIGTERM:
 4. Exit cleanly
 
 No special code needed — the framework handles this automatically. Process-manager hard kills such as SIGKILL cannot be caught; unacked jobs recover through lease expiry.
+
+Applications that integrate a kernel into a custom process host with
+`build_http_kernel`, `build_worker_kernel`, or another `build_*_kernel` method
+own the outer lifecycle. Call `kernel.app().shutdown().await` when that host
+stops so managed tasks drain and plugin shutdown hooks run. Repeated calls are
+safe.
 
 ---
 

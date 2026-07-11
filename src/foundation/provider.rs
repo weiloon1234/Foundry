@@ -3,8 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::auth::{
-    Authenticatable, AuthenticatableRegistryHandle, BearerAuthenticator, GuardRegistryHandle,
-    Policy, PolicyRegistryHandle,
+    ActorHydrator, ActorHydratorRegistryHandle, Authenticatable, AuthenticatableRegistryHandle,
+    BearerAuthenticator, GuardRegistryHandle, Policy, PolicyRegistryHandle,
 };
 use crate::config::ConfigRepository;
 use crate::database::{MigrationFile, MigrationRegistryHandle, SeederFile, SeederRegistryHandle};
@@ -30,6 +30,7 @@ pub(crate) struct RegistryHub {
     pub(crate) migration: MigrationRegistryHandle,
     pub(crate) seeder: SeederRegistryHandle,
     pub(crate) guard: GuardRegistryHandle,
+    pub(crate) actor_hydrator: ActorHydratorRegistryHandle,
     pub(crate) policy: PolicyRegistryHandle,
     pub(crate) authenticatable: AuthenticatableRegistryHandle,
     pub(crate) readiness: ReadinessRegistryHandle,
@@ -48,6 +49,7 @@ impl RegistryHub {
             migration: crate::database::MigrationRegistryBuilder::shared(),
             seeder: crate::database::SeederRegistryBuilder::shared(),
             guard: crate::auth::GuardRegistryBuilder::shared(),
+            actor_hydrator: crate::auth::ActorHydratorRegistryBuilder::shared(),
             policy: crate::auth::PolicyRegistryBuilder::shared(),
             authenticatable: crate::auth::AuthenticatableRegistryBuilder::shared(),
             readiness: crate::logging::ReadinessRegistryBuilder::shared(),
@@ -130,8 +132,7 @@ impl ServiceRegistrar {
         E: Event,
         L: EventListener<E>,
     {
-        lock_unpoisoned(&self.registries.event, "event registry").listen::<E, L>(listener);
-        Ok(())
+        lock_unpoisoned(&self.registries.event, "event registry").listen::<E, L>(listener)
     }
 
     pub fn register_job<J>(&self) -> Result<()>
@@ -171,6 +172,15 @@ impl ServiceRegistrar {
         G: BearerAuthenticator,
     {
         lock_unpoisoned(&self.registries.guard, "guard registry").register_arc(id, Arc::new(guard))
+    }
+
+    pub fn register_actor_hydrator<I, H>(&self, guard: I, hydrator: H) -> Result<()>
+    where
+        I: Into<GuardId>,
+        H: ActorHydrator,
+    {
+        lock_unpoisoned(&self.registries.actor_hydrator, "actor hydrator registry")
+            .register_arc(guard, Arc::new(hydrator))
     }
 
     pub fn register_policy<I, P>(&self, id: I, policy: P) -> Result<()>

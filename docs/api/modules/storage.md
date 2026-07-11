@@ -17,7 +17,9 @@ struct StorageManager
   async fn put( &self, path: &str, contents: impl AsRef<[u8]>, ) -> Result<StoredFile>
   async fn put_bytes( &self, path: &str, bytes: impl AsRef<[u8]>, ) -> Result<StoredFile>
   async fn put_file( &self, path: &str, temp_path: &Path, content_type: Option<&str>, ) -> Result<StoredFile>
+  async fn put_stream<R>( &self, path: &str, stream: R, content_type: Option<&str>, ) -> Result<StoredFile>
   async fn get(&self, path: &str) -> Result<Vec<u8>>
+  async fn get_stream(&self, path: &str) -> Result<StorageReadStream>
   async fn delete(&self, path: &str) -> Result<()>
   async fn exists(&self, path: &str) -> Result<bool>
   async fn copy(&self, from: &str, to: &str) -> Result<()>
@@ -25,11 +27,14 @@ struct StorageManager
   async fn url(&self, path: &str) -> Result<String>
   async fn temporary_url( &self, path: &str, expires_at: DateTime, ) -> Result<String>
   async fn list_prefix( &self, prefix: &str, limit: usize, ) -> Result<Vec<StorageObject>>
+  async fn list_prefix_after( &self, prefix: &str, after: Option<&str>, limit: usize, ) -> Result<Vec<StorageObject>>
 ```
 
 ## foundry::storage::adapter
 
 ```rust
+pub type StorageReadStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send + 'static>>;
+pub type StorageWriteStream = Pin<Box<dyn AsyncRead + Send + 'static>>;
 enum StorageVisibility { Private, Public }
 trait StorageAdapter
   fn put_bytes<'life0, 'life1, 'life2, 'life3, 'async_trait>(
@@ -41,7 +46,10 @@ trait StorageAdapter
   fn move_to<'life0, 'life1, 'life2, 'async_trait>(
   fn url<'life0, 'life1, 'async_trait>(
   fn temporary_url<'life0, 'life1, 'async_trait>(
+  fn put_stream<'life0, 'life1, 'life2, 'async_trait>(
+  fn get_stream<'life0, 'life1, 'async_trait>(
   fn list_prefix<'life0, 'life1, 'async_trait>(
+  fn list_prefix_after<'life0, 'life1, 'life2, 'async_trait>(
 ```
 
 ## foundry::storage::config
@@ -66,7 +74,9 @@ struct StorageDisk
   async fn put( &self, path: &str, contents: impl AsRef<[u8]>, ) -> Result<StoredFile>
   async fn put_bytes( &self, path: &str, bytes: impl AsRef<[u8]>, ) -> Result<StoredFile>
   async fn put_file( &self, path: &str, temp_path: &Path, content_type: Option<&str>, ) -> Result<StoredFile>
+  async fn put_stream<R>( &self, path: &str, stream: R, content_type: Option<&str>, ) -> Result<StoredFile>
   async fn get(&self, path: &str) -> Result<Vec<u8>>
+  async fn get_stream(&self, path: &str) -> Result<StorageReadStream>
   async fn delete(&self, path: &str) -> Result<()>
   async fn exists(&self, path: &str) -> Result<bool>
   async fn copy(&self, from: &str, to: &str) -> Result<()>
@@ -74,6 +84,7 @@ struct StorageDisk
   async fn url(&self, path: &str) -> Result<String>
   async fn temporary_url( &self, path: &str, expires_at: DateTime, ) -> Result<String>
   async fn list_prefix( &self, prefix: &str, limit: usize, ) -> Result<Vec<StorageObject>>
+  async fn list_prefix_after( &self, prefix: &str, after: Option<&str>, limit: usize, ) -> Result<Vec<StorageObject>>
 ```
 
 ## foundry::storage::local

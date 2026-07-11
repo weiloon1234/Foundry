@@ -382,6 +382,273 @@ pub fn field_name_literal(field_ident: &Ident, explicit: &Option<LitStr>) -> Lit
         .unwrap_or_else(|| LitStr::new(&field_ident.to_string(), field_ident.span()))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SerdeRenameRule {
+    Lower,
+    Upper,
+    Pascal,
+    Camel,
+    Snake,
+    ScreamingSnake,
+    Kebab,
+    ScreamingKebab,
+}
+
+impl SerdeRenameRule {
+    fn parse(value: &LitStr) -> syn::Result<Self> {
+        match value.value().as_str() {
+            "lowercase" => Ok(Self::Lower),
+            "UPPERCASE" => Ok(Self::Upper),
+            "PascalCase" => Ok(Self::Pascal),
+            "camelCase" => Ok(Self::Camel),
+            "snake_case" => Ok(Self::Snake),
+            "SCREAMING_SNAKE_CASE" => Ok(Self::ScreamingSnake),
+            "kebab-case" => Ok(Self::Kebab),
+            "SCREAMING-KEBAB-CASE" => Ok(Self::ScreamingKebab),
+            _ => Err(syn::Error::new(
+                value.span(),
+                "unsupported serde rename rule",
+            )),
+        }
+    }
+
+    fn apply_to_field(self, field: &str) -> String {
+        match self {
+            Self::Lower | Self::Snake => field.to_string(),
+            Self::Upper | Self::ScreamingSnake => field.to_ascii_uppercase(),
+            Self::Pascal => field_to_pascal_case(field),
+            Self::Camel => lowercase_first(&field_to_pascal_case(field)),
+            Self::Kebab => field.replace('_', "-"),
+            Self::ScreamingKebab => field.to_ascii_uppercase().replace('_', "-"),
+        }
+    }
+
+    fn apply_to_variant(self, variant: &str) -> String {
+        match self {
+            Self::Pascal => variant.to_string(),
+            Self::Lower => variant.to_ascii_lowercase(),
+            Self::Upper => variant.to_ascii_uppercase(),
+            Self::Camel => lowercase_first(variant),
+            Self::Snake => variant_to_snake_case(variant),
+            Self::ScreamingSnake => variant_to_snake_case(variant).to_ascii_uppercase(),
+            Self::Kebab => variant_to_snake_case(variant).replace('_', "-"),
+            Self::ScreamingKebab => variant_to_snake_case(variant)
+                .to_ascii_uppercase()
+                .replace('_', "-"),
+        }
+    }
+}
+
+struct DirectionalValue<T> {
+    both: Option<T>,
+    serialize: Option<T>,
+    deserialize: Option<T>,
+}
+
+impl<T> Default for DirectionalValue<T> {
+    fn default() -> Self {
+        Self {
+            both: None,
+            serialize: None,
+            deserialize: None,
+        }
+    }
+}
+
+/// Resolves the one external field/variant name shared by serde, validation,
+/// multipart parsing, schema generation, and generated clients.
+pub struct WireNameResolver {
+    serialize_rule: Option<SerdeRenameRule>,
+    deserialize_rule: Option<SerdeRenameRule>,
+}
+
+impl WireNameResolver {
+    pub fn from_serde_attrs(attrs: &[Attribute]) -> syn::Result<Self> {
+        let directional = parse_serde_name_attribute(attrs, "rename_all")?;
+        let both = directional
+            .both
+            .as_ref()
+            .map(SerdeRenameRule::parse)
+            .transpose()?;
+        let serialize_rule = directional
+            .serialize
+            .as_ref()
+            .map(SerdeRenameRule::parse)
+            .transpose()?
+            .or(both);
+        let deserialize_rule = directional
+            .deserialize
+            .as_ref()
+            .map(SerdeRenameRule::parse)
+            .transpose()?
+            .or(both);
+        Ok(Self {
+            serialize_rule,
+            deserialize_rule,
+        })
+    }
+
+    pub fn field_name(&self, field: &Field) -> syn::Result<String> {
+        let ident = require_ident(field)?;
+        self.resolve_name(
+            &ident.to_string(),
+            &field.attrs,
+            |rule, value| rule.apply_to_field(value),
+            field,
+        )
+    }
+
+    pub fn variant_name(&self, variant: &syn::Variant) -> syn::Result<String> {
+        self.resolve_name(
+            &variant.ident.to_string(),
+            &variant.attrs,
+            |rule, value| rule.apply_to_variant(value),
+            variant,
+        )
+    }
+
+    fn resolve_name<T>(
+        &self,
+        rust_name: &str,
+        attrs: &[Attribute],
+        apply_rule: fn(SerdeRenameRule, &str) -> String,
+        subject: &T,
+    ) -> syn::Result<String>
+    where
+        T: quote::ToTokens,
+    {
+        let explicit = parse_serde_name_attribute(attrs, "rename")?;
+        let serialize = explicit
+            .serialize
+            .as_ref()
+            .or(explicit.both.as_ref())
+            .map(LitStr::value)
+            .unwrap_or_else(|| {
+                self.serialize_rule
+                    .map(|rule| apply_rule(rule, rust_name))
+                    .unwrap_or_else(|| rust_name.to_string())
+            });
+        let deserialize = explicit
+            .deserialize
+            .as_ref()
+            .or(explicit.both.as_ref())
+            .map(LitStr::value)
+            .unwrap_or_else(|| {
+                self.deserialize_rule
+                    .map(|rule| apply_rule(rule, rust_name))
+                    .unwrap_or_else(|| rust_name.to_string())
+            });
+
+        if serialize != deserialize {
+            return Err(syn::Error::new_spanned(
+                subject,
+                format!(
+                    "serde serialize name `{serialize}` and deserialize name `{deserialize}` differ; Foundry wire contracts require one shared name"
+                ),
+            ));
+        }
+
+        Ok(serialize)
+    }
+}
+
+fn parse_serde_name_attribute(
+    attrs: &[Attribute],
+    attribute_name: &str,
+) -> syn::Result<DirectionalValue<LitStr>> {
+    let mut result = DirectionalValue::default();
+
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident(attribute_name) {
+                return consume_nested_meta(meta);
+            }
+
+            if meta.input.peek(syn::Token![=]) {
+                let value: LitStr = meta.value()?.parse()?;
+                set_directional_value(&mut result.both, value, attribute_name)?;
+                return Ok(());
+            }
+
+            meta.parse_nested_meta(|direction| {
+                let slot = if direction.path.is_ident("serialize") {
+                    &mut result.serialize
+                } else if direction.path.is_ident("deserialize") {
+                    &mut result.deserialize
+                } else {
+                    return Err(direction
+                        .error("expected `serialize = \"...\"` or `deserialize = \"...\"`"));
+                };
+                let value: LitStr = direction.value()?.parse()?;
+                set_directional_value(slot, value, attribute_name)
+            })
+        })?;
+    }
+
+    Ok(result)
+}
+
+fn set_directional_value(
+    slot: &mut Option<LitStr>,
+    value: LitStr,
+    attribute_name: &str,
+) -> syn::Result<()> {
+    if slot.is_some() {
+        return Err(syn::Error::new(
+            value.span(),
+            format!("duplicate serde `{attribute_name}` value"),
+        ));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn consume_nested_meta(meta: syn::meta::ParseNestedMeta<'_>) -> syn::Result<()> {
+    if meta.input.peek(syn::Token![=]) {
+        let _: Expr = meta.value()?.parse()?;
+    } else if meta.input.peek(syn::token::Paren) {
+        let content;
+        syn::parenthesized!(content in meta.input);
+        let _: TokenStream = content.parse()?;
+    }
+    Ok(())
+}
+
+fn field_to_pascal_case(field: &str) -> String {
+    let mut result = String::new();
+    let mut capitalize = true;
+    for character in field.chars() {
+        if character == '_' {
+            capitalize = true;
+        } else if capitalize {
+            result.push(character.to_ascii_uppercase());
+            capitalize = false;
+        } else {
+            result.push(character);
+        }
+    }
+    result
+}
+
+fn lowercase_first(value: &str) -> String {
+    let mut characters = value.chars();
+    match characters.next() {
+        Some(first) => first.to_ascii_lowercase().to_string() + characters.as_str(),
+        None => String::new(),
+    }
+}
+
+fn variant_to_snake_case(variant: &str) -> String {
+    let mut result = String::new();
+    for (index, character) in variant.char_indices() {
+        if index > 0 && character.is_ascii_uppercase() {
+            result.push('_');
+        }
+        result.push(character.to_ascii_lowercase());
+    }
+    result
+}
+
 pub fn screaming_const_ident(field_ident: &Ident) -> Ident {
     format_ident!(
         "{}",
@@ -534,4 +801,75 @@ fn type_path_non_generic_ends_with(ty: &Type, expected_tail: &[&str]) -> bool {
         return false;
     }
     type_path_ends_with(ty, expected_tail)
+}
+
+#[cfg(test)]
+mod tests {
+    use syn::parse_quote;
+
+    use super::{ensure_named_struct, WireNameResolver};
+
+    #[test]
+    fn wire_names_apply_struct_rules_and_field_overrides() {
+        let input: syn::DeriveInput = parse_quote! {
+            #[serde(rename_all = "camelCase")]
+            struct Profile {
+                display_name: String,
+                #[serde(rename = "primaryEmail")]
+                email_address: String,
+            }
+        };
+        let resolver = WireNameResolver::from_serde_attrs(&input.attrs).unwrap();
+        let fields = ensure_named_struct(&input).unwrap();
+
+        assert_eq!(
+            resolver.field_name(&fields.named[0]).unwrap(),
+            "displayName"
+        );
+        assert_eq!(
+            resolver.field_name(&fields.named[1]).unwrap(),
+            "primaryEmail"
+        );
+    }
+
+    #[test]
+    fn wire_names_apply_serde_enum_rules() {
+        let input: syn::DeriveInput = parse_quote! {
+            #[serde(rename_all = "snake_case")]
+            enum Status {
+                InReview,
+                ReadyToShip,
+            }
+        };
+        let resolver = WireNameResolver::from_serde_attrs(&input.attrs).unwrap();
+        let syn::Data::Enum(data) = input.data else {
+            panic!("expected enum");
+        };
+
+        assert_eq!(
+            resolver.variant_name(&data.variants[0]).unwrap(),
+            "in_review"
+        );
+        assert_eq!(
+            resolver.variant_name(&data.variants[1]).unwrap(),
+            "ready_to_ship"
+        );
+    }
+
+    #[test]
+    fn asymmetric_serde_names_are_rejected() {
+        let input: syn::DeriveInput = parse_quote! {
+            #[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+            struct Profile {
+                display_name: String,
+            }
+        };
+        let resolver = WireNameResolver::from_serde_attrs(&input.attrs).unwrap();
+        let fields = ensure_named_struct(&input).unwrap();
+
+        let error = resolver.field_name(&fields.named[0]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Foundry wire contracts require one shared name"));
+    }
 }

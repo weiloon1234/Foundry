@@ -33,8 +33,8 @@ pub struct SchedulerKernel {
     shutdown_timeout: Duration,
     owner_id: String,
     leader_active: AtomicBool,
-    last_tick: Mutex<Option<DateTime>>,
-    last_interval_run: Mutex<HashMap<ScheduleId, DateTime>>,
+    tick_lock: tokio::sync::Mutex<()>,
+    schedule_cursors: Mutex<HashMap<ScheduleId, DateTime>>,
     active_tasks: Mutex<Vec<ScheduleTaskHandle>>,
 }
 
@@ -51,8 +51,8 @@ impl SchedulerKernel {
             shutdown_timeout: Duration::from_millis(config.shutdown_timeout_ms),
             owner_id: next_owner_id(),
             leader_active: AtomicBool::new(false),
-            last_tick: Mutex::new(None),
-            last_interval_run: Mutex::new(HashMap::new()),
+            tick_lock: tokio::sync::Mutex::new(()),
+            schedule_cursors: Mutex::new(HashMap::new()),
             active_tasks: Mutex::new(Vec::new()),
         })
     }
@@ -108,17 +108,12 @@ impl SchedulerKernel {
         now: DateTime,
         timezone: &Timezone,
     ) -> Result<Vec<ScheduleId>> {
+        let _tick = self.tick_lock.lock().await;
         self.prune_finished_tasks().await;
 
         if let Ok(diagnostics) = self.app.diagnostics() {
             diagnostics.record_scheduler_tick();
         }
-        let previous = {
-            let mut last_tick = lock_unpoisoned(&self.last_tick, "scheduler tick");
-            let previous = last_tick.unwrap_or_else(|| now.sub_seconds(1));
-            *last_tick = Some(now);
-            previous
-        };
 
         // Check current environment for per-task environment filtering
         let current_env = self
@@ -129,17 +124,10 @@ impl SchedulerKernel {
             .unwrap_or_else(|_| "development".to_string());
 
         let mut executed = Vec::new();
+        let mut coordination_error = None;
         for task in &self.tasks {
-            let is_due = match &task.kind {
-                ScheduleKind::Cron { expression } => {
-                    cron_due_in_timezone(expression, previous, now, timezone)
-                }
-                ScheduleKind::Interval { every } => {
-                    interval_due(&self.last_interval_run, &task.id, *every, now)
-                }
-            };
-
-            if !is_due {
+            if !self.schedule_is_due(task, now, timezone) {
+                self.commit_cron_cursor(task, now);
                 continue;
             }
 
@@ -147,6 +135,7 @@ impl SchedulerKernel {
             if !task.options.environments.is_empty()
                 && !task.options.environments.iter().any(|e| e == &current_env)
             {
+                self.commit_schedule_cursor(&task.id, now);
                 continue;
             }
 
@@ -156,9 +145,24 @@ impl SchedulerKernel {
             let options = task.options.clone();
             let overlap_guard = if options.without_overlapping {
                 let lock_key = format!("schedule:{task_id}");
-                match self
-                    .app
-                    .lock()?
+                let lock = match self.app.lock() {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "foundry.scheduler",
+                            schedule = %task_id,
+                            error = %error,
+                            "Skipped because the overlap lock service is unavailable"
+                        );
+                        if coordination_error.is_none() {
+                            coordination_error = Some(Error::message(format!(
+                                "failed to resolve overlap lock for schedule `{task_id}`: {error}"
+                            )));
+                        }
+                        continue;
+                    }
+                };
+                match lock
                     .acquire_storage_key(&lock_key, options.overlap_lock_ttl)
                     .await
                 {
@@ -169,6 +173,7 @@ impl SchedulerKernel {
                             schedule = %task_id,
                             "Skipped (previous invocation still running)"
                         );
+                        self.commit_schedule_cursor(&task.id, now);
                         continue;
                     }
                     Err(error) => {
@@ -178,9 +183,12 @@ impl SchedulerKernel {
                             error = %error,
                             "Skipped because the overlap lock could not be acquired safely"
                         );
-                        return Err(Error::message(format!(
-                            "failed to acquire overlap lock for schedule `{task_id}`: {error}"
-                        )));
+                        if coordination_error.is_none() {
+                            coordination_error = Some(Error::message(format!(
+                                "failed to acquire overlap lock for schedule `{task_id}`: {error}"
+                            )));
+                        }
+                        continue;
                     }
                 }
             } else {
@@ -232,10 +240,48 @@ impl SchedulerKernel {
             });
             self.track_active_schedule_task(handle, cancel);
 
+            self.commit_schedule_cursor(&task.id, now);
             executed.push(task_id);
         }
 
-        Ok(executed)
+        coordination_error.map_or(Ok(executed), Err)
+    }
+
+    fn schedule_is_due(&self, task: &ScheduledTask, now: DateTime, timezone: &Timezone) -> bool {
+        let mut cursors = lock_unpoisoned(&self.schedule_cursors, "scheduler cursors");
+        match &task.kind {
+            ScheduleKind::Cron { expression } => {
+                let previous = match cursors.get(&task.id).cloned() {
+                    Some(previous) => previous,
+                    None => {
+                        let previous = now.sub_seconds(1);
+                        cursors.insert(task.id.clone(), previous);
+                        previous
+                    }
+                };
+                cron_due_in_timezone(expression, previous, now, timezone)
+            }
+            ScheduleKind::Interval { every } => match cursors.get(&task.id).cloned() {
+                Some(last_run) => (now.as_chrono() - last_run.as_chrono())
+                    .to_std()
+                    .map(|elapsed| elapsed >= *every)
+                    .unwrap_or(false),
+                None => {
+                    cursors.insert(task.id.clone(), now);
+                    false
+                }
+            },
+        }
+    }
+
+    fn commit_cron_cursor(&self, task: &ScheduledTask, now: DateTime) {
+        if matches!(&task.kind, ScheduleKind::Cron { .. }) {
+            self.commit_schedule_cursor(&task.id, now);
+        }
+    }
+
+    fn commit_schedule_cursor(&self, task_id: &ScheduleId, now: DateTime) {
+        lock_unpoisoned(&self.schedule_cursors, "scheduler cursors").insert(task_id.clone(), now);
     }
 
     pub async fn run(self) -> Result<()> {
@@ -706,33 +752,6 @@ impl Drop for SchedulerKernel {
     }
 }
 
-fn interval_due(
-    state: &Mutex<HashMap<ScheduleId, DateTime>>,
-    id: &ScheduleId,
-    every: Duration,
-    now: DateTime,
-) -> bool {
-    let mut state = lock_unpoisoned(state, "scheduler interval");
-    match state.get(id).cloned() {
-        Some(last_run) => {
-            if (now.as_chrono() - last_run.as_chrono())
-                .to_std()
-                .map(|elapsed| elapsed >= every)
-                .unwrap_or(false)
-            {
-                state.insert(id.clone(), now);
-                true
-            } else {
-                false
-            }
-        }
-        None => {
-            state.insert(id.clone(), now);
-            false
-        }
-    }
-}
-
 fn next_owner_id() -> String {
     static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
     format!(
@@ -805,7 +824,8 @@ mod tests {
     use crate::logging::ExecutionContext;
     use crate::scheduler::{CronExpression, ScheduleOptions};
     use crate::support::runtime::RuntimeBackend;
-    use crate::support::{DateTime, ScheduleId};
+    use crate::support::sync::lock_unpoisoned;
+    use crate::support::{DateTime, ScheduleId, Timezone};
 
     struct DropFlag(Arc<AtomicBool>);
 
@@ -1730,7 +1750,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overlap_lock_backend_error_skips_schedule() {
+    async fn overlap_lock_backend_error_isolated_and_cron_cursor_retries() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -1753,20 +1773,38 @@ mod tests {
         )
         .unwrap();
 
-        let handled = Arc::new(AtomicUsize::new(0));
-        let schedule_handled = handled.clone();
+        let failed_id = ScheduleId::new("scheduler.overlap.backend-error");
+        let later_id = ScheduleId::new("scheduler.after.backend-error");
+        let failed_handled = Arc::new(AtomicUsize::new(0));
+        let later_handled = Arc::new(AtomicUsize::new(0));
+        let schedule_failed_handled = failed_handled.clone();
+        let schedule_later_handled = later_handled.clone();
+        let registered_failed_id = failed_id.clone();
+        let registered_later_id = later_id.clone();
         let kernel = crate::App::builder()
             .load_config_dir(dir.path())
             .register_schedule(move |registry| {
-                let handled = schedule_handled.clone();
+                let failed_handled = schedule_failed_handled.clone();
                 registry.cron_with_options(
-                    ScheduleId::new("scheduler.overlap.backend-error"),
+                    registered_failed_id.clone(),
                     CronExpression::every_minute()?,
                     ScheduleOptions::new().without_overlapping(),
                     move |_| {
-                        let handled = handled.clone();
+                        let failed_handled = failed_handled.clone();
                         async move {
-                            handled.fetch_add(1, Ordering::SeqCst);
+                            failed_handled.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    },
+                )?;
+                let later_handled = schedule_later_handled.clone();
+                registry.cron(
+                    registered_later_id.clone(),
+                    CronExpression::every_minute()?,
+                    move |_| {
+                        let later_handled = later_handled.clone();
+                        async move {
+                            later_handled.fetch_add(1, Ordering::SeqCst);
                             Ok(())
                         }
                     },
@@ -1776,17 +1814,112 @@ mod tests {
             .build_scheduler_kernel()
             .await
             .unwrap();
-        let error = tokio::time::timeout(
-            Duration::from_secs(2),
-            kernel.tick_at(schedule_time("2026-04-08T12:00:00Z")),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
+        let now = schedule_time("2026-04-08T12:00:00Z");
+        let error = tokio::time::timeout(Duration::from_secs(2), kernel.tick_at(now))
+            .await
+            .unwrap()
+            .unwrap_err();
         close_connection.await.unwrap();
 
         assert!(error.to_string().contains("failed to acquire overlap lock"));
-        assert_eq!(handled.load(Ordering::SeqCst), 0);
+        assert_eq!(failed_handled.load(Ordering::SeqCst), 0);
+        wait_for_count(&later_handled, 1).await;
+
+        {
+            let cursors = lock_unpoisoned(&kernel.schedule_cursors, "scheduler cursors");
+            assert_eq!(cursors.get(&failed_id), Some(&now.sub_seconds(1)));
+            assert_eq!(cursors.get(&later_id), Some(&now));
+        }
+        assert!(kernel.schedule_is_due(&kernel.tasks[0], now.add_seconds(30), &Timezone::Utc));
+        kernel.drain_active_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn overlap_lock_backend_error_preserves_due_interval_cursor() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let close_connection = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            drop(connection);
+        });
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("redis.toml"),
+            format!(
+                r#"
+                [redis]
+                url = "redis://{address}/"
+                namespace = "scheduler-failing-interval-lock-{}"
+                "#,
+                Uuid::now_v7()
+            ),
+        )
+        .unwrap();
+
+        let failed_id = ScheduleId::new("scheduler.interval.backend-error");
+        let later_id = ScheduleId::new("scheduler.interval.after-error");
+        let failed_handled = Arc::new(AtomicUsize::new(0));
+        let later_handled = Arc::new(AtomicUsize::new(0));
+        let schedule_failed_handled = failed_handled.clone();
+        let schedule_later_handled = later_handled.clone();
+        let registered_failed_id = failed_id.clone();
+        let registered_later_id = later_id.clone();
+        let kernel = crate::App::builder()
+            .load_config_dir(dir.path())
+            .register_schedule(move |registry| {
+                let failed_handled = schedule_failed_handled.clone();
+                registry.interval_with_options(
+                    registered_failed_id.clone(),
+                    Duration::from_secs(60),
+                    ScheduleOptions::new().without_overlapping(),
+                    move |_| {
+                        let failed_handled = failed_handled.clone();
+                        async move {
+                            failed_handled.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    },
+                )?;
+                let later_handled = schedule_later_handled.clone();
+                registry.interval(
+                    registered_later_id.clone(),
+                    Duration::from_secs(60),
+                    move |_| {
+                        let later_handled = later_handled.clone();
+                        async move {
+                            later_handled.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    },
+                )?;
+                Ok(())
+            })
+            .build_scheduler_kernel()
+            .await
+            .unwrap();
+        let initial = schedule_time("2026-04-08T12:00:00Z");
+        let due = schedule_time("2026-04-08T12:01:00Z");
+
+        assert!(kernel.tick_at(initial).await.unwrap().is_empty());
+        let error = tokio::time::timeout(Duration::from_secs(2), kernel.tick_at(due))
+            .await
+            .unwrap()
+            .unwrap_err();
+        close_connection.await.unwrap();
+
+        assert!(error.to_string().contains("failed to acquire overlap lock"));
+        assert_eq!(failed_handled.load(Ordering::SeqCst), 0);
+        wait_for_count(&later_handled, 1).await;
+
+        {
+            let cursors = lock_unpoisoned(&kernel.schedule_cursors, "scheduler cursors");
+            assert_eq!(cursors.get(&failed_id), Some(&initial));
+            assert_eq!(cursors.get(&later_id), Some(&due));
+        }
+        assert!(kernel.schedule_is_due(&kernel.tasks[0], due, &Timezone::Utc));
+        kernel.drain_active_tasks().await;
     }
 
     #[tokio::test]

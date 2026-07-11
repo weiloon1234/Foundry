@@ -1,0 +1,5 @@
+error: field `missing` referenced in `required_if` does not exist on struct `InvalidConditionalRequest`
+ --> tests/ui/derive/fail_validate_conditional_unknown_field.rs:6:28
+  |
+6 |     #[validate(required_if("missing", "yes"))]
+  |                            ^^^^^^^^^

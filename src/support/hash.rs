@@ -79,6 +79,26 @@ impl HashManager {
         }
     }
 
+    /// Determine whether a stored password hash should be regenerated with
+    /// the manager's current Argon2id algorithm, version, or work factors.
+    ///
+    /// Malformed, incomplete, and non-Argon2id hashes return `Ok(true)` so a
+    /// successfully authenticated credential can be upgraded safely.
+    pub fn needs_rehash(&self, hash: &str) -> Result<bool> {
+        let parsed = match PasswordHash::new(hash) {
+            Ok(hash) => hash,
+            Err(_) => return Ok(true),
+        };
+
+        Ok(parsed.algorithm.as_str() != "argon2id"
+            || parsed.version != Some(u32::from(Version::V0x13))
+            || parsed.params.get_decimal("m") != Some(self.memory_cost)
+            || parsed.params.get_decimal("t") != Some(self.time_cost)
+            || parsed.params.get_decimal("p") != Some(self.parallelism)
+            || parsed.salt.is_none()
+            || parsed.hash.is_none())
+    }
+
     /// Generate a random alphanumeric string of the given length.
     ///
     /// Convenience wrapper around [`Token::generate`].
@@ -158,5 +178,78 @@ mod tests {
         let hash_a = manager.hash("same-password").unwrap();
         let hash_b = manager.hash("same-password").unwrap();
         assert_ne!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn needs_rehash_accepts_current_argon2id_parameters() {
+        let config = HashingConfig {
+            memory_cost: 32,
+            time_cost: 1,
+            parallelism: 1,
+            ..HashingConfig::default()
+        };
+        let manager = HashManager::from_config(&config).unwrap();
+        let hash = manager.hash("password").unwrap();
+
+        assert!(!manager.needs_rehash(&hash).unwrap());
+    }
+
+    #[test]
+    fn needs_rehash_detects_work_factor_algorithm_and_version_changes() {
+        let original = HashManager::from_config(&HashingConfig {
+            memory_cost: 32,
+            time_cost: 1,
+            parallelism: 1,
+            ..HashingConfig::default()
+        })
+        .unwrap();
+        let hash = original.hash("password").unwrap();
+
+        for config in [
+            HashingConfig {
+                memory_cost: 64,
+                time_cost: 1,
+                parallelism: 1,
+                ..HashingConfig::default()
+            },
+            HashingConfig {
+                memory_cost: 32,
+                time_cost: 2,
+                parallelism: 1,
+                ..HashingConfig::default()
+            },
+            HashingConfig {
+                memory_cost: 32,
+                time_cost: 1,
+                parallelism: 2,
+                ..HashingConfig::default()
+            },
+        ] {
+            let manager = HashManager::from_config(&config).unwrap();
+            assert!(manager.needs_rehash(&hash).unwrap());
+        }
+
+        assert!(original
+            .needs_rehash(&hash.replacen("$argon2id$", "$argon2i$", 1))
+            .unwrap());
+        assert!(original
+            .needs_rehash(&hash.replacen("v=19", "v=16", 1))
+            .unwrap());
+    }
+
+    #[test]
+    fn needs_rehash_treats_malformed_or_incomplete_hashes_as_stale() {
+        let manager = HashManager::from_config(&HashingConfig {
+            memory_cost: 32,
+            time_cost: 1,
+            parallelism: 1,
+            ..HashingConfig::default()
+        })
+        .unwrap();
+
+        assert!(manager.needs_rehash("not-a-password-hash").unwrap());
+        assert!(manager
+            .needs_rehash("$argon2id$v=19$m=32,t=1,p=1$c2FsdA")
+            .unwrap());
     }
 }

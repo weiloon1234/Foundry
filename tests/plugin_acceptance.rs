@@ -632,6 +632,19 @@ impl foundry::auth::BearerAuthenticator for DirectGuard {
     }
 }
 
+struct DirectActorHydrator;
+
+#[async_trait]
+impl ActorHydrator for DirectActorHydrator {
+    async fn hydrate(&self, actor: &Actor, _app: &AppContext) -> Result<Option<Actor>> {
+        Ok(Some(
+            actor
+                .clone()
+                .with_permissions([PermissionId::new("direct:hydrated")]),
+        ))
+    }
+}
+
 struct DirectPolicy;
 
 #[async_trait]
@@ -653,6 +666,7 @@ impl foundry::plugin::Plugin for DirectRegistrationPlugin {
     fn register(&self, registrar: &mut foundry::plugin::PluginRegistrar) -> Result<()> {
         // Direct registration — no ServiceProvider wrapper needed
         registrar.register_guard(DIRECT_GUARD, DirectGuard);
+        registrar.register_actor_hydrator(DIRECT_GUARD, DirectActorHydrator);
         registrar.register_policy(DIRECT_POLICY, DirectPolicy);
         registrar.register_middleware(foundry::MiddlewareConfig::Compression(foundry::Compression));
         registrar.register_routes(|r| {
@@ -683,6 +697,7 @@ async fn plugin_direct_registration_works_without_provider_wrapper() {
         .await
         .unwrap();
     assert_eq!(actor.id, "direct-user");
+    assert!(actor.has_permission(PermissionId::new("direct:hydrated")));
 
     // Policy is registered — verify through authorizer
     let authorizer = app.authorizer().unwrap();
@@ -691,6 +706,119 @@ async fn plugin_direct_registration_works_without_provider_wrapper() {
         .await
         .unwrap();
     assert!(allowed);
+}
+
+struct DirectHydratorCollisionProvider;
+
+#[async_trait]
+impl ServiceProvider for DirectHydratorCollisionProvider {
+    async fn register(&self, registrar: &mut ServiceRegistrar) -> Result<()> {
+        registrar.register_actor_hydrator(DIRECT_GUARD, DirectActorHydrator)
+    }
+}
+
+#[tokio::test]
+async fn plugin_and_provider_actor_hydrators_cannot_claim_the_same_guard() {
+    let error = App::builder()
+        .register_plugin(DirectRegistrationPlugin)
+        .register_provider(DirectHydratorCollisionProvider)
+        .build_cli_kernel()
+        .await
+        .err()
+        .expect("actor hydrator collision should fail bootstrap");
+
+    assert!(error
+        .to_string()
+        .contains("actor hydrator for guard `direct_guard` already registered"));
+}
+
+// ---------------------------------------------------------------------------
+// Semantic event ID collisions across plugin and application registrations
+// ---------------------------------------------------------------------------
+
+const EVENT_COLLISION_PLUGIN_ID: PluginId = PluginId::new("foundry.plugin.event_collision");
+
+#[derive(Clone, Serialize)]
+struct PluginCollisionEvent;
+
+impl Event for PluginCollisionEvent {
+    const ID: EventId = EventId::new("tests.shared_event_id");
+}
+
+#[derive(Clone, Serialize)]
+struct ApplicationCollisionEvent;
+
+impl Event for ApplicationCollisionEvent {
+    const ID: EventId = EventId::new("tests.shared_event_id");
+}
+
+struct PluginCollisionListener;
+
+#[async_trait]
+impl EventListener<PluginCollisionEvent> for PluginCollisionListener {
+    async fn handle(&self, _context: &EventContext, _event: &PluginCollisionEvent) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct ApplicationCollisionListener;
+
+#[async_trait]
+impl EventListener<ApplicationCollisionEvent> for ApplicationCollisionListener {
+    async fn handle(
+        &self,
+        _context: &EventContext,
+        _event: &ApplicationCollisionEvent,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct EventCollisionPlugin;
+
+impl Plugin for EventCollisionPlugin {
+    fn manifest(&self) -> PluginManifest {
+        PluginManifest::new(
+            EVENT_COLLISION_PLUGIN_ID,
+            Version::new(1, 0, 0),
+            VersionReq::parse(">=0.1.0").unwrap(),
+        )
+    }
+
+    fn register(&self, registrar: &mut PluginRegistrar) -> Result<()> {
+        registrar.listen_event::<PluginCollisionEvent, _>(PluginCollisionListener);
+        Ok(())
+    }
+}
+
+struct EventCollisionProvider;
+
+#[async_trait]
+impl ServiceProvider for EventCollisionProvider {
+    async fn register(&self, registrar: &mut ServiceRegistrar) -> Result<()> {
+        registrar.listen_event::<ApplicationCollisionEvent, _>(ApplicationCollisionListener)
+    }
+}
+
+#[tokio::test]
+async fn plugin_and_application_event_types_cannot_share_a_semantic_id() {
+    let error = App::builder()
+        .register_plugin(EventCollisionPlugin)
+        .register_provider(EventCollisionProvider)
+        .build_cli_kernel()
+        .await
+        .err()
+        .expect("event ID collision should fail bootstrap");
+
+    assert!(error
+        .to_string()
+        .contains("event ID `tests.shared_event_id`"));
+    assert!(error
+        .to_string()
+        .contains(std::any::type_name::<PluginCollisionEvent>()));
+    assert!(error
+        .to_string()
+        .contains(std::any::type_name::<ApplicationCollisionEvent>()));
 }
 
 // ---------------------------------------------------------------------------

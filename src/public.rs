@@ -9,7 +9,7 @@ pub use crate::attachments::{
     AttachmentImageResize, AttachmentSpec, AttachmentSpecHook, AttachmentSpecKind,
     AttachmentUploadBuilder, HasAttachments,
 };
-pub use crate::audit::AuditLog;
+pub use crate::audit::{scope_audit, AuditContext, AuditEntry, AuditLog, AuditManager};
 pub use crate::auth::{
     email_verification::EmailVerificationManager,
     lockout::{
@@ -26,21 +26,23 @@ pub use crate::auth::{
         HasToken, RefreshTokenRequest, TokenAuthenticator, TokenManager, TokenPair, TokenResponse,
         WsTokenResponse,
     },
-    AccessScope, Actor, Auth, AuthError, AuthErrorCode, AuthManager, Authenticatable,
-    AuthenticatableRegistry, AuthenticatedModel, Authorizer, BearerAuthenticator, CurrentActor,
-    GuardedAccess, OptionalActor, Policy, StaticBearerAuthenticator,
+    AccessScope, Actor, ActorHydrator, Auth, AuthError, AuthErrorCode, AuthManager,
+    Authenticatable, AuthenticatableRegistry, AuthenticatedModel, Authorizer, BearerAuthenticator,
+    CurrentActor, GuardedAccess, OptionalActor, Policy, StaticBearerAuthenticator,
 };
-pub use crate::cache::{CacheManager, CacheStore};
-pub use crate::cli::{CommandInvocation, CommandRegistry};
+pub use crate::cache::{CacheManager, CacheStore, TaggedCache};
+pub use crate::cli::{
+    CommandExit, CommandInvocation, CommandIo, CommandProgress, CommandRegistry, TerminalCommandIo,
+};
 pub use crate::contract::{
     ContractAction, ContractAuth, ContractError, ContractHttpBody, ContractHttpTransport,
-    ContractManifest, ContractPayload, ContractRealtimeChannel, ContractRealtimeEvent,
-    ContractResponse, ContractSchema, ContractTransport, ContractValidationAttribute,
-    ContractValidationField, ContractValidationMessage, ContractValidationRule,
-    ContractValidationSchema, ContractValueKind, ContractWebSocketTransport,
-    CONTRACT_MANIFEST_VERSION,
+    ContractManifest, ContractParameter, ContractParameterLocation, ContractPayload,
+    ContractRealtimeChannel, ContractRealtimeEvent, ContractResponse, ContractSchema,
+    ContractTransport, ContractValidationAttribute, ContractValidationField,
+    ContractValidationMessage, ContractValidationRule, ContractValidationSchema, ContractValueKind,
+    ContractWebSocketTransport, CONTRACT_MANIFEST_VERSION,
 };
-pub use crate::countries::Country;
+pub use crate::countries::{Country, CountryCurrency, CountryStatus};
 pub use crate::database::{
     belongs_to, has_many, has_one, many_to_many, AggregateExpr, AggregateFn, AggregateNode,
     AggregateProjection, AnyRelation, BinaryExpr, BinaryOperator, Case, Column, ColumnInfo,
@@ -70,7 +72,7 @@ pub use crate::datatable::{
     DatatableFilterValue, DatatableFilterValueKind, DatatableJsonResponse, DatatableMapping,
     DatatablePaginationMeta, DatatableQuery, DatatableRegistry, DatatableRelationColumn,
     DatatableRelationFilter, DatatableRequest, DatatableSort, DatatableSortInput, DatatableValue,
-    GeneratedDatatableExport,
+    GeneratedDatatableExport, GeneratedDatatableExportFile, LEGACY_DATATABLE_EXPORT_MAX_BYTES,
 };
 pub use crate::email::{
     EmailAddress, EmailAttachment, EmailDriver, EmailMailer, EmailManager, EmailMessage,
@@ -99,10 +101,16 @@ pub use crate::http::response::MessageResponse;
 pub use crate::http::routes::RouteRegistry;
 pub use crate::http::{
     HttpAuthorizeContext, HttpRegistrar, HttpResourceRoutes, HttpRouteBuilder, HttpRouteOptions,
-    HttpScope, JsonValidated, RouteManifestEntry, RouteManifestResponse, Validated,
+    HttpScope, JsonValidated, ModelPath, RouteManifestEntry, RouteManifestError,
+    RouteManifestParameter, RouteManifestResponse, Validated,
+};
+pub use crate::http_client::{
+    HttpClient, HttpClientBuilder, HttpClientError, HttpClientErrorKind, HttpClientResult,
+    HttpHeaderMap, HttpHeaderName, HttpHeaderValue, HttpMethod, HttpRequest, HttpRequestBuilder,
+    HttpResponse, HttpStatus, HttpTransport, HttpUrl, RawHttpClient, ReqwestTransport, RetryPolicy,
 };
 pub use crate::i18n::{I18n, I18nManager, Locale};
-pub use crate::imaging::{ImageFormat, ImageProcessor, Rotation};
+pub use crate::imaging::{ImageDecodeLimits, ImageFormat, ImageProcessor, Rotation};
 pub use crate::jobs::{
     spawn_worker, Job, JobBatchBuilder, JobChainBuilder, JobContext, JobDeadLetterContext,
     JobDispatcher, JobHistoryStatus, JobMiddleware, Worker,
@@ -111,15 +119,19 @@ pub use crate::kernel::worker::WorkerKernel;
 pub use crate::logging::{
     current_trace_id, AuthOutcome, CurrentRequest, ErrorReporter, HandlerErrorReport,
     HttpOutcomeClass, JobDeadLetteredReport, JobOutcome, LivenessReport, LogFormat, LogLevel,
-    ObservabilityOptions, PanicContext, PanicReport, ProbeResult, ProbeState, ReadinessCheck,
-    ReadinessReport, RequestId, RuntimeBackendKind, RuntimeDiagnostics, RuntimeSnapshot,
-    SchedulerLeadershipState, WebSocketConnectionState,
+    LogWriterRuntimeSnapshot, ObservabilityOptions, PanicContext, PanicReport, ProbeResult,
+    ProbeState, ReadinessCheck, ReadinessReport, RequestId, RequestIdError, RuntimeBackendKind,
+    RuntimeDiagnostics, RuntimeSnapshot, SchedulerLeadershipState, WebSocketConnectionState,
+    REQUEST_ID_HEADER, REQUEST_ID_MAX_LENGTH,
 };
-pub use crate::metadata::{HasMetadata, ModelMeta};
+pub use crate::metadata::{
+    audit_metadata_orphans, prune_metadata_orphans, HasMetadata, MetadataOwner, ModelMeta,
+};
 pub use crate::notifications::{
-    register_notification_websocket_channel, BroadcastNotificationChannel,
-    DatabaseNotificationChannel, EmailNotificationChannel, Notifiable, Notification,
-    NotificationChannel, NotificationChannelRegistry, NOTIFICATION_BROADCAST_CHANNEL,
+    register_notification_websocket_channel, BroadcastNotificationChannel, DatabaseNotification,
+    DatabaseNotificationChannel, DatabaseNotificationRepository, DatabaseNotificationScope,
+    EmailNotificationChannel, Notifiable, Notification, NotificationChannel,
+    NotificationChannelRegistry, DEFAULT_NOTIFIABLE_TYPE, NOTIFICATION_BROADCAST_CHANNEL,
     NOTIFICATION_BROADCAST_EVENT, NOTIFY_BROADCAST, NOTIFY_DATABASE, NOTIFY_EMAIL,
 };
 pub use crate::openapi::spec::{
@@ -130,12 +142,15 @@ pub use crate::plugin::{
     Plugin, PluginAsset, PluginAssetKind, PluginDependency, PluginInstallOptions, PluginManifest,
     PluginRegistrar, PluginRegistry, PluginScaffold, PluginScaffoldOptions, PluginScaffoldVar,
 };
-pub use crate::redis::{RedisChannel, RedisConnection, RedisKey, RedisManager};
+pub use crate::redis::{
+    RedisChannel, RedisCommand, RedisCommandBuilder, RedisConnection, RedisKey, RedisManager,
+    RedisPipeline, RedisScript,
+};
 pub use crate::scheduler::{CronExpression, ScheduleInvocation, ScheduleOptions, ScheduleRegistry};
 pub use crate::storage::{
     LocalStorageAdapter, MultipartForm, S3StorageAdapter, StorageAdapter, StorageConfig,
-    StorageDisk, StorageManager, StorageObject, StorageVisibility, StoredFile, UploadCounters,
-    UploadLimits, UploadedFile,
+    StorageDisk, StorageManager, StorageObject, StorageReadStream, StorageVisibility,
+    StorageWriteStream, StoredFile, UploadCounters, UploadLimits, UploadedFile,
 };
 pub use crate::support::lock::{DistributedLock, LockGuard, LockHeartbeat};
 pub use crate::support::{
@@ -146,8 +161,11 @@ pub use crate::support::{
     RouteId, ScheduleId, SeederId, Time, Timezone, Token, ValidationRuleId,
 };
 pub use crate::testing::{
-    assert_safe_to_wipe, Factory, FactoryBuilder, FactoryValue, TestApp, TestAppBuilder,
-    TestClient, TestRequestBuilder, TestResponse,
+    assert_database_count, assert_database_has, assert_database_missing, assert_safe_to_wipe,
+    ClockFake, CommandIoFake, DatabaseTestTransaction, EventFake, Factory, FactoryBuilder,
+    FactoryValue, HttpClientFake, JobFake, MailFake, NotificationDelivery, NotificationFake,
+    PluginTestApp, PluginTestHarness, RecordedJob, RecordedNotification, StorageFake,
+    StoredFakeFile, TestApp, TestAppBuilder, TestClient, TestRequestBuilder, TestResponse,
 };
 pub use crate::translations::{
     current_locale, translation_join, HasTranslations, ModelTranslation, TranslatedFields,
@@ -158,7 +176,7 @@ pub use crate::validation::{
     Validator,
 };
 pub use crate::websocket::{
-    ChannelHandler, ClientAction, ClientMessage, PresenceInfo, ServerMessage,
+    ChannelHandler, ClientAction, ClientMessage, PresenceInfo, ServerMessage, TypedChannelHandler,
     WebSocketChannelDescriptor, WebSocketChannelEventDescriptor, WebSocketChannelOptions,
     WebSocketChannelRegistry, WebSocketContext, WebSocketEventDirection, WebSocketPublisher,
     WebSocketRegistrar, ACK_EVENT, ERROR_EVENT, PRESENCE_JOIN_EVENT, PRESENCE_LEAVE_EVENT,

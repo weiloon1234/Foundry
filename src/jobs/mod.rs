@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use crate::logging::{
     JobOutcome as RecordedJobOutcome, RuntimeDiagnostics,
 };
 use crate::support::runtime::RuntimeBackend;
-use crate::support::{sync::lock_unpoisoned, JobId, QueueId};
+use crate::support::{sync::lock_unpoisoned, DateTime, JobId, QueueId};
 
 use self::backend::{ClaimedJobLease, JobToEnqueue, SuccessfulJobEffects};
 
@@ -298,6 +298,19 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + Debug + 'static {
 pub struct JobDispatcher {
     runtime: Arc<JobRuntime>,
     diagnostics: Arc<RuntimeDiagnostics>,
+    test_sink: Option<Arc<dyn JobDispatchSink>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RecordedJobDispatch {
+    pub(crate) job_id: JobId,
+    pub(crate) queue: QueueId,
+    pub(crate) scheduled_at: i64,
+    pub(crate) payload: serde_json::Value,
+}
+
+pub(crate) trait JobDispatchSink: Send + Sync {
+    fn record(&self, dispatch: RecordedJobDispatch) -> Result<()>;
 }
 
 struct UniqueJobReservation {
@@ -337,6 +350,15 @@ impl JobDispatcher {
         Self {
             runtime,
             diagnostics,
+            test_sink: None,
+        }
+    }
+
+    pub(crate) fn with_test_sink(&self, sink: Arc<dyn JobDispatchSink>) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+            diagnostics: self.diagnostics.clone(),
+            test_sink: Some(sink),
         }
     }
 
@@ -344,20 +366,119 @@ impl JobDispatcher {
     where
         J: Job,
     {
-        self.dispatch_at(job, Utc::now().timestamp_millis()).await
+        self.dispatch_at_millis(job, Utc::now().timestamp_millis())
+            .await
     }
 
+    /// Dispatch a job immediately on an explicit queue.
+    ///
+    /// Long-running workers must include dynamic queues in
+    /// `jobs.queue_priorities`; framework-owned queues such as `email.queue`
+    /// are registered automatically.
+    pub async fn dispatch_on<J, Q>(&self, job: J, queue: Q) -> Result<()>
+    where
+        J: Job,
+        Q: Into<QueueId>,
+    {
+        self.dispatch_at_millis_on(job, Utc::now().timestamp_millis(), Some(queue.into()))
+            .await
+    }
+
+    /// Dispatch a job at an absolute Foundry timestamp.
+    pub async fn dispatch_at<J>(&self, job: J, run_at: DateTime) -> Result<()>
+    where
+        J: Job,
+    {
+        self.dispatch_at_millis(job, run_at.timestamp_millis())
+            .await
+    }
+
+    /// Dispatch a job at an absolute Foundry timestamp on an explicit queue.
+    pub async fn dispatch_at_on<J, Q>(&self, job: J, run_at: DateTime, queue: Q) -> Result<()>
+    where
+        J: Job,
+        Q: Into<QueueId>,
+    {
+        self.dispatch_at_millis_on(job, run_at.timestamp_millis(), Some(queue.into()))
+            .await
+    }
+
+    /// Dispatch a job after the supplied delay.
+    pub async fn dispatch_after<J>(&self, job: J, delay: Duration) -> Result<()>
+    where
+        J: Job,
+    {
+        let run_at_millis = checked_dispatch_time_after(Utc::now().timestamp_millis(), delay)?;
+        self.dispatch_at_millis(job, run_at_millis).await
+    }
+
+    /// Dispatch a job after the supplied delay on an explicit queue.
+    pub async fn dispatch_after_on<J, Q>(&self, job: J, delay: Duration, queue: Q) -> Result<()>
+    where
+        J: Job,
+        Q: Into<QueueId>,
+    {
+        let run_at_millis = checked_dispatch_time_after(Utc::now().timestamp_millis(), delay)?;
+        self.dispatch_at_millis_on(job, run_at_millis, Some(queue.into()))
+            .await
+    }
+
+    /// Dispatch a job at a raw Unix epoch timestamp in milliseconds.
     pub async fn dispatch_later<J>(&self, job: J, run_at_millis: i64) -> Result<()>
     where
         J: Job,
     {
-        self.dispatch_at(job, run_at_millis).await
+        self.dispatch_at_millis(job, run_at_millis).await
     }
 
-    async fn dispatch_at<J>(&self, job: J, run_at_millis: i64) -> Result<()>
+    /// Dispatch a job at a raw Unix epoch timestamp on an explicit queue.
+    pub async fn dispatch_later_on<J, Q>(&self, job: J, run_at_millis: i64, queue: Q) -> Result<()>
+    where
+        J: Job,
+        Q: Into<QueueId>,
+    {
+        self.dispatch_at_millis_on(job, run_at_millis, Some(queue.into()))
+            .await
+    }
+
+    async fn dispatch_at_millis<J>(&self, job: J, run_at_millis: i64) -> Result<()>
     where
         J: Job,
     {
+        self.dispatch_at_millis_on(job, run_at_millis, None).await
+    }
+
+    async fn dispatch_at_millis_on<J>(
+        &self,
+        job: J,
+        run_at_millis: i64,
+        queue_override: Option<QueueId>,
+    ) -> Result<()>
+    where
+        J: Job,
+    {
+        if queue_override
+            .as_ref()
+            .is_some_and(|queue| queue.as_str().trim().is_empty())
+        {
+            return Err(Error::message("job queue name cannot be empty"));
+        }
+
+        if let Some(sink) = &self.test_sink {
+            let queue = queue_override.unwrap_or_else(|| {
+                J::QUEUE
+                    .clone()
+                    .unwrap_or_else(|| self.runtime.config.queue.clone())
+            });
+            sink.record(RecordedJobDispatch {
+                job_id: J::ID.clone(),
+                queue,
+                scheduled_at: run_at_millis,
+                payload: serde_json::to_value(&job).map_err(Error::other)?,
+            })?;
+            return Ok(());
+        }
+
         let mut unique_reservation = None;
 
         // Unique job check: skip dispatch if a duplicate exists within the window
@@ -390,9 +511,11 @@ impl JobDispatcher {
         }
 
         let dispatch_result = async {
-            let queue = J::QUEUE
-                .clone()
-                .unwrap_or_else(|| self.runtime.config.queue.clone());
+            let queue = queue_override.unwrap_or_else(|| {
+                J::QUEUE
+                    .clone()
+                    .unwrap_or_else(|| self.runtime.config.queue.clone())
+            });
             let trace = crate::logging::trace_context_for_child(
                 crate::logging::current_execution_trace_parent(),
             );
@@ -456,6 +579,14 @@ impl JobDispatcher {
             jobs: Vec::new(),
         }
     }
+}
+
+fn checked_dispatch_time_after(now_millis: i64, delay: Duration) -> Result<i64> {
+    let delay_millis = i64::try_from(delay.as_millis())
+        .map_err(|_| Error::message("job dispatch delay exceeds the supported timestamp range"))?;
+    now_millis
+        .checked_add(delay_millis)
+        .ok_or_else(|| Error::message("job dispatch delay exceeds the supported timestamp range"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,11 +1351,12 @@ impl Worker {
         let token = lease.token.clone();
         let heartbeat = self.spawn_lease_heartbeat(queue.clone(), token.clone());
         let lost_signal = heartbeat.lease_lost_signal();
+        let finalization = heartbeat.finalization();
         // Cancel the job future the moment the lease can no longer be proven:
         // letting it run past lease expiry means another worker can claim the
         // redelivered job and execute it concurrently.
         let result = tokio::select! {
-            result = self.process_claimed_job_with_active_lease(lease) => Some(result),
+            result = self.process_claimed_job_with_active_lease(lease, finalization) => Some(result),
             _ = lease_lost(lost_signal) => None,
         };
         heartbeat.shutdown().await;
@@ -1250,6 +1382,7 @@ impl Worker {
     async fn process_claimed_job_with_active_lease(
         &self,
         lease: ClaimedJobLease,
+        finalization: LeaseFinalization,
     ) -> ClaimedJobProcessingResult<()> {
         self.diagnostics
             .record_job_outcome(RecordedJobOutcome::Started);
@@ -1286,6 +1419,7 @@ impl Worker {
                     started_at,
                     middleware: middleware.as_deref(),
                     job_context: Some(&job_context),
+                    finalization: &finalization,
                 })
                 .await
                 .map_err(|error| {
@@ -1334,6 +1468,7 @@ impl Worker {
                 started_at,
                 middleware: middleware.as_deref(),
                 job_context: Some(&job_context),
+                finalization: &finalization,
             })
             .await
             .map_err(|error| {
@@ -1375,6 +1510,9 @@ impl Worker {
                     serde_json::to_string(&requeue_envelope).map_err(Error::other),
                 )?;
                 let requeue_token = next_delivery_token();
+                if !finalization.begin() {
+                    return Ok(());
+                }
                 if !claimed_job_result(
                     ClaimedJobPhase::RateLimitRequeue,
                     &context,
@@ -1459,6 +1597,9 @@ impl Worker {
                         Some(trace_context.clone()),
                     ),
                 )?;
+                if !finalization.begin() {
+                    return Ok(());
+                }
                 let success = claimed_job_result(
                     ClaimedJobPhase::SuccessFinalization,
                     &context,
@@ -1583,6 +1724,9 @@ impl Worker {
                     serde_json::to_string(&retry_envelope).map_err(Error::other),
                 )?;
                 let retry_token = next_delivery_token();
+                if !finalization.begin() {
+                    return Ok(());
+                }
                 if !claimed_job_result(
                     ClaimedJobPhase::RetrySchedule,
                     &retry_context,
@@ -1652,6 +1796,9 @@ impl Worker {
                     &dead_letter_context,
                     serde_json::to_string(&dead_letter).map_err(Error::other),
                 )?;
+                if !finalization.begin() {
+                    return Ok(());
+                }
                 if !claimed_job_result(
                     ClaimedJobPhase::DeadLetterTransition,
                     &dead_letter_context,
@@ -1720,6 +1867,7 @@ impl Worker {
             started_at,
             middleware,
             job_context,
+            finalization,
         } = job;
 
         if let (Some(middleware), Some(job_context)) = (middleware, job_context) {
@@ -1743,6 +1891,9 @@ impl Worker {
             },
         };
         let payload = serde_json::to_string(&dead_letter).map_err(Error::other)?;
+        if !finalization.begin() {
+            return Ok(());
+        }
         if !self
             .runtime
             .dead_letter_job(&lease.queue, &lease.token, &payload)
@@ -1957,10 +2108,45 @@ impl Drop for WorkerJobTask {
     }
 }
 
+const LEASE_ACTIVE: u8 = 0;
+const LEASE_FINALIZING: u8 = 1;
+const LEASE_LOST: u8 = 2;
+
+#[derive(Clone, Default)]
+struct LeaseFinalization {
+    state: Arc<AtomicU8>,
+}
+
+impl LeaseFinalization {
+    /// Atomically wins the right to perform the lease-releasing transition.
+    /// If lease loss won first, the caller must leave the job for redelivery.
+    fn begin(&self) -> bool {
+        self.try_transition_from_active(LEASE_FINALIZING)
+    }
+
+    fn is_finalizing(&self) -> bool {
+        self.state.load(Ordering::Acquire) == LEASE_FINALIZING
+    }
+
+    /// Atomically marks an active lease as lost. Finalization and loss are
+    /// mutually exclusive so a normal backend release cannot cancel its own
+    /// post-transition work.
+    fn mark_lost(&self) -> bool {
+        self.try_transition_from_active(LEASE_LOST)
+    }
+
+    fn try_transition_from_active(&self, next: u8) -> bool {
+        self.state
+            .compare_exchange(LEASE_ACTIVE, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
 struct LeaseHeartbeat {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     handle: Option<JoinHandle<()>>,
     lease_lost: tokio::sync::watch::Receiver<bool>,
+    finalization: LeaseFinalization,
 }
 
 impl LeaseHeartbeat {
@@ -1969,6 +2155,8 @@ impl LeaseHeartbeat {
         let lease_ttl = runtime.lease_ttl();
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let (lost_tx, lost_rx) = tokio::sync::watch::channel(false);
+        let finalization = LeaseFinalization::default();
+        let heartbeat_finalization = finalization.clone();
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(heartbeat_every);
             let mut last_renewed = tokio::time::Instant::now();
@@ -1976,11 +2164,22 @@ impl LeaseHeartbeat {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
                     _ = interval.tick() => {
-                        match runtime.renew_job_lease(&queue, &token).await {
+                        let renewal = runtime.renew_job_lease(&queue, &token).await;
+                        match renewal {
                             Ok(true) => {
                                 last_renewed = tokio::time::Instant::now();
                             }
+                            Ok(false) if heartbeat_finalization.is_finalizing() => {
+                                // The final backend transition intentionally
+                                // releases the lease. Do not race that normal
+                                // completion against the worker's cancellation
+                                // branch while post-transition work finishes.
+                                break;
+                            }
                             Ok(false) => {
+                                if !heartbeat_finalization.mark_lost() {
+                                    break;
+                                }
                                 // The lease is definitively gone (expired or
                                 // claimed elsewhere). Signal the executor so
                                 // the job stops instead of running
@@ -2000,6 +2199,9 @@ impl LeaseHeartbeat {
                                 // lease TTL; past that we can no longer prove
                                 // ownership and must stop the job.
                                 if last_renewed.elapsed() >= lease_ttl {
+                                    if !heartbeat_finalization.mark_lost() {
+                                        break;
+                                    }
                                     tracing::warn!(
                                         target: "foundry.worker",
                                         queue = %queue,
@@ -2028,11 +2230,16 @@ impl LeaseHeartbeat {
             shutdown: Some(shutdown_tx),
             handle: Some(handle),
             lease_lost: lost_rx,
+            finalization,
         }
     }
 
     fn lease_lost_signal(&self) -> tokio::sync::watch::Receiver<bool> {
         self.lease_lost.clone()
+    }
+
+    fn finalization(&self) -> LeaseFinalization {
+        self.finalization.clone()
     }
 
     async fn shutdown(mut self) {
@@ -2124,7 +2331,7 @@ impl Worker {
             duration_ms,
             payload,
         } = entry;
-        if !self.runtime.config.track_history || !self.diagnostics.capture_enabled() {
+        if !self.runtime.config.track_history {
             return;
         }
         let Ok(db) = self.app.database() else {
@@ -2260,6 +2467,9 @@ impl JobRegistryBuilder {
         queues.insert(config.queue.clone());
         for registration in jobs.values() {
             queues.insert(registration.queue.clone());
+        }
+        for queue in config.queue_priorities.keys() {
+            queues.insert(QueueId::owned(queue.clone()));
         }
 
         let mut queues: Vec<QueueId> = queues.into_iter().collect();
@@ -2487,6 +2697,21 @@ pub(crate) struct JobRegistrySnapshot {
     queues: Vec<QueueId>,
 }
 
+impl JobRegistrySnapshot {
+    pub(crate) fn include_queue(&mut self, queue: QueueId, config: &JobsConfig) {
+        if !self.queues.contains(&queue) {
+            self.queues.push(queue);
+        }
+        self.queues.sort_by_key(|queue| {
+            config
+                .queue_priorities
+                .get(queue.as_ref())
+                .copied()
+                .unwrap_or(5)
+        });
+    }
+}
+
 struct JobRegistrationBuilder {
     queue: Option<QueueId>,
     handler: Arc<dyn DynJobHandler>,
@@ -2535,6 +2760,7 @@ struct DeadLetterClaimedJob<'a> {
     started_at: i64,
     middleware: Option<&'a JobMiddlewareRegistry>,
     job_context: Option<&'a JobContext>,
+    finalization: &'a LeaseFinalization,
 }
 
 enum JobExecutionOutcome {
@@ -2651,19 +2877,20 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use chrono::Utc;
     use serde::{Deserialize, Serialize};
     use tokio::sync::Notify;
 
     use super::{
-        ChainedJob, Job, JobContext, JobDeadLetterContext, JobDispatcher, JobEnvelope,
-        JobMiddleware, JobMiddlewareRegistryBuilder, JobRegistryBuilder, JobRuntime,
-        SuccessfulJobEffects, Worker,
+        checked_dispatch_time_after, ChainedJob, Job, JobContext, JobDeadLetterContext,
+        JobDispatcher, JobEnvelope, JobMiddleware, JobMiddlewareRegistryBuilder,
+        JobRegistryBuilder, JobRuntime, SuccessfulJobEffects, Worker,
     };
     use crate::config::JobsConfig;
     use crate::foundation::{AppContext, Container, Error};
     use crate::logging::{ReadinessRegistryBuilder, RuntimeBackendKind, RuntimeDiagnostics};
     use crate::support::runtime::RuntimeBackend;
-    use crate::support::{JobId, QueueId};
+    use crate::support::{DateTime, JobId, QueueId};
     use crate::validation::RuleRegistry;
 
     #[test]
@@ -2997,6 +3224,52 @@ mod tests {
         ));
         let dispatcher = JobDispatcher::new(runtime.clone(), diagnostics.clone());
         (backend, runtime, diagnostics, dispatcher)
+    }
+
+    #[tokio::test]
+    async fn explicit_dispatch_queue_is_serialized_and_configured_dynamic_queues_are_polled() {
+        let jobs_config = JobsConfig::default();
+        let (backend, _runtime, _diagnostics, dispatcher) =
+            build_panic_runtime("jobs-explicit-dispatch-queue", jobs_config);
+        let queue = QueueId::new("mail-critical");
+
+        dispatcher
+            .dispatch_on(PanickingJob, queue.clone())
+            .await
+            .unwrap();
+        let lease = backend
+            .claim_job(std::slice::from_ref(&queue), Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let envelope: JobEnvelope = serde_json::from_str(&lease.payload).unwrap();
+        assert_eq!(lease.queue, queue);
+        assert_eq!(envelope.queue, queue);
+
+        let error = dispatcher
+            .dispatch_on(PanickingJob, QueueId::owned("  "))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("queue name cannot be empty"));
+
+        let mut config = JobsConfig::default();
+        config.queue_priorities.insert("dynamic-low".to_string(), 9);
+        config
+            .queue_priorities
+            .insert("dynamic-high".to_string(), 1);
+        let snapshot = JobRegistryBuilder::freeze_shared(JobRegistryBuilder::shared(), &config);
+        assert!(snapshot.queues.contains(&QueueId::new("dynamic-low")));
+        assert!(snapshot.queues.contains(&QueueId::new("dynamic-high")));
+        assert!(
+            snapshot
+                .queues
+                .iter()
+                .position(|queue| queue == &QueueId::new("dynamic-high"))
+                < snapshot
+                    .queues
+                    .iter()
+                    .position(|queue| queue == &QueueId::new("dynamic-low"))
+        );
     }
 
     struct PanicRecordingMiddleware {
@@ -3733,6 +4006,104 @@ mod tests {
         assert_eq!(diagnostics.snapshot().jobs.succeeded_total, 1);
     }
 
+    #[test]
+    fn lease_finalization_and_loss_have_exactly_one_winner() {
+        for _ in 0..32 {
+            let finalization = super::LeaseFinalization::default();
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+
+            let (finalization_won, loss_won) = std::thread::scope(|scope| {
+                let finalization_state = finalization.clone();
+                let finalization_barrier = barrier.clone();
+                let finalization_thread = scope.spawn(move || {
+                    finalization_barrier.wait();
+                    finalization_state.begin()
+                });
+
+                let loss_state = finalization.clone();
+                let loss_barrier = barrier.clone();
+                let loss_thread = scope.spawn(move || {
+                    loss_barrier.wait();
+                    loss_state.mark_lost()
+                });
+
+                barrier.wait();
+                (
+                    finalization_thread.join().unwrap(),
+                    loss_thread.join().unwrap(),
+                )
+            });
+
+            assert_ne!(finalization_won, loss_won);
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_heartbeat_keeps_finalizing_lease_alive_and_ignores_its_release() {
+        let (backend, runtime, _diagnostics, _dispatcher) =
+            build_runtime_and_dispatcher("heartbeat-finalization-release");
+        let queue = QueueId::new("default");
+        backend
+            .enqueue_job(&queue, "heartbeat-finalization-token", "{}")
+            .await
+            .unwrap();
+        let lease = runtime.claim_job().await.unwrap().unwrap();
+        let heartbeat =
+            super::LeaseHeartbeat::spawn(runtime.clone(), lease.queue.clone(), lease.token.clone());
+        let lost_signal = heartbeat.lease_lost_signal();
+        let finalization = heartbeat.finalization();
+
+        assert!(finalization.begin());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            runtime
+                .requeue_expired_jobs(Utc::now().timestamp_millis())
+                .await
+                .unwrap(),
+            0
+        );
+
+        let completion = runtime
+            .complete_successful_job(&lease.queue, &lease.token, SuccessfulJobEffects::default())
+            .await
+            .unwrap();
+        assert!(completion.lease_released);
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(!*lost_signal.borrow());
+        heartbeat.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn lease_heartbeat_reports_release_that_did_not_begin_finalization() {
+        let (backend, runtime, _diagnostics, _dispatcher) =
+            build_runtime_and_dispatcher("heartbeat-unexpected-release");
+        let queue = QueueId::new("default");
+        backend
+            .enqueue_job(&queue, "heartbeat-unexpected-token", "{}")
+            .await
+            .unwrap();
+        let lease = runtime.claim_job().await.unwrap().unwrap();
+        let heartbeat =
+            super::LeaseHeartbeat::spawn(runtime.clone(), lease.queue.clone(), lease.token.clone());
+        let lost_signal = heartbeat.lease_lost_signal();
+
+        let completion = runtime
+            .complete_successful_job(&lease.queue, &lease.token, SuccessfulJobEffects::default())
+            .await
+            .unwrap();
+        assert!(completion.lease_released);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            super::lease_lost(lost_signal.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(*lost_signal.borrow());
+        heartbeat.shutdown().await;
+    }
+
     // --- Batch & chain test helpers ---
 
     static EXECUTION_LOG: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
@@ -3857,6 +4228,81 @@ mod tests {
         ));
         let dispatcher = JobDispatcher::new(runtime.clone(), diagnostics.clone());
         (backend, runtime, diagnostics, dispatcher)
+    }
+
+    async fn scheduled_run_times(backend: &RuntimeBackend) -> Vec<i64> {
+        let runtime = match backend {
+            RuntimeBackend::Memory(runtime) => runtime,
+            RuntimeBackend::Redis(_) => unreachable!("test uses memory runtime"),
+        };
+        runtime
+            .scheduled_jobs
+            .lock()
+            .await
+            .get(&QueueId::new("default"))
+            .map(|jobs| jobs.iter().map(|job| job.run_at_millis).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn dispatch_at_accepts_foundry_datetime() {
+        let (backend, _runtime, _diagnostics, dispatcher) =
+            build_runtime_and_dispatcher("dispatch-at-datetime");
+        let run_at = DateTime::now().add_days(365);
+
+        dispatcher.dispatch_at(FailingJob, run_at).await.unwrap();
+
+        assert_eq!(
+            scheduled_run_times(&backend).await,
+            [run_at.timestamp_millis()]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_later_preserves_raw_epoch_milliseconds() {
+        let (backend, _runtime, _diagnostics, dispatcher) =
+            build_runtime_and_dispatcher("dispatch-later-epoch");
+        let run_at_millis = DateTime::now().add_days(365).timestamp_millis();
+
+        dispatcher
+            .dispatch_later(FailingJob, run_at_millis)
+            .await
+            .unwrap();
+
+        assert_eq!(scheduled_run_times(&backend).await, [run_at_millis]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_after_uses_checked_duration_arithmetic() {
+        let (backend, _runtime, _diagnostics, dispatcher) =
+            build_runtime_and_dispatcher("dispatch-after-duration");
+        let before = Utc::now().timestamp_millis();
+
+        dispatcher
+            .dispatch_after(FailingJob, Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        let after = Utc::now().timestamp_millis();
+        let scheduled = scheduled_run_times(&backend).await;
+        assert_eq!(scheduled.len(), 1);
+        assert!(scheduled[0] >= before + 60_000);
+        assert!(scheduled[0] <= after + 60_000);
+    }
+
+    #[tokio::test]
+    async fn dispatch_after_rejects_timestamp_overflow_before_enqueueing() {
+        let (backend, _runtime, _diagnostics, dispatcher) =
+            build_runtime_and_dispatcher("dispatch-after-overflow");
+
+        let error = dispatcher
+            .dispatch_after(FailingJob, Duration::MAX)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("supported timestamp range"));
+        assert!(scheduled_run_times(&backend).await.is_empty());
+        assert!(checked_dispatch_time_after(i64::MAX, Duration::from_millis(1)).is_err());
     }
 
     #[tokio::test]

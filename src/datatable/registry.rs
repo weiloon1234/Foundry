@@ -33,6 +33,16 @@ pub trait DynDatatable: Send + Sync {
         request: DatatableRequest,
     ) -> Result<axum::response::Response>;
 
+    async fn export_file(
+        &self,
+        app: &AppContext,
+        actor: Option<&Actor>,
+        request: DatatableRequest,
+    ) -> Result<super::export::GeneratedDatatableExportFile> {
+        let response = self.download(app, actor, request).await?;
+        super::download::response_to_xlsx_file(self.id(), response).await
+    }
+
     async fn queue_email(
         &self,
         app: &AppContext,
@@ -85,6 +95,15 @@ where
         request: DatatableRequest,
     ) -> Result<axum::response::Response> {
         D::download(app, actor, request).await
+    }
+
+    async fn export_file(
+        &self,
+        app: &AppContext,
+        actor: Option<&Actor>,
+        request: DatatableRequest,
+    ) -> Result<super::export::GeneratedDatatableExportFile> {
+        super::download::build_xlsx_file::<D>(app, actor, request).await
     }
 
     async fn queue_email(

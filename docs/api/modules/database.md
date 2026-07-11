@@ -118,8 +118,6 @@ struct Cte
 struct CursorInfo
 struct CursorMeta
 struct CursorPaginated
-  fn encode_cursor(value: &impl Display) -> String
-  fn with_cursors( self, first_value: Option<&impl Display>, last_value: Option<&impl Display>, ) -> Self
 struct CursorPagination
   fn new(per_page: u64) -> Self
   fn after(self, cursor: impl Into<String>) -> Self
@@ -212,7 +210,6 @@ struct ModelLifecycleSnapshot
   fn for_model<M: Model>( before: Option<DbRecord>, after: Option<DbRecord>, pending: Option<DbRecord>, ) -> Self
 struct ModelQuery
   fn new(table: &'static TableMeta<M>) -> Self
-  fn without_defaults(self) -> Self
   fn with_timeout(self, timeout: Duration) -> Self
   fn with_label(self, label: impl Into<String>) -> Self
   fn use_write_pool(self) -> Self
@@ -232,6 +229,8 @@ struct ModelQuery
   fn scope(self, f: impl FnOnce(Self) -> Self) -> Self
   fn with<To>(self, relation: RelationDef<M, To>) -> Self
   fn with_attachments(self, collection: impl Into<String>) -> Self
+  fn with_meta(self, key: impl Into<String>) -> Self
+  fn with_metadata(self) -> Self
   fn with_translated_field(self, field: impl Into<String>) -> Self
   fn with_translations_for(self, locale: impl Into<String>) -> Self
   fn with_all_translations(self) -> Self
@@ -786,6 +785,8 @@ struct ManyToManyDef
   fn with<Child>(self, child: RelationDef<To, Child>) -> Self
   fn with_many_to_many<Child, ChildPivot>( self, child: ManyToManyDef<To, Child, ChildPivot>, ) -> Self
   fn with_attachments(self, collection: impl Into<String>) -> Self
+  fn with_meta(self, key: impl Into<String>) -> Self
+  fn with_metadata(self) -> Self
   fn with_translated_field(self, field: impl Into<String>) -> Self
   fn with_translations_for(self, locale: impl Into<String>) -> Self
   fn with_all_translations(self) -> Self
@@ -806,6 +807,8 @@ struct RelationDef
   fn with<Child>(self, child: RelationDef<To, Child>) -> Self
   fn with_many_to_many<Child, Pivot>( self, child: ManyToManyDef<To, Child, Pivot>, ) -> Self
   fn with_attachments(self, collection: impl Into<String>) -> Self
+  fn with_meta(self, key: impl Into<String>) -> Self
+  fn with_metadata(self) -> Self
   fn with_translated_field(self, field: impl Into<String>) -> Self
   fn with_translations_for(self, locale: impl Into<String>) -> Self
   fn with_all_translations(self) -> Self

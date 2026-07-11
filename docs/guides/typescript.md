@@ -6,10 +6,10 @@ Auto-generate TypeScript types from Rust structs and enums. Types are discovered
 
 ## How It Works
 
-Types that derive `ApiSchema`, `AppEnum`, or `foundry::TS` are automatically registered for TypeScript export. Run `types:export` to generate `.ts` files.
+Types that derive `AppEnum` or `foundry::TS` are automatically registered for TypeScript export. `ApiSchema` is independent and registers only JSON Schema/OpenAPI metadata. Run `types:export` to generate `.ts` files.
 
 ```
-Rust DTO (#[derive(ApiSchema)]) → auto-discovered → types:export → TypeScript file
+Rust DTO (#[derive(ts_rs::TS, foundry::TS)]) → auto-discovered → types:export → TypeScript file
 ```
 
 ---
@@ -18,10 +18,10 @@ Rust DTO (#[derive(ApiSchema)]) → auto-discovered → types:export → TypeScr
 
 ### 1. Derive on your types
 
-Request/response DTOs already derive `ApiSchema` — they're auto-included:
+Request/response DTOs opt into schema generation and TypeScript export independently:
 
 ```rust
-#[derive(Debug, Deserialize, ts_rs::TS, foundry::ApiSchema)]
+#[derive(Debug, Deserialize, ts_rs::TS, foundry::TS, foundry::ApiSchema)]
 pub struct CreateOrderRequest {
     pub product_id: String,
     pub quantity: u32,
@@ -46,6 +46,16 @@ cargo run -- types:export
 # or
 make types
 ```
+
+The pure SDK and contract outputs are the default. Generate the compatibility
+form-oriented `routes/*.ts` adapters only when a frontend still uses them:
+
+```bash
+cargo run -- types:export --route-form-adapter
+```
+
+Programmatic exporters opt in with
+`TypeScriptExportContext { route_form_adapter: true, ..Default::default() }`.
 
 ### 3. Use in frontend
 
@@ -92,14 +102,18 @@ TYPESCRIPT__OUTPUT_DIR=frontend/shared/types/generated
 
 ## Derives
 
-### `foundry::ApiSchema` (request/response DTOs)
+### `foundry::ApiSchema` and `foundry::TS` (request/response DTOs)
 
-Auto-registers for TypeScript export. Must also derive `ts_rs::TS`:
+`ApiSchema` registers JSON Schema/OpenAPI metadata. Add both `ts_rs::TS` and `foundry::TS` when the same DTO should also be exported to TypeScript:
 
 ```rust
-#[derive(Debug, Deserialize, ts_rs::TS, foundry::ApiSchema)]
+#[derive(Debug, Deserialize, ts_rs::TS, foundry::TS, foundry::ApiSchema)]
 pub struct MyRequest { ... }
 ```
+
+Serde `rename` and `rename_all` attributes are shared by OpenAPI, validation,
+multipart extraction, and generated TypeScript validation metadata. Foundry
+rejects different serialize/deserialize names on one contract DTO.
 
 ### `foundry::AppEnum` (enums)
 
@@ -116,7 +130,7 @@ Use AppEnum fields directly in request/response DTOs. Manual
 `Option<MyEnum>` and collections:
 
 ```rust
-#[derive(Debug, serde::Serialize, ts_rs::TS, foundry::ApiSchema)]
+#[derive(Debug, serde::Serialize, ts_rs::TS, foundry::TS, foundry::ApiSchema)]
 pub struct OrderResponse {
     pub status: OrderStatus,
     pub previous_status: Option<OrderStatus>,
@@ -202,30 +216,35 @@ adminRouteUrl(RouteIds.admin.users.show, { id: userId });
 // -> "/users/123" after substituting and stripping the admin API base path
 ```
 
-The generated manifest includes route id, path, method, path params, guard,
-permissions, summary, request schema name, response schema names, and whether a
-route endpoint helper was generated. Route id groups are camelCased for
-TypeScript property access, so `admin.audit_logs.index` becomes
+`RouteManifest.ts` contains URL transport metadata: route ID, path, method,
+typed path parameters, guard, permissions, summary, request/response schema
+names, and client-export state. Route ID groups are camelCased for TypeScript
+property access, so `admin.audit_logs.index` becomes
 `RouteIds.admin.auditLogs.index`.
 
 `types:export` also writes `FoundryContractManifest.json`, the normalized
-contract artifact used by newer generators. It contains action metadata,
-transport kind, request/response DTO names, DTO JSON schemas, validation schemas,
-permissions, and realtime contract slots. OpenAPI and TypeScript SDK generation
-should use this manifest layer rather than reading scattered route or macro
-metadata.
+contract artifact used by all route-facing generators. It contains explicit
+business action names, typed path/query/header/cookie parameters,
+request/response DTO names, action-specific and standard errors, custom request
+media types, DTO JSON schemas, validation schemas, permissions, and typed
+realtime message/event schemas. `RouteManifest.ts`, the pure SDK, WebSocket
+types, and the optional form adapters all consume this frozen manifest rather
+than reading scattered route metadata. Manifest version 2 requires every
+named route to declare `.action_name("BusinessAction")`; duplicate action names
+fail export. Generated SDK files/client methods use that action name, while the
+route ID remains URL transport metadata.
 
 Route params support Axum `{id}` / `{*path}` patterns and legacy `:id` patterns.
 The helper URL-encodes substituted params and throws a clear runtime error if a
 required param is missing.
 
-When a named route has request/response docs, Foundry also writes a route helper
-under `routes/`. The helper is optional and headless: it does not depend on
-React, Vue, or a specific HTTP library. Any Axios-compatible client with
-`request(config)` works.
+With `--route-form-adapter`, a named route with request/response docs also gets
+a helper under `routes/`. This compatibility adapter is optional and headless:
+it does not depend on React, Vue, or a specific HTTP library. Any
+Axios-compatible client with `request(config)` works.
 
 ```rust
-#[derive(Debug, Deserialize, ts_rs::TS, foundry::ApiSchema, foundry::Validate)]
+#[derive(Debug, Deserialize, ts_rs::TS, foundry::TS, foundry::ApiSchema, foundry::Validate)]
 pub struct LoginRequest {
     #[validate(required, email)]
     pub email: String,
@@ -234,13 +253,14 @@ pub struct LoginRequest {
     pub password: String,
 }
 
-#[derive(Debug, Serialize, ts_rs::TS, foundry::ApiSchema)]
+#[derive(Debug, Serialize, ts_rs::TS, foundry::TS, foundry::ApiSchema)]
 pub struct LoginResponse {
     pub token: String,
 }
 
 routes.post("/login", "user.portal.login", login, |route| {
     route
+        .action_name("AuthenticateUser")
         .request::<LoginRequest>()
         .response::<LoginResponse>(200);
 });
@@ -295,7 +315,8 @@ const response = await api.userPortalLogin({
 The SDK runtime owns route URL generation, method selection, JSON vs multipart
 body handling, response unwrapping, and typed error normalization through
 `FoundrySdkError`. `FoundryEndpoint` remains available as a headless form-state
-adapter, but the pure SDK is the preferred core layer for new frontend code.
+runtime, but per-route form adapters are opt-in and the pure SDK is the
+preferred core layer for new frontend code.
 
 ```typescript
 import { FoundrySdkError } from "@shared/types/generated";
@@ -327,8 +348,9 @@ and run in `validateForm()`. Server-backed rules such as `unique`, `exists`, and
 custom `rule("...")` are kept as server-only metadata; the backend remains the
 final source of validation truth through `JsonValidated<T>` and `Validated<T>`.
 
-Disable the route helper when a route should only export manifest metadata and
-DTOs:
+Omit `--route-form-adapter` to disable form adapters globally while retaining
+the pure SDK. Disable all per-route client output (both SDK action and optional
+form adapter) when a route should export only manifest metadata and DTOs:
 
 ```rust
 routes.post("/webhook", "billing.webhook", webhook, |route| {
@@ -358,7 +380,7 @@ pub struct SomeCustomType {
 Control TypeScript output with `#[ts(...)]` attributes:
 
 ```rust
-#[derive(Serialize, ts_rs::TS, foundry::ApiSchema)]
+#[derive(Serialize, ts_rs::TS, foundry::TS, foundry::ApiSchema)]
 pub struct Example {
     pub name: String,
 
@@ -379,8 +401,8 @@ Common attributes:
 - `#[ts(rename = "...")]` — rename in TypeScript output
 - `#[ts(export_to = "...")]` — rare filename/subdirectory override inside `typescript.output_dir`
 
-Do not use `#[ts(export)]` on types deriving `foundry::ApiSchema` or
-`foundry::TS`. Foundry registers those types automatically and `types:export`
+Do not use `#[ts(export)]` on types deriving `foundry::TS`. Foundry registers
+those types automatically and `types:export`
 writes them to the configured `typescript.output_dir`; direct ts-rs export
 creates unmanaged files such as root `bindings/*.ts`.
 
@@ -419,8 +441,8 @@ frontend/shared/types/generated/
 ├── RouteManifest.ts            ← route URL helpers and metadata
 ├── sdk/
 │   └── UserPortalLogin.ts      ← pure SDK action factory
-├── routes/
-│   └── UserPortalLogin.ts      ← route helper class + route DTO aliases
+├── routes/                      ← only with --route-form-adapter
+│   └── UserPortalLogin.ts      ← optional form helper + route DTO aliases
 ├── CreateOrderRequest.ts       ← from project
 ├── OrderStatus.ts              ← from project
 ├── CountryStatus.ts            ← from framework
@@ -479,7 +501,7 @@ build: types
 
 ## Workflow
 
-1. Add or modify a Rust struct/enum with `ApiSchema`, `AppEnum`, or `foundry::TS`
+1. Add or modify a Rust struct/enum with `AppEnum` or `foundry::TS` (`ApiSchema` is optional and independent)
 2. Run `make types` (or `make dev` / `make build` which include it)
 3. TypeScript types are generated — import and use in frontend
 

@@ -130,12 +130,14 @@ mod app {
         }
 
         #[derive(Debug, Deserialize, Validate)]
+        #[serde(rename_all = "camelCase")]
         pub struct CreateTypedMultipartProfile {
             #[validate(required, min(2))]
-            pub name: String,
+            pub display_name: String,
             pub settings: serde_json::Value,
             pub metadata: Option<serde_json::Value>,
             pub age: Option<i32>,
+            #[validate(distinct)]
             pub tags: Vec<String>,
             pub scores: Vec<i32>,
         }
@@ -184,7 +186,7 @@ mod app {
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
-                    "name": payload.name,
+                    "name": payload.display_name,
                     "settings": payload.settings,
                     "metadata": payload.metadata,
                     "age": payload.age,
@@ -504,7 +506,7 @@ async fn run_http_async_parses_typed_multipart_fields() {
         .post(format!("{url}/typed-multipart"))
         .multipart(
             reqwest::multipart::Form::new()
-                .text("name", "Alice")
+                .text("displayName", "Alice")
                 .text("settings", r#"{"theme":"dark","layout":"stacked"}"#)
                 .text("metadata", r#"{"source":"starter"}"#)
                 .text("age", "42")
@@ -556,7 +558,7 @@ async fn run_http_async_rejects_invalid_typed_multipart_values() {
         .post(format!("{url}/typed-multipart"))
         .multipart(
             reqwest::multipart::Form::new()
-                .text("name", "Alice")
+                .text("displayName", "Alice")
                 .text("settings", "{")
                 .text("age", "42"),
         )
@@ -574,7 +576,7 @@ async fn run_http_async_rejects_invalid_typed_multipart_values() {
         .post(format!("{url}/typed-multipart"))
         .multipart(
             reqwest::multipart::Form::new()
-                .text("name", "Alice")
+                .text("displayName", "Alice")
                 .text("settings", r#"{"theme":"dark"}"#)
                 .text("age", "not-a-number"),
         )
@@ -587,6 +589,26 @@ async fn run_http_async_rejects_invalid_typed_multipart_values() {
         invalid_number_payload["message"],
         "field 'age' has invalid value"
     );
+
+    let duplicate_tags = client
+        .post(format!("{url}/typed-multipart"))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .text("displayName", "Alice")
+                .text("settings", r#"{"theme":"dark"}"#)
+                .text("tags", "rust")
+                .text("tags", "rust"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate_tags.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let duplicate_tags_payload: serde_json::Value = duplicate_tags.json().await.unwrap();
+    assert_eq!(duplicate_tags_payload["errors"][0]["field"], "tags");
+    assert_eq!(duplicate_tags_payload["errors"][0]["code"], "distinct");
 
     task.abort();
 }

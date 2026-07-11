@@ -151,6 +151,92 @@ mod validate_derive {
         );
     }
 
+    #[derive(Debug, Serialize, Deserialize, ts_rs::TS, foundry::TS, ApiSchema, Validate)]
+    #[serde(rename_all = "camelCase")]
+    #[validate(
+        messages(email_address(required = "A contact email is required.")),
+        attributes(email_address = "contact email")
+    )]
+    pub struct RenamedWireProfile {
+        #[validate(required, email)]
+        pub email_address: String,
+        #[validate(required, confirmed("password_confirmation"))]
+        pub password: String,
+        #[validate(required)]
+        pub password_confirmation: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, Serialize, ApiSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RenamedWireStatus {
+        InReview,
+        ReadyToShip,
+    }
+
+    #[tokio::test]
+    async fn serde_names_are_shared_by_validation_schema_and_typescript_metadata() {
+        let input = RenamedWireProfile {
+            email_address: String::new(),
+            password: "secret123".to_string(),
+            password_confirmation: "different".to_string(),
+        };
+        let mut validator = Validator::new(test_app());
+        for (field, code, message) in input.messages() {
+            validator.custom_message(field, code, message);
+        }
+        for (field, name) in input.attributes() {
+            validator.custom_attribute(field, name);
+        }
+        input.validate(&mut validator).await.unwrap();
+
+        let errors = validator.finish().unwrap_err();
+        assert!(errors.errors.iter().any(|error| {
+            error.field == "emailAddress"
+                && error.code == "required"
+                && error.message == "A contact email is required."
+        }));
+
+        let schema = <RenamedWireProfile as ApiSchema>::schema();
+        assert!(schema["properties"].get("emailAddress").is_some());
+        assert!(schema["properties"].get("passwordConfirmation").is_some());
+        assert!(schema["properties"].get("email_address").is_none());
+
+        let validation = foundry::inventory::iter::<foundry::typescript::TsValidation>
+            .into_iter()
+            .find(|registration| registration.name == "RenamedWireProfile")
+            .map(|registration| (registration.schema_fn)())
+            .expect("RenamedWireProfile validation schema should be registered");
+        assert!(validation
+            .fields
+            .iter()
+            .any(|field| field.name == "emailAddress"));
+        assert!(validation
+            .messages
+            .iter()
+            .any(|message| message.field == "emailAddress"));
+        let password = validation
+            .fields
+            .iter()
+            .find(|field| field.name == "password")
+            .unwrap();
+        let confirmed = password
+            .rules
+            .iter()
+            .find(|rule| rule.code == "confirmed")
+            .unwrap();
+        assert_eq!(
+            confirmed.params.get("other").map(String::as_str),
+            Some("passwordConfirmation")
+        );
+
+        let enum_schema = <RenamedWireStatus as ApiSchema>::schema();
+        assert_eq!(
+            enum_schema["enum"],
+            serde_json::json!(["in_review", "ready_to_ship"])
+        );
+    }
+
     // --- Per-rule message override ---
 
     #[derive(Debug, Deserialize, Validate)]
@@ -246,6 +332,159 @@ mod validate_derive {
         pub scores: Vec<i32>,
         #[validate(each(integer, min_numeric(0)))]
         pub adjustments: Option<Vec<i32>>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, ts_rs::TS, foundry::TS, ApiSchema, Validate)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ConditionalPresenceInput {
+        pub publication_status: String,
+        pub contact_email: Option<String>,
+        pub contact_phone: Option<String>,
+        #[validate(required_if("publication_status", "published"))]
+        pub published_at: Option<String>,
+        #[validate(required_unless("publication_status", "draft"))]
+        pub draft_reason: Option<String>,
+        #[validate(required_with("contact_email", "contact_phone"))]
+        pub contact_note: Option<String>,
+        pub related_ids: Vec<String>,
+        #[validate(required_with("related_ids"))]
+        pub related_note: Option<String>,
+        #[validate(present)]
+        pub present_value: Option<String>,
+        #[validate(sometimes, email)]
+        pub optional_email: Option<String>,
+        #[validate(prohibited)]
+        pub internal_note: Option<String>,
+        #[validate(boolean)]
+        pub enabled: bool,
+        #[validate(distinct)]
+        pub tags: Vec<String>,
+    }
+
+    #[tokio::test]
+    async fn derive_conditional_presence_boolean_and_distinct_rules_accept_valid_input() {
+        let input = ConditionalPresenceInput {
+            publication_status: "draft".to_string(),
+            contact_email: Some("person@example.com".to_string()),
+            contact_phone: None,
+            published_at: None,
+            draft_reason: None,
+            contact_note: Some("email is preferred".to_string()),
+            related_ids: Vec::new(),
+            related_note: None,
+            present_value: Some(String::new()),
+            optional_email: None,
+            internal_note: Some(String::new()),
+            enabled: true,
+            tags: vec!["rust".to_string(), "foundry".to_string()],
+        };
+        let mut validator = Validator::new(test_app());
+
+        input.validate(&mut validator).await.unwrap();
+
+        assert!(validator.finish().is_ok());
+    }
+
+    #[tokio::test]
+    async fn derive_conditional_presence_and_distinct_rules_report_each_failure() {
+        let input = ConditionalPresenceInput {
+            publication_status: "published".to_string(),
+            contact_email: Some("person@example.com".to_string()),
+            contact_phone: None,
+            published_at: None,
+            draft_reason: None,
+            contact_note: None,
+            related_ids: vec!["related-1".to_string()],
+            related_note: None,
+            present_value: None,
+            optional_email: Some("invalid".to_string()),
+            internal_note: Some("server-owned".to_string()),
+            enabled: false,
+            tags: vec!["rust".to_string(), "rust".to_string()],
+        };
+        let mut validator = Validator::new(test_app());
+
+        input.validate(&mut validator).await.unwrap();
+
+        let errors = validator.finish().unwrap_err();
+        assert_eq!(
+            errors
+                .errors
+                .iter()
+                .map(|error| (error.field.as_str(), error.code.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("publishedAt", "required_if"),
+                ("draftReason", "required_unless"),
+                ("contactNote", "required_with"),
+                ("relatedNote", "required_with"),
+                ("presentValue", "present"),
+                ("optionalEmail", "email"),
+                ("internalNote", "prohibited"),
+                ("tags", "distinct"),
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_conditional_rules_share_wire_names_with_openapi_and_typescript_metadata() {
+        let schema = <ConditionalPresenceInput as ApiSchema>::schema();
+        assert_eq!(schema["properties"]["tags"]["uniqueItems"], true);
+        assert_eq!(schema["properties"]["enabled"]["type"], "boolean");
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "presentValue"));
+
+        let validation = foundry::inventory::iter::<foundry::typescript::TsValidation>
+            .into_iter()
+            .find(|registration| registration.name == "ConditionalPresenceInput")
+            .map(|registration| (registration.schema_fn)())
+            .expect("ConditionalPresenceInput validation schema should be registered");
+        let published_at = validation
+            .fields
+            .iter()
+            .find(|field| field.name == "publishedAt")
+            .unwrap();
+        let required_if = published_at
+            .rules
+            .iter()
+            .find(|rule| rule.code == "required_if")
+            .unwrap();
+        assert_eq!(
+            required_if.params.get("other").map(String::as_str),
+            Some("publicationStatus")
+        );
+        assert_eq!(required_if.values, vec!["published"]);
+
+        let contact_note = validation
+            .fields
+            .iter()
+            .find(|field| field.name == "contactNote")
+            .unwrap();
+        let required_with = contact_note
+            .rules
+            .iter()
+            .find(|rule| rule.code == "required_with")
+            .unwrap();
+        assert_eq!(required_with.values, vec!["contactEmail", "contactPhone"]);
+        assert!(validation
+            .fields
+            .iter()
+            .find(|field| field.name == "enabled")
+            .unwrap()
+            .rules
+            .iter()
+            .any(|rule| rule.code == "boolean"));
+        assert!(validation
+            .fields
+            .iter()
+            .find(|field| field.name == "tags")
+            .unwrap()
+            .rules
+            .iter()
+            .any(|rule| rule.code == "distinct"));
     }
 
     #[tokio::test]

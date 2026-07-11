@@ -1,11 +1,19 @@
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::Actor;
 use crate::database::{DbRecord, DbType, DbValue, Model, Query, QueryExecutor};
 use crate::foundation::{Error, Result};
+use crate::logging::RequestId;
+
+mod cli;
+
+pub(crate) use cli::audit_cli_registrar;
 
 #[derive(Debug, Serialize, Deserialize, crate::Model)]
 #[foundry(table = "audit_logs", audit = false)]
@@ -25,6 +33,132 @@ pub struct AuditLog {
     pub after_data: Option<serde_json::Value>,
     pub changes: Option<serde_json::Value>,
     pub created_at: crate::DateTime,
+}
+
+/// Attribution applied to model lifecycle audits within an async scope.
+#[derive(Clone, Debug)]
+pub struct AuditContext {
+    area: String,
+    actor: Option<Actor>,
+    request_id: Option<RequestId>,
+    ip: Option<IpAddr>,
+    user_agent: Option<String>,
+}
+
+impl AuditContext {
+    pub fn new(area: impl Into<String>) -> Self {
+        Self::try_new(area).expect("audit area must be non-empty")
+    }
+
+    pub fn try_new(area: impl Into<String>) -> Result<Self> {
+        let area = area.into();
+        validate_audit_label("area", &area)?;
+        Ok(Self {
+            area,
+            actor: None,
+            request_id: None,
+            ip: None,
+            user_agent: None,
+        })
+    }
+
+    pub fn with_actor(mut self, actor: Actor) -> Self {
+        self.actor = Some(actor);
+        self
+    }
+
+    pub fn with_request_id(mut self, request_id: RequestId) -> Self {
+        self.request_id = Some(request_id);
+        self
+    }
+
+    pub fn with_ip(mut self, ip: IpAddr) -> Self {
+        self.ip = Some(ip);
+        self
+    }
+
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
+        self
+    }
+
+    pub fn area(&self) -> &str {
+        &self.area
+    }
+
+    pub fn actor(&self) -> Option<&Actor> {
+        self.actor.as_ref()
+    }
+}
+
+tokio::task_local! {
+    static CURRENT_AUDIT_CONTEXT: AuditContext;
+}
+
+/// Run domain work with audit attribution independent of an HTTP route.
+pub async fn scope_audit<F>(context: AuditContext, future: F) -> F::Output
+where
+    F: Future,
+{
+    CURRENT_AUDIT_CONTEXT.scope(context, future).await
+}
+
+/// Explicit audit event for domain actions that are not model lifecycle writes.
+#[derive(Clone, Debug)]
+pub struct AuditEntry {
+    event_type: String,
+    subject_model: String,
+    subject_table: String,
+    subject_id: String,
+    area: Option<String>,
+    before_data: Option<serde_json::Value>,
+    after_data: Option<serde_json::Value>,
+    changes: Option<serde_json::Value>,
+}
+
+impl AuditEntry {
+    pub fn new(
+        event_type: impl Into<String>,
+        subject_table: impl Into<String>,
+        subject_id: impl Into<String>,
+    ) -> Self {
+        let subject_table = subject_table.into();
+        Self {
+            event_type: event_type.into(),
+            subject_model: subject_table.clone(),
+            subject_table,
+            subject_id: subject_id.into(),
+            area: None,
+            before_data: None,
+            after_data: None,
+            changes: None,
+        }
+    }
+
+    pub fn subject_model(mut self, subject_model: impl Into<String>) -> Self {
+        self.subject_model = subject_model.into();
+        self
+    }
+
+    pub fn area(mut self, area: impl Into<String>) -> Self {
+        self.area = Some(area.into());
+        self
+    }
+
+    pub fn before(mut self, value: impl Serialize) -> Result<Self> {
+        self.before_data = Some(serde_json::to_value(value).map_err(Error::other)?);
+        Ok(self)
+    }
+
+    pub fn after(mut self, value: impl Serialize) -> Result<Self> {
+        self.after_data = Some(serde_json::to_value(value).map_err(Error::other)?);
+        Ok(self)
+    }
+
+    pub fn changes(mut self, value: impl Serialize) -> Result<Self> {
+        self.changes = Some(serde_json::to_value(value).map_err(Error::other)?);
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,16 +279,28 @@ impl AuditRedactionPolicy {
     }
 }
 
-pub(crate) struct AuditManager {
+#[derive(Clone, Debug, Default)]
+struct AuditAttribution {
+    area: Option<String>,
+    actor: Option<Actor>,
+    request_id: Option<String>,
+    ip: Option<String>,
+    user_agent: Option<String>,
+}
+
+/// Manual audit writer and retention API.
+pub struct AuditManager {
     availability: AtomicU8,
     warned_missing: AtomicBool,
+    config: crate::config::AuditConfig,
 }
 
 impl AuditManager {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(config: crate::config::AuditConfig) -> Self {
         Self {
             availability: AtomicU8::new(0),
             warned_missing: AtomicBool::new(false),
+            config,
         }
     }
 
@@ -175,12 +321,13 @@ impl AuditManager {
     {
         M::audit_enabled()
             && M::table_meta().name() != "audit_logs"
-            && request
-                .and_then(|request| request.audit_area.as_deref())
-                .is_some()
+            && current_audit_area(request).is_some()
     }
 
-    async fn table_available(&self, executor: &dyn QueryExecutor) -> Result<bool> {
+    async fn table_available<E>(&self, executor: &E) -> Result<bool>
+    where
+        E: QueryExecutor + ?Sized,
+    {
         match self.availability.load(Ordering::Relaxed) {
             1 => return Ok(true),
             2 => return Ok(false),
@@ -225,6 +372,193 @@ impl AuditManager {
 
         Ok(available)
     }
+
+    /// Write an explicit domain audit entry through any query executor.
+    pub async fn record<E>(&self, executor: &E, entry: AuditEntry) -> Result<()>
+    where
+        E: QueryExecutor + ?Sized,
+    {
+        validate_audit_label("event type", &entry.event_type)?;
+        validate_audit_label("subject model", &entry.subject_model)?;
+        validate_audit_label("subject table", &entry.subject_table)?;
+        validate_audit_label("subject ID", &entry.subject_id)?;
+        if let Some(area) = entry.area.as_deref() {
+            validate_audit_label("area", area)?;
+        }
+        if !self.table_available(executor).await? {
+            return Err(Error::message(
+                "audit_logs table or `area` column is unavailable; publish and run framework migrations before recording manual audit entries",
+            ));
+        }
+
+        let redaction = AuditRedactionPolicy::new(&[], &self.config);
+        let mut attribution = current_audit_attribution(None);
+        if entry.area.is_some() {
+            attribution.area = entry.area;
+        }
+        let payload = AuditPayload {
+            before_data: entry
+                .before_data
+                .map(|value| redaction.redact_json_value(value)),
+            after_data: entry
+                .after_data
+                .map(|value| redaction.redact_json_value(value)),
+            changes: entry
+                .changes
+                .map(|value| redaction.redact_json_value(value)),
+        };
+
+        insert_audit_row(
+            executor,
+            &entry.event_type,
+            &entry.subject_model,
+            &entry.subject_table,
+            &entry.subject_id,
+            &attribution,
+            payload,
+        )
+        .await
+    }
+
+    /// Delete every audit row older than `cutoff`.
+    pub async fn prune_before<E>(&self, executor: &E, cutoff: crate::DateTime) -> Result<u64>
+    where
+        E: QueryExecutor + ?Sized,
+    {
+        if !self.table_available(executor).await? {
+            return Err(Error::message(
+                "audit_logs table or `area` column is unavailable; publish and run framework migrations before pruning audit rows",
+            ));
+        }
+        executor
+            .raw_execute(
+                "DELETE FROM audit_logs WHERE created_at < $1",
+                &[DbValue::TimestampTz(cutoff)],
+            )
+            .await
+    }
+
+    /// Apply the configured retention window. A zero-day window is disabled.
+    pub async fn prune_retention<E>(&self, executor: &E, now: crate::DateTime) -> Result<u64>
+    where
+        E: QueryExecutor + ?Sized,
+    {
+        if self.config.retention_days == 0 {
+            return Ok(0);
+        }
+        self.prune_before(
+            executor,
+            now.sub_days(i64::from(self.config.retention_days)),
+        )
+        .await
+    }
+
+    pub fn retention_days(&self) -> u32 {
+        self.config.retention_days
+    }
+}
+
+fn current_audit_area(request: Option<&crate::logging::CurrentRequest>) -> Option<String> {
+    CURRENT_AUDIT_CONTEXT
+        .try_with(|context| context.area.clone())
+        .ok()
+        .or_else(|| request.and_then(|request| request.audit_area.clone()))
+}
+
+fn current_audit_attribution(hook_actor: Option<&Actor>) -> AuditAttribution {
+    let request = crate::logging::current_request();
+    let scoped = CURRENT_AUDIT_CONTEXT.try_with(Clone::clone).ok();
+    AuditAttribution {
+        area: scoped
+            .as_ref()
+            .map(|context| context.area.clone())
+            .or_else(|| {
+                request
+                    .as_ref()
+                    .and_then(|request| request.audit_area.clone())
+            }),
+        actor: scoped
+            .as_ref()
+            .and_then(|context| context.actor.clone())
+            .or_else(|| hook_actor.cloned())
+            .or_else(crate::logging::current_actor),
+        request_id: scoped
+            .as_ref()
+            .and_then(|context| context.request_id.as_ref().map(ToString::to_string))
+            .or_else(|| {
+                request
+                    .as_ref()
+                    .and_then(|request| request.request_id.clone())
+            }),
+        ip: scoped
+            .as_ref()
+            .and_then(|context| context.ip.map(|ip| ip.to_string()))
+            .or_else(|| {
+                request
+                    .as_ref()
+                    .and_then(|request| request.ip.map(|ip| ip.to_string()))
+            }),
+        user_agent: scoped
+            .as_ref()
+            .and_then(|context| context.user_agent.clone())
+            .or_else(|| {
+                request
+                    .as_ref()
+                    .and_then(|request| request.user_agent.clone())
+            }),
+    }
+}
+
+fn validate_audit_label(name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(Error::message(format!("audit {name} cannot be empty")));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_audit_row<E>(
+    executor: &E,
+    event_type: &str,
+    subject_model: &str,
+    subject_table: &str,
+    subject_id: &str,
+    attribution: &AuditAttribution,
+    payload: AuditPayload,
+) -> Result<()>
+where
+    E: QueryExecutor + ?Sized,
+{
+    Query::insert_into("audit_logs")
+        .values([
+            ("event_type", DbValue::Text(event_type.to_string())),
+            ("subject_model", DbValue::Text(subject_model.to_string())),
+            ("subject_table", DbValue::Text(subject_table.to_string())),
+            ("subject_id", DbValue::Text(subject_id.to_string())),
+            ("area", nullable_text(attribution.area.clone())),
+            (
+                "actor_guard",
+                nullable_text(
+                    attribution
+                        .actor
+                        .as_ref()
+                        .map(|actor| actor.guard.to_string()),
+                ),
+            ),
+            (
+                "actor_id",
+                nullable_text(attribution.actor.as_ref().map(|actor| actor.id.clone())),
+            ),
+            ("request_id", nullable_text(attribution.request_id.clone())),
+            ("ip", nullable_text(attribution.ip.clone())),
+            ("user_agent", nullable_text(attribution.user_agent.clone())),
+            ("before_data", nullable_json(payload.before_data)),
+            ("after_data", nullable_json(payload.after_data)),
+            ("changes", nullable_json(payload.changes)),
+        ])
+        .execute(executor)
+        .await?;
+    Ok(())
 }
 
 pub(crate) async fn write_model_audit<M>(
@@ -238,14 +572,14 @@ where
 {
     let audit = context.app().audit()?;
     let request = crate::logging::current_request();
+    let attribution = current_audit_attribution(context.actor());
     if !audit.active_for_request::<M>(request.as_ref())
         || !audit.table_available(context.transaction()).await?
     {
         return Ok(());
     }
 
-    let audit_config = context.app().config().audit()?;
-    let redaction = AuditRedactionPolicy::new(M::audit_excluded_fields(), &audit_config);
+    let redaction = AuditRedactionPolicy::new(M::audit_excluded_fields(), &audit.config);
     let payload = build_payload(event_type, before, after, &redaction);
     let subject_source = after.or(before).ok_or_else(|| {
         Error::message(format!(
@@ -253,59 +587,17 @@ where
             M::table_meta().name()
         ))
     })?;
-    let actor = context.actor();
-
-    Query::insert_into("audit_logs")
-        .values([
-            ("event_type", DbValue::Text(event_type.as_str().to_string())),
-            (
-                "subject_model",
-                DbValue::Text(std::any::type_name::<M>().to_string()),
-            ),
-            (
-                "subject_table",
-                DbValue::Text(M::table_meta().name().to_string()),
-            ),
-            (
-                "subject_id",
-                DbValue::Text(subject_id_for_record::<M>(subject_source)?),
-            ),
-            (
-                "area",
-                nullable_text(request.as_ref().and_then(|value| value.audit_area.clone())),
-            ),
-            (
-                "actor_guard",
-                nullable_text(actor.map(|value| value.guard.as_ref().to_string())),
-            ),
-            (
-                "actor_id",
-                nullable_text(actor.map(|value| value.id.clone())),
-            ),
-            (
-                "request_id",
-                nullable_text(request.as_ref().and_then(|value| value.request_id.clone())),
-            ),
-            (
-                "ip",
-                nullable_text(
-                    request
-                        .as_ref()
-                        .and_then(|value| value.ip.map(|ip| ip.to_string())),
-                ),
-            ),
-            (
-                "user_agent",
-                nullable_text(request.as_ref().and_then(|value| value.user_agent.clone())),
-            ),
-            ("before_data", nullable_json(payload.before_data)),
-            ("after_data", nullable_json(payload.after_data)),
-            ("changes", nullable_json(payload.changes)),
-        ])
-        .execute(context.transaction())
-        .await?;
-
-    Ok(())
+    let subject_id = subject_id_for_record::<M>(subject_source)?;
+    insert_audit_row(
+        context.transaction(),
+        event_type.as_str(),
+        std::any::type_name::<M>(),
+        M::table_meta().name(),
+        &subject_id,
+        &attribution,
+        payload,
+    )
+    .await
 }
 
 pub(crate) fn record_with_assignments(

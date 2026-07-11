@@ -88,6 +88,24 @@ mod app {
 
         pub struct AdminPolicy;
 
+        pub struct CurrentActorHydrator;
+
+        #[async_trait]
+        impl ActorHydrator for CurrentActorHydrator {
+            async fn hydrate(&self, actor: &Actor, _app: &AppContext) -> Result<Option<Actor>> {
+                let hydrated = match actor.id.as_str() {
+                    "viewer-1" | "pending-1" => Actor::new(&actor.id, actor.guard.clone())
+                        .with_permissions([ids::Ability::ReportsView, ids::Ability::WsChat]),
+                    "admin-1" => Actor::new(&actor.id, actor.guard.clone())
+                        .with_roles([ids::RoleKey::Admin])
+                        .with_permissions([ids::Ability::ReportsView, ids::Ability::WsChat]),
+                    "guest-1" => Actor::new(&actor.id, actor.guard.clone()),
+                    _ => return Ok(None),
+                };
+                Ok(Some(hydrated))
+            }
+        }
+
         #[async_trait]
         impl Policy for AdminPolicy {
             async fn evaluate(&self, actor: &Actor, _app: &AppContext) -> Result<bool> {
@@ -101,32 +119,17 @@ mod app {
                 registrar.register_guard(
                     ids::AuthGuard::Api,
                     StaticBearerAuthenticator::new()
-                        .token(
-                            "viewer-token",
-                            Actor::new("viewer-1", ids::AuthGuard::Api).with_permissions([
-                                ids::Ability::ReportsView,
-                                ids::Ability::WsChat,
-                            ]),
-                        )
+                        .token("viewer-token", Actor::new("viewer-1", ids::AuthGuard::Api))
                         .token("guest-token", Actor::new("guest-1", ids::AuthGuard::Api))
                         .token(
                             "mfa-pending-token",
                             Actor::new("pending-1", ids::AuthGuard::Api).with_permissions([
-                                ids::Ability::ReportsView.into(),
-                                ids::Ability::WsChat.into(),
                                 PermissionId::new(foundry::auth::token::MFA_PENDING_ABILITY),
                             ]),
                         )
-                        .token(
-                            "admin-token",
-                            Actor::new("admin-1", ids::AuthGuard::Api)
-                                .with_roles([ids::RoleKey::Admin])
-                                .with_permissions([
-                                    ids::Ability::ReportsView,
-                                    ids::Ability::WsChat,
-                                ]),
-                        ),
+                        .token("admin-token", Actor::new("admin-1", ids::AuthGuard::Api)),
                 )?;
+                registrar.register_actor_hydrator(ids::AuthGuard::Api, CurrentActorHydrator)?;
                 registrar.register_guard(
                     ids::AuthGuard::Admin,
                     StaticBearerAuthenticator::new().token(
@@ -221,6 +224,39 @@ mod app {
             Ok(())
         }
     }
+}
+
+struct CollisionActorHydrator;
+
+#[async_trait]
+impl ActorHydrator for CollisionActorHydrator {
+    async fn hydrate(&self, actor: &Actor, _app: &AppContext) -> Result<Option<Actor>> {
+        Ok(Some(actor.clone()))
+    }
+}
+
+struct CollisionHydratorProvider;
+
+#[async_trait]
+impl ServiceProvider for CollisionHydratorProvider {
+    async fn register(&self, registrar: &mut ServiceRegistrar) -> Result<()> {
+        registrar.register_actor_hydrator(GuardId::new("collision"), CollisionActorHydrator)
+    }
+}
+
+#[tokio::test]
+async fn providers_cannot_register_two_actor_hydrators_for_one_guard() {
+    let error = App::builder()
+        .register_provider(CollisionHydratorProvider)
+        .register_provider(CollisionHydratorProvider)
+        .build_cli_kernel()
+        .await
+        .err()
+        .expect("actor hydrator collision should fail bootstrap");
+
+    assert!(error
+        .to_string()
+        .contains("actor hydrator for guard `collision` already registered"));
 }
 
 #[derive(Clone)]
@@ -800,7 +836,7 @@ async fn websocket_guard_only_channel_rejects_actor_from_different_guard() {
 }
 
 #[tokio::test]
-async fn disconnect_user_closes_authenticated_websocket_connections_and_broadcasts_presence_leave()
+async fn disconnect_actor_closes_authenticated_websocket_connections_and_broadcasts_presence_leave()
 {
     let config_dir = tempdir().unwrap();
     let server_port = free_port();
@@ -869,7 +905,7 @@ async fn disconnect_user_closes_authenticated_websocket_connections_and_broadcas
 
     app.websocket()
         .unwrap()
-        .disconnect_user("viewer-1")
+        .disconnect_actor(app::ids::AuthGuard::Api, "viewer-1")
         .await
         .unwrap();
 

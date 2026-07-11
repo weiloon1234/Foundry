@@ -15,16 +15,16 @@ jobs:
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: forge
+          POSTGRES_DB: foundry
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d forge"
+          --health-cmd "pg_isready -U postgres -d foundry"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
     env:
-      FORGE_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/forge
+      FOUNDRY_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/foundry
 
     steps:
       - name: Checkout
@@ -37,3 +37,12 @@ jobs:
 
       - name: Release verification
         run: make verify-release
+
+      - name: Capture clean build metrics
+        run: make build-metrics | tee build-metrics.md
+
+      - name: Upload build metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: foundry-build-metrics
+          path: build-metrics.md

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -6,7 +7,13 @@ use axum::Router;
 use serde::de::DeserializeOwned;
 use tower::ServiceExt;
 
+use crate::auth::Actor;
 use crate::foundation::{App, AppBuilder, AppContext, Result};
+
+use super::{
+    ClockFake, DatabaseTestTransaction, EventFake, HttpClientFake, JobFake, MailFake,
+    NotificationFake,
+};
 
 /// A test application that bootstraps the full framework without starting a server.
 ///
@@ -35,7 +42,10 @@ impl TestApp {
     /// This keeps shared providers, plugins, middleware, validation rules, and routes
     /// on the production builder instead of duplicating them in test setup.
     pub fn from_builder(builder: AppBuilder) -> TestAppBuilder {
-        TestAppBuilder { inner: builder }
+        TestAppBuilder {
+            inner: builder,
+            service_overrides: Vec::new(),
+        }
     }
 
     /// Access the underlying AppContext for direct service resolution.
@@ -45,9 +55,30 @@ impl TestApp {
 
     /// Create a test HTTP client that sends requests to the app's router directly.
     pub fn client(&self) -> TestClient {
+        let session_cookie_name = self
+            .app
+            .config()
+            .auth()
+            .map(|config| config.sessions.cookie_name)
+            .unwrap_or_else(|_| "foundry_session".to_string());
         TestClient {
             router: self.router.clone(),
+            default_actor: None,
+            default_headers: Vec::new(),
+            session_cookie_name,
         }
+    }
+
+    /// Begin a transaction intended to isolate one database test.
+    pub async fn begin_database_test(&self) -> Result<DatabaseTestTransaction> {
+        DatabaseTestTransaction::begin(&self.app).await
+    }
+
+    /// Install a controllable application clock after bootstrap.
+    pub fn freeze_time(&self, now: crate::support::DateTime) -> Result<ClockFake> {
+        let fake = ClockFake::new(now, self.app.timezone()?);
+        install_clock(self.app.container(), &fake)?;
+        Ok(fake)
     }
 
     /// Gracefully stop managed background tasks and registered plugins.
@@ -57,7 +88,7 @@ impl TestApp {
     pub async fn shutdown(self) -> Result<()> {
         let Self { app, router } = self;
         drop(router);
-        app.shutdown_runtime().await
+        app.shutdown().await
     }
 
     /// Seed a presence member into the Redis-backed presence set for testing.
@@ -94,11 +125,38 @@ impl TestApp {
 /// Builder for [`TestApp`].
 pub struct TestAppBuilder {
     inner: AppBuilder,
+    service_overrides: Vec<TestServiceOverride>,
 }
 
+type TestServiceOverride = Box<dyn FnOnce(&crate::foundation::Container) -> Result<()> + Send>;
+
 impl TestAppBuilder {
+    pub fn use_external_tracing_subscriber(mut self) -> Self {
+        self.inner = self.inner.use_external_tracing_subscriber();
+        self
+    }
+
     pub fn load_config_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.inner = self.inner.load_config_dir(path);
+        self
+    }
+
+    /// Register a plugin on the same application builder used by the test app.
+    pub fn register_plugin<P>(mut self, plugin: P) -> Self
+    where
+        P: crate::plugin::Plugin,
+    {
+        self.inner = self.inner.register_plugin(plugin);
+        self
+    }
+
+    /// Register multiple plugins of the same concrete type.
+    pub fn register_plugins<I, P>(mut self, plugins: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: crate::plugin::Plugin,
+    {
+        self.inner = self.inner.register_plugins(plugins);
         self
     }
 
@@ -152,9 +210,90 @@ impl TestAppBuilder {
         self
     }
 
+    /// Replace an already registered service after bootstrap and before the
+    /// test router is built. Production container registration remains strict.
+    pub fn replace_service<T>(self, value: T) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        self.replace_service_arc(Arc::new(value))
+    }
+
+    /// Arc form of [`Self::replace_service`].
+    pub fn replace_service_arc<T>(mut self, value: Arc<T>) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        self.service_overrides.push(Box::new(move |container| {
+            container.replace_singleton_arc(value)
+        }));
+        self
+    }
+
+    /// Record typed events and suppress their listeners.
+    pub fn fake_events(mut self, fake: EventFake) -> Self {
+        self.service_overrides.push(Box::new(move |container| {
+            let bus = container.resolve::<crate::events::EventBus>()?;
+            let sink: Arc<dyn crate::events::EventDispatchSink> = Arc::new(fake);
+            container.replace_singleton_arc(Arc::new(bus.with_test_sink(sink)))
+        }));
+        self
+    }
+
+    /// Record typed jobs and suppress queue writes.
+    pub fn fake_jobs(mut self, fake: JobFake) -> Self {
+        self.service_overrides.push(Box::new(move |container| {
+            let dispatcher = container.resolve::<crate::jobs::JobDispatcher>()?;
+            let sink: Arc<dyn crate::jobs::JobDispatchSink> = Arc::new(fake);
+            container.replace_singleton_arc(Arc::new(dispatcher.with_test_sink(sink)))
+        }));
+        self
+    }
+
+    /// Record fully resolved outbound emails and suppress transport delivery.
+    pub fn fake_mail(mut self, fake: MailFake) -> Self {
+        self.service_overrides.push(Box::new(move |container| {
+            let manager = container.resolve::<crate::email::EmailManager>()?;
+            let driver: Arc<dyn crate::email::EmailDriver> = Arc::new(fake);
+            container.replace_singleton_arc(Arc::new(manager.with_test_driver(driver)))
+        }));
+        self
+    }
+
+    /// Record immediate and queued notifications and suppress channel delivery.
+    pub fn fake_notifications(mut self, fake: NotificationFake) -> Self {
+        self.service_overrides.push(Box::new(move |container| {
+            let sink: Arc<dyn crate::notifications::NotificationDispatchSink> = Arc::new(fake);
+            container.singleton(crate::notifications::NotificationDispatchHook::new(sink))
+        }));
+        self
+    }
+
+    /// Replace the outbound HTTP client with a deterministic fake transport.
+    pub fn fake_http(self, fake: HttpClientFake) -> Self {
+        self.replace_service(fake.client())
+    }
+
+    /// Install a caller-owned controllable application clock.
+    pub fn with_clock(mut self, fake: ClockFake) -> Self {
+        self.service_overrides
+            .push(Box::new(move |container| install_clock(container, &fake)));
+        self
+    }
+
     /// Build the test application. Bootstraps all services without starting a server.
     pub async fn build(self) -> Result<TestApp> {
-        let kernel = self.inner.build_http_kernel().await?;
+        let Self {
+            inner,
+            service_overrides,
+        } = self;
+        let kernel = inner.build_http_kernel().await?;
+        for service_override in service_overrides {
+            if let Err(error) = service_override(kernel.app().container()) {
+                let _ = kernel.app().shutdown().await;
+                return Err(error);
+            }
+        }
         let router = kernel.build_router()?;
         Ok(TestApp {
             app: kernel.app().clone(),
@@ -163,31 +302,73 @@ impl TestAppBuilder {
     }
 }
 
+fn install_clock(container: &crate::foundation::Container, fake: &ClockFake) -> Result<()> {
+    let clock = Arc::new(fake.clock());
+    if container.contains::<crate::support::Clock>() {
+        container.replace_singleton_arc(clock)
+    } else {
+        container.singleton_arc(clock)
+    }
+}
+
 /// HTTP test client that sends requests directly to the router without TCP.
 #[derive(Clone)]
 pub struct TestClient {
     router: Router,
+    default_actor: Option<Actor>,
+    default_headers: Vec<(String, String)>,
+    session_cookie_name: String,
 }
 
 impl TestClient {
+    /// Apply a pre-authenticated actor to every request from this client.
+    pub fn acting_as(mut self, actor: Actor) -> Self {
+        self.default_actor = Some(actor);
+        self
+    }
+
+    /// Apply a bearer token to every request from this client.
+    pub fn with_bearer_token(mut self, token: &str) -> Self {
+        self.default_headers
+            .push(("authorization".to_string(), format!("Bearer {token}")));
+        self
+    }
+
+    /// Apply the configured auth-session cookie to every request from this client.
+    pub fn with_session(mut self, session_id: &str) -> Self {
+        self.default_headers.push((
+            "cookie".to_string(),
+            format!("{}={session_id}", self.session_cookie_name),
+        ));
+        self
+    }
+
+    fn request(&self, method: Method, path: &str) -> TestRequestBuilder {
+        let mut request = TestRequestBuilder::new(self.router.clone(), method, path);
+        request.headers = self.default_headers.clone();
+        request.actor = self.default_actor.clone();
+        request.session_cookie_name = self.session_cookie_name.clone();
+        request
+    }
+
     pub fn get(&self, path: &str) -> TestRequestBuilder {
-        TestRequestBuilder::new(self.router.clone(), Method::GET, path)
+        self.request(Method::GET, path)
     }
 
     pub fn post(&self, path: &str) -> TestRequestBuilder {
-        TestRequestBuilder::new(self.router.clone(), Method::POST, path)
+        self.request(Method::POST, path)
     }
 
     pub fn put(&self, path: &str) -> TestRequestBuilder {
-        TestRequestBuilder::new(self.router.clone(), Method::PUT, path)
+        self.request(Method::PUT, path)
     }
 
     pub fn patch(&self, path: &str) -> TestRequestBuilder {
-        TestRequestBuilder::new(self.router.clone(), Method::PATCH, path)
+        self.request(Method::PATCH, path)
     }
 
     pub fn delete(&self, path: &str) -> TestRequestBuilder {
-        TestRequestBuilder::new(self.router.clone(), Method::DELETE, path)
+        self.request(Method::DELETE, path)
     }
 }
 
@@ -198,6 +379,8 @@ pub struct TestRequestBuilder {
     path: String,
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
+    actor: Option<Actor>,
+    session_cookie_name: String,
 }
 
 impl TestRequestBuilder {
@@ -208,6 +391,8 @@ impl TestRequestBuilder {
             path: path.to_string(),
             headers: Vec::new(),
             body: None,
+            actor: None,
+            session_cookie_name: "foundry_session".to_string(),
         }
     }
 
@@ -220,6 +405,19 @@ impl TestRequestBuilder {
     /// Set the Authorization header with a bearer token.
     pub fn bearer_auth(self, token: &str) -> Self {
         self.header("authorization", &format!("Bearer {token}"))
+    }
+
+    /// Set the configured auth-session cookie.
+    pub fn session_auth(self, session_id: &str) -> Self {
+        let cookie = format!("{}={session_id}", self.session_cookie_name);
+        self.header("cookie", &cookie)
+    }
+
+    /// Bypass credential lookup with a typed actor while retaining guard,
+    /// permission, policy, MFA, and post-auth middleware checks.
+    pub fn acting_as(mut self, actor: Actor) -> Self {
+        self.actor = Some(actor);
+        self
     }
 
     /// Set a raw request body.
@@ -255,9 +453,15 @@ impl TestRequestBuilder {
             builder = builder.header(name.as_str(), value.as_str());
         }
 
-        let request = builder
+        let mut request = builder
             .body(body)
             .map_err(crate::foundation::Error::other)?;
+        if let Some(actor) = self.actor {
+            request.extensions_mut().insert(actor.clone());
+            request
+                .extensions_mut()
+                .insert(crate::auth::TestActorOverride(actor));
+        }
         let response = self
             .router
             .oneshot(request)
@@ -318,14 +522,322 @@ impl TestResponse {
     pub fn bytes(&self) -> &[u8] {
         &self.body
     }
+
+    #[track_caller]
+    pub fn assert_status(&self, expected: StatusCode) -> &Self {
+        assert_eq!(
+            self.status,
+            expected,
+            "unexpected response status; body: {}",
+            self.body_preview()
+        );
+        self
+    }
+
+    #[track_caller]
+    pub fn assert_successful(&self) -> &Self {
+        assert!(
+            self.status.is_success(),
+            "expected a successful response, got {}; body: {}",
+            self.status,
+            self.body_preview()
+        );
+        self
+    }
+
+    #[track_caller]
+    pub fn assert_ok(&self) -> &Self {
+        self.assert_status(StatusCode::OK)
+    }
+
+    #[track_caller]
+    pub fn assert_created(&self) -> &Self {
+        self.assert_status(StatusCode::CREATED)
+    }
+
+    #[track_caller]
+    pub fn assert_no_content(&self) -> &Self {
+        self.assert_status(StatusCode::NO_CONTENT)
+    }
+
+    #[track_caller]
+    pub fn assert_not_found(&self) -> &Self {
+        self.assert_status(StatusCode::NOT_FOUND)
+    }
+
+    #[track_caller]
+    pub fn assert_unprocessable(&self) -> &Self {
+        self.assert_status(StatusCode::UNPROCESSABLE_ENTITY)
+    }
+
+    #[track_caller]
+    pub fn assert_header(&self, name: &str, expected: &str) -> &Self {
+        assert_eq!(
+            self.header(name),
+            Some(expected),
+            "unexpected `{name}` response header"
+        );
+        self
+    }
+
+    #[track_caller]
+    pub fn assert_header_missing(&self, name: &str) -> &Self {
+        assert!(
+            self.header(name).is_none(),
+            "expected `{name}` response header to be absent"
+        );
+        self
+    }
+
+    #[track_caller]
+    pub fn assert_json(&self, expected: &serde_json::Value) -> &Self {
+        let actual = self.json_value();
+        assert_eq!(&actual, expected, "unexpected JSON response body");
+        self
+    }
+
+    #[track_caller]
+    pub fn assert_json_path(&self, path: &str, expected: &serde_json::Value) -> &Self {
+        let actual = self.json_value();
+        let value = json_path(&actual, path)
+            .unwrap_or_else(|| panic!("JSON response does not contain path `{path}`"));
+        assert_eq!(value, expected, "unexpected JSON value at path `{path}`");
+        self
+    }
+
+    #[track_caller]
+    pub fn assert_json_fragment(&self, expected: &serde_json::Value) -> &Self {
+        let actual = self.json_value();
+        assert!(
+            contains_json_fragment(&actual, expected),
+            "JSON response does not contain fragment {expected}; actual: {actual}"
+        );
+        self
+    }
+
+    #[track_caller]
+    pub fn assert_json_shape(&self, paths: &[&str]) -> &Self {
+        let actual = self.json_value();
+        for path in paths {
+            assert!(
+                json_path(&actual, path).is_some(),
+                "JSON response does not contain required path `{path}`"
+            );
+        }
+        self
+    }
+
+    #[track_caller]
+    pub fn assert_validation_error(&self, field: &str) -> &Self {
+        self.assert_unprocessable();
+        let actual = self.json_value();
+        let errors = actual
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("validation response does not contain an `errors` array"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.get("field").and_then(serde_json::Value::as_str) == Some(field)),
+            "validation response does not contain an error for `{field}`: {actual}"
+        );
+        self
+    }
+
+    #[track_caller]
+    pub fn assert_redirect(&self, location: &str) -> &Self {
+        assert!(
+            self.status.is_redirection(),
+            "expected a redirect response, got {}",
+            self.status
+        );
+        self.assert_header("location", location)
+    }
+
+    #[track_caller]
+    pub fn assert_download(&self) -> &Self {
+        let disposition = self
+            .header("content-disposition")
+            .unwrap_or_else(|| panic!("download response is missing `content-disposition`"));
+        assert!(
+            disposition
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("attachment")),
+            "expected attachment content disposition, got `{disposition}`"
+        );
+        self
+    }
+
+    #[track_caller]
+    pub fn assert_download_named(&self, filename: &str) -> &Self {
+        self.assert_download();
+        let disposition = self
+            .header("content-disposition")
+            .expect("assert_download verifies the header");
+        assert!(
+            disposition.contains(&format!("filename=\"{filename}\""))
+                || disposition.contains(&format!("filename*=UTF-8''{filename}")),
+            "download filename `{filename}` is not present in `{disposition}`"
+        );
+        self
+    }
+
+    #[track_caller]
+    fn json_value(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).unwrap_or_else(|error| {
+            panic!(
+                "response body is not valid JSON: {error}; body: {}",
+                self.body_preview()
+            )
+        })
+    }
+
+    fn body_preview(&self) -> String {
+        const LIMIT: usize = 1_000;
+        let body = String::from_utf8_lossy(&self.body);
+        let mut preview = body.chars().take(LIMIT).collect::<String>();
+        if body.chars().count() > LIMIT {
+            preview.push_str("...");
+        }
+        preview
+    }
+}
+
+fn json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    if path.is_empty() {
+        return Some(value);
+    }
+
+    path.split('.').try_fold(value, |current, segment| {
+        current
+            .as_object()
+            .and_then(|object| object.get(segment))
+            .or_else(|| {
+                segment
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| current.as_array()?.get(index))
+            })
+    })
+}
+
+fn contains_json_fragment(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    if json_value_contains(actual, expected) {
+        return true;
+    }
+
+    match actual {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| contains_json_fragment(value, expected)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|value| contains_json_fragment(value, expected)),
+        _ => false,
+    }
+}
+
+fn json_value_contains(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    match (actual, expected) {
+        (serde_json::Value::Object(actual), serde_json::Value::Object(expected)) => {
+            expected.iter().all(|(key, value)| {
+                actual
+                    .get(key)
+                    .is_some_and(|actual| json_value_contains(actual, value))
+            })
+        }
+        (serde_json::Value::Array(actual), serde_json::Value::Array(expected)) => {
+            expected.iter().all(|value| {
+                actual
+                    .iter()
+                    .any(|actual| json_value_contains(actual, value))
+            })
+        }
+        _ => actual == expected,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::Json;
+    use serde::{Deserialize, Serialize};
     use serde_json::Value;
 
-    use super::TestResponse;
+    use super::{TestApp, TestResponse};
+    use crate::auth::{Actor, CurrentActor};
+    use crate::email::EmailMessage;
+    use crate::events::Event;
+    use crate::jobs::{Job, JobContext};
+    use crate::notifications::{Notifiable, Notification, NOTIFY_DATABASE};
+    use crate::support::{EventId, GuardId, JobId};
+    use crate::testing::{EventFake, JobFake, MailFake, NotificationFake};
+
+    #[derive(Debug)]
+    struct ReplaceableService(&'static str);
+
+    struct ReplaceableProvider;
+
+    #[derive(Clone, Serialize)]
+    struct TestEvent {
+        order_id: u64,
+    }
+
+    impl Event for TestEvent {
+        const ID: EventId = EventId::new("testing.order_created");
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct TestJob {
+        order_id: u64,
+    }
+
+    #[crate::__reexports::async_trait]
+    impl Job for TestJob {
+        const ID: JobId = JobId::new("testing.send_order");
+
+        async fn handle(&self, _context: JobContext) -> crate::foundation::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TestNotifiable;
+
+    impl Notifiable for TestNotifiable {
+        fn notifiable_type(&self) -> &str {
+            "users"
+        }
+
+        fn notification_id(&self) -> String {
+            "user-1".to_string()
+        }
+    }
+
+    struct TestNotification;
+
+    impl Notification for TestNotification {
+        fn notification_type(&self) -> &str {
+            "testing.order_ready"
+        }
+
+        fn via(&self) -> Vec<crate::support::NotificationChannelId> {
+            vec![NOTIFY_DATABASE]
+        }
+    }
+
+    #[crate::__reexports::async_trait]
+    impl crate::foundation::ServiceProvider for ReplaceableProvider {
+        async fn register(
+            &self,
+            registrar: &mut crate::foundation::ServiceRegistrar,
+        ) -> crate::foundation::Result<()> {
+            registrar.singleton(ReplaceableService("production"))
+        }
+    }
 
     fn response(body: impl Into<Vec<u8>>) -> TestResponse {
         TestResponse {
@@ -374,6 +886,219 @@ mod tests {
         assert_eq!(
             builder.headers,
             vec![("content-type".to_string(), "text/plain".to_string())]
+        );
+    }
+
+    #[test]
+    fn fluent_json_assertions_cover_paths_fragments_and_shapes() {
+        let response = TestResponse {
+            status: StatusCode::OK,
+            headers: vec![("x-request-id".to_string(), "request-1".to_string())],
+            body: serde_json::to_vec(&serde_json::json!({
+                "data": {
+                    "users": [
+                        {"id": 1, "name": "Ada", "roles": ["admin", "editor"]},
+                        {"id": 2, "name": "Grace"}
+                    ]
+                }
+            }))
+            .unwrap(),
+        };
+
+        response
+            .assert_ok()
+            .assert_successful()
+            .assert_header("X-Request-ID", "request-1")
+            .assert_header_missing("x-missing")
+            .assert_json_path("data.users.0.name", &serde_json::json!("Ada"))
+            .assert_json_fragment(&serde_json::json!({"id": 1, "roles": ["admin"]}))
+            .assert_json_shape(&["data.users", "data.users.1.name"]);
+    }
+
+    #[test]
+    fn validation_redirect_and_download_assertions_follow_http_contracts() {
+        let validation = TestResponse {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            headers: Vec::new(),
+            body: serde_json::to_vec(&serde_json::json!({
+                "message": "Validation failed",
+                "status": 422,
+                "errors": [{"field": "email", "code": "required", "message": "Required"}]
+            }))
+            .unwrap(),
+        };
+        validation
+            .assert_unprocessable()
+            .assert_validation_error("email");
+
+        let redirect = TestResponse {
+            status: StatusCode::SEE_OTHER,
+            headers: vec![("location".to_string(), "/login".to_string())],
+            body: Vec::new(),
+        };
+        redirect.assert_redirect("/login");
+
+        let download = TestResponse {
+            status: StatusCode::OK,
+            headers: vec![(
+                "content-disposition".to_string(),
+                "attachment; filename=\"report.csv\"; filename*=UTF-8''report.csv".to_string(),
+            )],
+            body: b"id,name\n1,Ada\n".to_vec(),
+        };
+        download
+            .assert_download()
+            .assert_download_named("report.csv");
+    }
+
+    #[test]
+    #[should_panic(expected = "JSON response does not contain path `data.missing`")]
+    fn json_path_assertion_reports_missing_path() {
+        response(r#"{"data":{}}"#).assert_json_path("data.missing", &serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_app_can_replace_an_existing_service_only() {
+        let app = TestApp::builder()
+            .register_provider(ReplaceableProvider)
+            .replace_service(ReplaceableService("fake"))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(app.app().resolve::<ReplaceableService>().unwrap().0, "fake");
+        app.shutdown().await.unwrap();
+
+        let result = TestApp::builder()
+            .replace_service(ReplaceableService("missing"))
+            .build()
+            .await;
+        assert!(result
+            .err()
+            .is_some_and(|error| error.to_string().contains("is not registered")));
+    }
+
+    #[tokio::test]
+    async fn installed_service_fakes_record_and_suppress_side_effects() {
+        let events = EventFake::new();
+        let jobs = JobFake::new();
+        let mail = MailFake::new();
+        let notifications = NotificationFake::new();
+        let app = TestApp::builder()
+            .fake_events(events.clone())
+            .fake_jobs(jobs.clone())
+            .fake_mail(mail.clone())
+            .fake_notifications(notifications.clone())
+            .build()
+            .await
+            .unwrap();
+
+        app.app()
+            .events()
+            .unwrap()
+            .dispatch(TestEvent { order_id: 42 })
+            .await
+            .unwrap();
+        app.app()
+            .jobs()
+            .unwrap()
+            .dispatch_after(TestJob { order_id: 42 }, Duration::from_secs(30))
+            .await
+            .unwrap();
+        app.app()
+            .email()
+            .unwrap()
+            .send(
+                EmailMessage::new("Order ready")
+                    .from("sender@example.test")
+                    .to("user@example.test")
+                    .text_body("Ready"),
+            )
+            .await
+            .unwrap();
+        app.app()
+            .notify_queued(&TestNotifiable, &TestNotification)
+            .await
+            .unwrap();
+
+        events.assert_dispatched_where::<TestEvent, _>(|event, _origin| event.order_id == 42);
+        jobs.assert_dispatched_where::<TestJob, _>(|job, record| {
+            job.order_id == 42 && record.scheduled_at > 0
+        });
+        mail.assert_sent_where(|message| message.subject == "Order ready");
+        notifications.assert_sent_where(|notification| {
+            notification.notification_type == "testing.order_ready"
+                && notification.delivery == crate::testing::NotificationDelivery::Queued
+        });
+
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acting_as_and_frozen_clock_compose_with_test_requests() {
+        async fn actor(CurrentActor(actor): CurrentActor) -> Json<Value> {
+            Json(serde_json::json!({
+                "id": actor.id,
+                "guard": actor.guard.as_str(),
+            }))
+        }
+
+        let app = TestApp::builder()
+            .register_routes(|routes| {
+                routes.route_with_options(
+                    "/actor",
+                    get(actor),
+                    crate::http::HttpRouteOptions::new().guard(GuardId::new("api")),
+                );
+                Ok(())
+            })
+            .build()
+            .await
+            .unwrap();
+        let now = crate::support::DateTime::parse("2026-07-11T12:00:00Z").unwrap();
+        let clock = app.freeze_time(now).unwrap();
+
+        app.client()
+            .acting_as(Actor::new("user-1", GuardId::new("api")))
+            .get("/actor")
+            .send()
+            .await
+            .unwrap()
+            .assert_ok()
+            .assert_json_path("id", &serde_json::json!("user-1"));
+        assert_eq!(app.app().clock().now(), now);
+        clock.advance_seconds(60);
+        assert_eq!(app.app().clock().now(), now.add_seconds(60));
+
+        app.client()
+            .acting_as(Actor::new("admin-1", GuardId::new("admin")))
+            .get("/actor")
+            .send()
+            .await
+            .unwrap()
+            .assert_status(StatusCode::UNAUTHORIZED);
+
+        app.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn token_and_session_helpers_apply_default_credentials() {
+        let client = super::TestClient {
+            router: axum::Router::new(),
+            default_actor: None,
+            default_headers: Vec::new(),
+            session_cookie_name: "app_session".to_string(),
+        };
+
+        let bearer = client.clone().with_bearer_token("secret").get("/");
+        assert_eq!(
+            bearer.headers,
+            vec![("authorization".to_string(), "Bearer secret".to_string())]
+        );
+
+        let session = client.with_session("session-1").get("/");
+        assert_eq!(
+            session.headers,
+            vec![("cookie".to_string(), "app_session=session-1".to_string())]
         );
     }
 }

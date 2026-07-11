@@ -21,7 +21,7 @@ make api-docs        # Regenerate docs/api/ from cargo doc HTML
 
 Single test: `cargo test --test <test_file_name>` (e.g., `cargo test --test auth_acceptance`)
 
-Postgres tests: `cargo test --test database_acceptance` (requires `FOUNDRY_TEST_POSTGRES_URL` env var)
+Postgres tests: `FOUNDRY_TEST_POSTGRES_URL=postgres://... make test-postgres` (runs every target so PostgreSQL-backed auth, audit, attachment, datatable, lifecycle, metadata, and query tests execute)
 
 MSRV: Rust 1.94. CI tests on 1.94.1 and stable with Postgres 16.
 
@@ -59,7 +59,7 @@ MSRV: Rust 1.94. CI tests on 1.94.1 and stable with Postgres 16.
 
 Acceptance tests live in `tests/` as separate test files:
 - `acceptance.rs` — general app
-- `database_acceptance.rs` — queries (needs Postgres)
+- PostgreSQL-backed acceptance coverage spans `database_acceptance.rs`, lifecycle, auth/token, audit, attachments, datatables, metadata/support stores, observability, HTTP model binding, events, and testing-layer targets
 - `auth_acceptance.rs` — auth flows
 - `phase2_acceptance.rs` — WebSocket + events + jobs
 - `plugin_acceptance.rs` — plugin system

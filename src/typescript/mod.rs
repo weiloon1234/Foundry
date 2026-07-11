@@ -1,7 +1,8 @@
 //! TypeScript type auto-export.
 //!
-//! Types that derive `ApiSchema`, `AppEnum`, or `foundry::TS` are automatically
-//! registered for TypeScript export via the `inventory` crate.
+//! Types that derive `AppEnum` or `foundry::TS` are automatically registered for
+//! TypeScript export via the `inventory` crate. `ApiSchema` registration remains
+//! independent so OpenAPI-only DTOs do not require TypeScript support.
 //!
 //! `AppEnum` types also export runtime metadata:
 //! ```ts
@@ -20,9 +21,10 @@ use std::sync::Arc;
 use crate::app_enum::{EnumKey, EnumKeyKind, EnumMeta};
 use crate::cli::CommandRegistrar;
 use crate::contract::{
-    ContractAction, ContractHttpBody, ContractManifest, ContractRealtimeChannel, ContractSchema,
-    ContractTransport, ContractValidationAttribute, ContractValidationField,
-    ContractValidationMessage, ContractValidationRule, ContractValidationSchema, ContractValueKind,
+    ContractAction, ContractHttpBody, ContractManifest, ContractParameterLocation,
+    ContractRealtimeChannel, ContractSchema, ContractTransport, ContractValidationAttribute,
+    ContractValidationField, ContractValidationMessage, ContractValidationRule,
+    ContractValidationSchema, ContractValueKind,
 };
 use crate::foundation::{Error, Result};
 use crate::http::RouteManifestEntry;
@@ -516,11 +518,11 @@ fn insert_route_id_node(
     insert_route_id_node(&mut child.node, route_id, remaining)
 }
 
-fn route_id_tree(routes: &[RouteManifestEntry]) -> Result<RouteIdTreeNode> {
+fn route_id_tree(actions: &[&ContractAction]) -> Result<RouteIdTreeNode> {
     let mut root = RouteIdTreeNode::default();
 
-    for route in routes {
-        let route_id = route.id.as_str();
+    for action in actions {
+        let route_id = action.id.as_str();
         let segments = route_id.split('.').collect::<Vec<_>>();
         insert_route_id_node(&mut root, route_id, &segments)?;
     }
@@ -558,83 +560,108 @@ fn render_route_id_node(node: &RouteIdTreeNode, indent: usize) -> String {
     format!("{{\n{},\n{closing_indent}}}", entries.join(",\n"))
 }
 
-fn render_route_ids(routes: &[RouteManifestEntry]) -> Result<String> {
-    let tree = route_id_tree(routes)?;
+fn render_route_ids(actions: &[&ContractAction]) -> Result<String> {
+    let tree = route_id_tree(actions)?;
     Ok(render_route_id_node(&tree, 0))
 }
 
-fn ensure_unique_route_manifest(routes: &[RouteManifestEntry]) -> Result<()> {
+fn ensure_unique_route_manifest(actions: &[&ContractAction]) -> Result<()> {
     let mut route_ids = HashSet::new();
-    for route in routes {
-        if !route_ids.insert(route.id.as_str()) {
+    for action in actions {
+        if !route_ids.insert(action.id.as_str()) {
             return Err(Error::message(format!(
                 "RouteManifest TypeScript export contains duplicate route id `{}`",
-                route.id.as_str()
+                action.id
             )));
         }
     }
     Ok(())
 }
 
-fn render_route_manifest(routes: &[RouteManifestEntry]) -> Result<String> {
-    ensure_unique_route_manifest(routes)?;
-    let route_ids = render_route_ids(routes)?;
-
-    let route_literals = routes
+fn render_route_manifest(
+    actions: &[ContractAction],
+    schema_exports: &BTreeMap<String, serde_json::Value>,
+) -> Result<String> {
+    let actions = actions
         .iter()
-        .map(|route| {
-            let params = string_array_literal(route.params.iter().map(String::as_str));
-            let permissions =
-                string_array_literal(route.permissions.iter().map(|permission| permission.as_str()));
-            let responses = route
+        .filter(|action| matches!(action.transport, ContractTransport::Http(_)))
+        .collect::<Vec<_>>();
+    ensure_unique_route_manifest(&actions)?;
+    let route_ids = render_route_ids(&actions)?;
+
+    let route_literals = actions
+        .iter()
+        .map(|action| {
+            let ContractTransport::Http(http) = &action.transport else {
+                unreachable!("HTTP actions were filtered above")
+            };
+            let params = string_array_literal(
+                action
+                    .parameters
+                    .iter()
+                    .filter(|parameter| parameter.location == ContractParameterLocation::Path)
+                    .map(|parameter| parameter.name.as_str()),
+            );
+            let permissions = string_array_literal(action.auth.permissions.iter().map(String::as_str));
+            let responses = action
                 .responses
                 .iter()
                 .map(|response| {
                     format!(
                         "{{ status: {}, schema: {} }}",
                         response.status,
-                        json_string(response.schema)
+                        json_string(&response.schema)
                     )
                 })
                 .collect::<Vec<_>>();
 
             format!(
                 "  {}: {{ id: {}, path: {}, method: {}, params: {}, clientExport: {}, guard: {}, permissions: {}, summary: {}, request: {}, responses: [{}] }}",
-                json_string(route.id.as_str()),
-                json_string(route.id.as_str()),
-                json_string(&route.path),
-                option_string_literal(route.method.as_deref()),
+                json_string(&action.id),
+                json_string(&action.id),
+                json_string(&http.path),
+                option_string_literal(http.method.as_deref()),
                 params,
-                if route.client_export { "true" } else { "false" },
-                option_string_literal(route.guard.as_ref().map(|guard| guard.as_str())),
+                if action.client_export { "true" } else { "false" },
+                option_string_literal(action.auth.guard.as_deref()),
                 permissions,
-                option_string_literal(route.summary.as_deref()),
-                option_string_literal(route.request),
+                option_string_literal(action.summary.as_deref()),
+                option_string_literal(action.request.as_ref().map(|request| request.schema.as_str())),
                 responses.join(", "),
             )
         })
         .collect::<Vec<_>>();
 
-    let route_params = if routes.is_empty() {
+    let route_params = if actions.is_empty() {
         "export type RouteParams = Record<RouteName, Record<never, never>>;\n".to_string()
     } else {
-        let entries = routes
+        let entries = actions
             .iter()
-            .map(|route| {
-                if route.params.is_empty() {
-                    format!(
-                        "  {}: Record<never, never>;",
-                        json_string(route.id.as_str())
-                    )
+            .map(|action| {
+                let path_params = action
+                    .parameters
+                    .iter()
+                    .filter(|parameter| parameter.location == ContractParameterLocation::Path)
+                    .collect::<Vec<_>>();
+                if path_params.is_empty() {
+                    format!("  {}: Record<never, never>;", json_string(&action.id))
                 } else {
-                    let fields = route
-                        .params
+                    let fields = path_params
                         .iter()
-                        .map(|param| format!("{}: RouteParamValue", json_string(param)))
+                        .map(|parameter| {
+                            format!(
+                                "{}: {}",
+                                json_string(&parameter.name),
+                                schema_exports
+                                    .get(&parameter.schema)
+                                    .map(route_parameter_ts_type)
+                                    .unwrap_or("RouteParamValue")
+                            )
+                        })
                         .collect::<Vec<_>>();
                     format!(
                         "  {}: {{ {} }};",
-                        json_string(route.id.as_str()),
+                        json_string(&action.id),
                         fields.join("; ")
                     )
                 }
@@ -735,6 +762,15 @@ fn render_route_manifest(routes: &[RouteManifestEntry]) -> Result<String> {
         route_ids,
         route_params,
     ))
+}
+
+fn route_parameter_ts_type(schema: &serde_json::Value) -> &'static str {
+    match schema.get("type").and_then(serde_json::Value::as_str) {
+        Some("string") => "string",
+        Some("integer") | Some("number") => "number",
+        Some("boolean") => "boolean",
+        _ => "RouteParamValue",
+    }
 }
 
 fn render_i18n_manifest(manifest: Option<&I18nTypeScriptManifest>) -> Result<String> {
@@ -888,13 +924,10 @@ fn websocket_payload_event_array(events: &[crate::contract::ContractRealtimeEven
 }
 
 fn websocket_payload_type(
-    payload: Option<&crate::contract::ContractPayload>,
+    payload: &crate::contract::ContractPayload,
     exported_types: &BTreeMap<String, String>,
     imports: &mut BTreeSet<String>,
 ) -> String {
-    let Some(payload) = payload else {
-        return "JsonValue".to_string();
-    };
     if exported_types.contains_key(&payload.schema) {
         imports.insert(payload.schema.clone());
         payload.schema.clone()
@@ -920,9 +953,8 @@ fn render_websocket_payload_map(
             let event_entries = events
                 .iter()
                 .filter_map(|event| {
-                    event.payload.as_ref()?;
-                    let payload_type =
-                        websocket_payload_type(event.payload.as_ref(), exported_types, imports);
+                    let payload = event.payload.as_ref()?;
+                    let payload_type = websocket_payload_type(payload, exported_types, imports);
                     Some(format!(
                         "    readonly {}: {payload_type};",
                         json_string(&event.event)
@@ -948,6 +980,29 @@ fn render_websocket_payload_map(
     }
 }
 
+fn render_websocket_message_payload_map(
+    channels: &[ContractRealtimeChannel],
+    exported_types: &BTreeMap<String, String>,
+    imports: &mut BTreeSet<String>,
+) -> String {
+    let entries = channels
+        .iter()
+        .filter_map(|channel| {
+            let payload = channel.message_payload.as_ref()?;
+            let payload_type = websocket_payload_type(payload, exported_types, imports);
+            Some(format!(
+                "  readonly {}: {payload_type};",
+                json_string(&channel.id)
+            ))
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{\n{}\n}}", entries.join("\n"))
+    }
+}
+
 fn render_websocket_manifest(
     channels: &[ContractRealtimeChannel],
     exported_types: &BTreeMap<String, String>,
@@ -959,12 +1014,18 @@ fn render_websocket_manifest(
         .iter()
         .map(|channel| {
             format!(
-                "  {}: {{ id: {}, presence: {}, replayCount: {}, allowClientEvents: {}, clientEvents: {}, serverEvents: {}, clientPayloadEvents: {}, serverPayloadEvents: {}, requiresAuth: {}, guard: {}, permissions: {} }}",
+                "  {}: {{ id: {}, presence: {}, replayCount: {}, allowClientEvents: {}, messagePayload: {}, clientEvents: {}, serverEvents: {}, clientPayloadEvents: {}, serverPayloadEvents: {}, requiresAuth: {}, guard: {}, permissions: {} }}",
                 json_string(&channel.id),
                 json_string(&channel.id),
                 if channel.presence { "true" } else { "false" },
                 channel.replay_count,
                 if channel.allow_client_events { "true" } else { "false" },
+                option_string_literal(
+                    channel
+                        .message_payload
+                        .as_ref()
+                        .map(|payload| payload.schema.as_str())
+                ),
                 websocket_event_array(&channel.incoming),
                 websocket_event_array(&channel.outgoing),
                 websocket_payload_event_array(&channel.incoming),
@@ -989,6 +1050,8 @@ fn render_websocket_manifest(
         render_websocket_payload_map(&channels, exported_types, &mut imports, "server");
     let client_payload_map =
         render_websocket_payload_map(&channels, exported_types, &mut imports, "client");
+    let message_payload_map =
+        render_websocket_message_payload_map(&channels, exported_types, &mut imports);
     let import_lines = imports
         .iter()
         .filter_map(|import| {
@@ -1010,6 +1073,7 @@ fn render_websocket_manifest(
            readonly presence: boolean;\n\
            readonly replayCount: number;\n\
            readonly allowClientEvents: boolean;\n\
+           readonly messagePayload: string | null;\n\
            readonly clientEvents: readonly string[];\n\
            readonly serverEvents: readonly string[];\n\
            readonly clientPayloadEvents: readonly string[];\n\
@@ -1049,6 +1113,8 @@ fn render_websocket_manifest(
          export type WebSocketAppServerEventName<Name extends WebSocketChannelName> = [WebSocketChannelName] extends [never] ? string : (typeof WebSocketChannelManifest)[Name][\"serverEvents\"][number] extends never ? string : Exclude<(typeof WebSocketChannelManifest)[Name][\"serverEvents\"][number], WebSocketChannelProtocolEventName>;\n\
          export type WebSocketServerPayloadMap = {server_payload_map};\n\
          export type WebSocketClientEventPayloadMap = {client_payload_map};\n\
+         export type WebSocketMessagePayloadMap = {message_payload_map};\n\
+         export type WebSocketMessagePayload<Name extends WebSocketChannelName> = Name extends keyof WebSocketMessagePayloadMap ? WebSocketMessagePayloadMap[Name] : JsonValue;\n\
          export type WebSocketServerPayload<Name extends WebSocketChannelName, Event extends WebSocketAppServerEventName<Name>> = Name extends keyof WebSocketServerPayloadMap ? Event extends keyof WebSocketServerPayloadMap[Name] ? WebSocketServerPayloadMap[Name][Event] : JsonValue : JsonValue;\n\
          export type WebSocketClientEventPayload<Name extends WebSocketClientEventChannelName, Event extends WebSocketClientEventName<Name>> = Name extends keyof WebSocketClientEventPayloadMap ? Event extends keyof WebSocketClientEventPayloadMap[Name] ? WebSocketClientEventPayloadMap[Name][Event] : JsonValue : JsonValue;\n\n\
          export type WebSocketFrameOptions = {{ readonly room?: string }};\n\
@@ -1056,6 +1122,7 @@ fn render_websocket_manifest(
          export type WebSocketSubscribeFrame<Name extends WebSocketChannelName = WebSocketChannelName> = {{ readonly action: \"subscribe\"; readonly channel: Name; readonly room?: string }};\n\
          export type WebSocketUnsubscribeFrame<Name extends WebSocketChannelName = WebSocketChannelName> = {{ readonly action: \"unsubscribe\"; readonly channel: Name; readonly room?: string }};\n\
          export type WebSocketMessageFrame<Name extends WebSocketChannelName = WebSocketChannelName, Payload extends JsonValue = JsonValue> = {{ readonly action: \"message\"; readonly channel: Name; readonly room?: string; readonly payload: Payload; readonly ack_id?: string }};\n\
+         export type TypedWebSocketMessageFrame<Name extends WebSocketChannelName = WebSocketChannelName> = WebSocketMessageFrame<Name, WebSocketMessagePayload<Name> & JsonValue>;\n\
          export type WebSocketClientEventFrame<Name extends WebSocketClientEventChannelName = WebSocketClientEventChannelName, Payload extends JsonValue = JsonValue, Event extends WebSocketClientEventName<Name> = WebSocketClientEventName<Name>> = {{ readonly action: \"client_event\"; readonly channel: Name; readonly room?: string; readonly event: Event; readonly payload: Payload }};\n\
          export type WebSocketClientFrame<Name extends WebSocketChannelName = WebSocketChannelName, Payload extends JsonValue = JsonValue> = WebSocketSubscribeFrame<Name> | WebSocketUnsubscribeFrame<Name> | WebSocketMessageFrame<Name, Payload> | WebSocketClientEventFrame<Extract<Name, WebSocketClientEventChannelName>, Payload>;\n\
          export type WebSocketServerFrame<Name extends string = string, Event extends string = string, Payload extends JsonValue = JsonValue> = {{ readonly channel: Name; readonly event: Event; readonly room?: string; readonly payload: Payload }};\n\
@@ -1135,6 +1202,9 @@ fn render_websocket_manifest(
          export function messageToChannel<Name extends WebSocketChannelName, Payload extends JsonValue = JsonValue>(channel: Name, payload: Payload, options: WebSocketMessageOptions = {{}}): WebSocketMessageFrame<Name, Payload> {{\n\
            return {{ action: \"message\", channel, room: options.room, payload, ack_id: options.ackId }};\n\
          }}\n\n\
+         export function typedMessageToChannel<Name extends WebSocketChannelName>(channel: Name, payload: WebSocketMessagePayload<Name>, options: WebSocketMessageOptions = {{}}): TypedWebSocketMessageFrame<Name> {{\n\
+           return messageToChannel(channel, payload as WebSocketMessagePayload<Name> & JsonValue, options);\n\
+         }}\n\n\
          export function clientEventToChannel<Name extends WebSocketClientEventChannelName, Event extends WebSocketClientEventName<Name>, Payload extends JsonValue = JsonValue>(channel: Name, event: Event, payload: Payload, options: WebSocketFrameOptions = {{}}): WebSocketClientEventFrame<Name, Payload, Event> {{\n\
            return {{ action: \"client_event\", channel, room: options.room, event, payload }};\n\
          }}\n\n\
@@ -1149,7 +1219,7 @@ fn render_websocket_manifest(
 
 #[derive(Debug)]
 struct PlannedRouteHelper<'a> {
-    route: &'a RouteManifestEntry,
+    action: &'a ContractAction,
     name: String,
     file: String,
 }
@@ -1174,6 +1244,10 @@ pub struct TypeScriptExportContext {
     pub realtime_channels: Vec<ContractRealtimeChannel>,
     pub i18n: Option<I18nTypeScriptManifest>,
     pub datatable_ids: Vec<String>,
+    /// Generate the legacy form-oriented route adapter in `routes/`.
+    ///
+    /// The pure SDK remains the default generator surface.
+    pub route_form_adapter: bool,
 }
 
 fn to_pascal_case_identifier_with_context(value: &str, context: &str) -> Result<String> {
@@ -1236,32 +1310,32 @@ fn to_lower_camel_case_identifier(value: &str, context: &str) -> Result<String> 
     Ok(identifier)
 }
 
-fn planned_route_helpers(routes: &[RouteManifestEntry]) -> Result<Vec<PlannedRouteHelper<'_>>> {
+fn planned_route_helpers(actions: &[ContractAction]) -> Result<Vec<PlannedRouteHelper<'_>>> {
     let mut helpers = Vec::new();
     let mut names = BTreeMap::<String, &str>::new();
     let mut files = BTreeMap::<String, &str>::new();
 
-    for route in routes.iter().filter(|route| route.client_export) {
-        let name = to_pascal_case_identifier_with_context(
-            route.id.as_str(),
-            "route endpoint TypeScript export",
-        )?;
-        if let Some(existing) = names.insert(name.clone(), route.id.as_str()) {
+    for action in actions.iter().filter(|action| {
+        action.client_export && matches!(action.transport, ContractTransport::Http(_))
+    }) {
+        let name =
+            to_pascal_case_identifier_with_context(&action.id, "route endpoint TypeScript export")?;
+        if let Some(existing) = names.insert(name.clone(), &action.id) {
             return Err(Error::message(format!(
                 "route endpoint TypeScript export has route ids `{existing}` and `{}` that both normalize to `{name}`",
-                route.id.as_str()
+                action.id
             )));
         }
 
         let file = format!("{ROUTE_HELPER_DIR}/{name}.ts");
-        if let Some(existing) = files.insert(file.clone(), route.id.as_str()) {
+        if let Some(existing) = files.insert(file.clone(), &action.id) {
             return Err(Error::message(format!(
                 "route endpoint TypeScript export has route ids `{existing}` and `{}` that both write `{file}`",
-                route.id.as_str()
+                action.id
             )));
         }
 
-        helpers.push(PlannedRouteHelper { route, name, file });
+        helpers.push(PlannedRouteHelper { action, name, file });
     }
 
     Ok(helpers)
@@ -1468,6 +1542,10 @@ function isEmptyValue(value: unknown): boolean {
   return false;
 }
 
+function hasOwnField(data: Record<string, unknown>, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(data, field);
+}
+
 function stringValue(value: unknown): string {
   if (value === null || value === undefined) {
     return "";
@@ -1541,10 +1619,16 @@ function fallbackMessage(field: string, code: string, params: Readonly<Record<st
   const value = (name: string) => params[name] ?? "";
   switch (code) {
     case "required": return `The ${field} field is required.`;
+    case "required_if": return `The ${field} field is required when ${value("other")} is ${value("values")}.`;
+    case "required_unless": return `The ${field} field is required unless ${value("other")} is ${value("values")}.`;
+    case "required_with": return `The ${field} field is required when ${value("other")} is present.`;
+    case "present": return `The ${field} field must be present.`;
+    case "prohibited": return `The ${field} field is prohibited.`;
     case "email": return `The ${field} must be a valid email address.`;
     case "min": return `The ${field} must be at least ${value("min")} characters.`;
     case "max": return `The ${field} must not exceed ${value("max")} characters.`;
     case "numeric": return `The ${field} must be a number.`;
+    case "boolean": return `The ${field} field must be true or false.`;
     case "integer": return `The ${field} must be an integer.`;
     case "alpha": return `The ${field} must contain only letters.`;
     case "alpha_numeric": return `The ${field} must contain only letters and numbers.`;
@@ -1575,6 +1659,7 @@ function fallbackMessage(field: string, code: string, params: Readonly<Record<st
     case "max_numeric": return `The ${field} must not exceed ${value("max")}.`;
     case "between": return `The ${field} must be between ${value("min")} and ${value("max")}.`;
     case "app_enum": return `The selected ${field} is invalid.`;
+    case "distinct": return `The ${field} field has a duplicate value.`;
     default: return `The ${field} is invalid.`;
   }
 }
@@ -1584,16 +1669,27 @@ function parseComparable(value: unknown): number | null {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
-function isValidByRule(rule: FoundryValidationRule, value: unknown, data: Record<string, unknown>): boolean {
+function isValidByRule(
+  rule: FoundryValidationRule,
+  value: unknown,
+  data: Record<string, unknown>,
+  present: boolean,
+): boolean {
   const params = rule.params ?? {};
   const text = stringValue(value);
 
   switch (rule.code) {
     case "required": return !isEmptyValue(value);
+    case "required_if": return !(rule.values ?? []).includes(stringValue(data[params.other ?? ""])) || !isEmptyValue(value);
+    case "required_unless": return (rule.values ?? []).includes(stringValue(data[params.other ?? ""])) || !isEmptyValue(value);
+    case "required_with": return !(rule.values ?? []).some((other) => !isEmptyValue(data[other])) || !isEmptyValue(value);
+    case "present": return present;
+    case "prohibited": return !present || isEmptyValue(value);
     case "email": return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text);
     case "min": return valueLength(value) >= Number(params.min ?? 0);
     case "max": return valueLength(value) <= Number(params.max ?? 0);
     case "numeric": return finiteNumber(value) !== null;
+    case "boolean": return typeof value === "boolean" || value === 1 || value === 0 || value === "true" || value === "false" || value === "1" || value === "0";
     case "integer": return /^-?\d+$/.test(text.trim());
     case "alpha": return /^[\p{L}]+$/u.test(text);
     case "alpha_numeric": return /^[\p{L}\p{N}]+$/u.test(text);
@@ -1670,6 +1766,11 @@ function isValidByRule(rule: FoundryValidationRule, value: unknown, data: Record
       return parsed !== null && parsed >= Number(params.min ?? 0) && parsed <= Number(params.max ?? 0);
     }
     case "app_enum": return (rule.values ?? []).includes(text);
+    case "distinct": {
+      if (!Array.isArray(value)) return false;
+      const values = value.map(stringValue);
+      return new Set(values).size === values.length;
+    }
     default: return true;
   }
 }
@@ -1786,27 +1887,37 @@ export abstract class FoundryEndpoint<
     rules: readonly FoundryValidationRule[],
     data: Record<string, unknown>,
     errors: FoundryFieldErrors<TRequest>,
+    fieldPresent?: boolean,
   ): void {
-    if (rules.some((rule) => rule.code === "nullable") && isEmptyValue(value)) {
+    const present = fieldPresent ?? hasOwnField(data, field);
+    if (rules.some((rule) => rule.code === "sometimes") && !present) {
       return;
     }
 
+    const nullableEmpty = rules.some((rule) => rule.code === "nullable") && isEmptyValue(value);
     const bail = rules.some((rule) => rule.code === "bail");
     for (const rule of rules) {
-      if (rule.code === "nullable" || rule.code === "bail" || rule.serverOnly) {
+      if (rule.code === "nullable" || rule.code === "sometimes" || rule.code === "bail" || rule.serverOnly) {
+        continue;
+      }
+
+      if (
+        nullableEmpty &&
+        !["required_if", "required_unless", "required_with", "present", "prohibited"].includes(rule.code)
+      ) {
         continue;
       }
 
       if (rule.code === "each") {
         if (Array.isArray(value)) {
           value.forEach((item, index) => {
-            this.validateField(`${field}[${index}]`, item, rule.rules ?? [], data, errors);
+            this.validateField(`${field}[${index}]`, item, rule.rules ?? [], data, errors, true);
           });
         }
         continue;
       }
 
-      if (!isValidByRule(rule, value, data)) {
+      if (!isValidByRule(rule, value, data, present)) {
         this.addValidationError(errors, field, rule);
         if (bail) {
           break;
@@ -1820,7 +1931,11 @@ export abstract class FoundryEndpoint<
     field: string,
     rule: FoundryValidationRule,
   ): void {
-    const params = rule.params ?? {};
+    const params = {
+      ...(rule.params ?? {}),
+      values: (rule.values ?? []).join(", "),
+      other: rule.params?.other ?? (rule.values ?? []).join(", "),
+    };
     const display = this.validation.attributes?.find((entry) => entry.field === field)?.name ?? field;
     const custom = this.validation.messages?.find((entry) => entry.field === field && entry.rule === rule.code)?.message;
     const message = rule.message ?? custom ?? fallbackMessage(display, rule.code, params);
@@ -1933,10 +2048,9 @@ export class FoundrySdkError extends Error {
       const response = data as FoundryErrorResponse;
       return new FoundrySdkError(
         {
+          ...response,
           message: typeof response.message === "string" ? response.message : "Foundry request failed",
           status: response.status ?? transportResponse?.status,
-          code: response.code,
-          errors: response.errors,
         },
         error,
       );
@@ -1984,11 +2098,18 @@ export type FoundrySdkTransport = {
   request<T = unknown>(config: FoundrySdkRequestConfig): Promise<FoundrySdkResponse<T>>;
 };
 
-export type FoundryActionOptions<TParams extends Record<string, RouteParamValue>> = {
+export type FoundryActionOptions<
+  TParams extends Record<string, RouteParamValue>,
+  TQuery extends Record<string, unknown> = Record<never, never>,
+  THeaders extends Record<string, unknown> = Record<never, never>,
+  TCookies extends Record<string, unknown> = Record<never, never>,
+> = {
   params?: TParams;
+  query?: TQuery;
   url?: string;
   route?: RouteUrlOptions;
-  headers?: FoundrySdkHeaders;
+  headers?: THeaders;
+  cookies?: TCookies;
   request?: Omit<FoundrySdkRequestConfig, "url" | "method" | "data">;
 };
 
@@ -2002,16 +2123,24 @@ export type FoundryActionDefinition<TParams extends Record<string, RouteParamVal
   routeName: RouteName;
   method: FoundrySdkHttpMethod | string;
   body: FoundrySdkBodyKind;
+  errors: readonly { readonly code: string; readonly status: number; readonly schema: string | null }[];
 };
 
-export function mergeFoundryActionOptions<TParams extends Record<string, RouteParamValue>>(
+export function mergeFoundryActionOptions<
+  TParams extends Record<string, RouteParamValue>,
+  TQuery extends Record<string, unknown>,
+  THeaders extends Record<string, unknown>,
+  TCookies extends Record<string, unknown>,
+>(
   defaults: FoundryClientOptions | undefined,
-  options: FoundryActionOptions<TParams> = {},
-): FoundryActionOptions<TParams> {
+  options: FoundryActionOptions<TParams, TQuery, THeaders, TCookies> = {},
+): FoundryActionOptions<TParams, TQuery, THeaders, TCookies> {
   return {
     ...options,
+    query: { ...(options.query ?? {}) } as TQuery,
     route: { ...(defaults?.route ?? {}), ...(options.route ?? {}) },
-    headers: { ...(defaults?.headers ?? {}), ...(options.headers ?? {}) },
+    headers: { ...(defaults?.headers ?? {}), ...(options.headers ?? {}) } as THeaders,
+    cookies: { ...(options.cookies ?? {}) } as TCookies,
     request: { ...(defaults?.request ?? {}), ...(options.request ?? {}) },
   };
 }
@@ -2102,18 +2231,39 @@ function actionParams<TRequest>(
   return requestParams;
 }
 
+function serializeParameterRecord(values: Record<string, unknown> | undefined): FoundrySdkHeaders {
+  const serialized: FoundrySdkHeaders = {};
+  for (const [key, value] of Object.entries(values ?? {})) {
+    if (value !== undefined) serialized[key] = String(value);
+  }
+  return serialized;
+}
+
+function serializeCookieParameters(values: Record<string, unknown> | undefined): string | undefined {
+  const entries = Object.entries(values ?? {}).filter(([, value]) => value !== undefined);
+  if (entries.length === 0) return undefined;
+  return entries.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`).join("; ");
+}
+
 export async function sendFoundryAction<
   TRequest,
   TResponse,
   TParams extends Record<string, RouteParamValue>,
+  TQuery extends Record<string, unknown>,
+  THeaders extends Record<string, unknown>,
+  TCookies extends Record<string, unknown>,
 >(
   transport: FoundrySdkTransport,
   definition: FoundryActionDefinition<TParams>,
   data: TRequest | undefined,
-  options: FoundryActionOptions<TParams> = {},
+  options: FoundryActionOptions<TParams, TQuery, THeaders, TCookies> = {},
 ): Promise<TResponse> {
   const url = options.url ?? routeUrlUntyped(definition.routeName, options.params ?? {}, options.route ?? {});
-  const params = actionParams(definition.body, data, options.request?.params as Record<string, unknown> | undefined);
+  const requestParams = { ...(options.query ?? {}), ...((options.request?.params as Record<string, unknown> | undefined) ?? {}) };
+  const params = actionParams(definition.body, data, requestParams);
+  const headers = serializeParameterRecord(options.headers as Record<string, unknown> | undefined);
+  const cookies = serializeCookieParameters(options.cookies as Record<string, unknown> | undefined);
+  if (cookies) headers.Cookie = cookies;
   try {
     const response = await transport.request<TResponse>({
       ...(options.request ?? {}),
@@ -2121,7 +2271,7 @@ export async function sendFoundryAction<
       url,
       params,
       data: actionData(definition.body, data),
-      headers: { ...(options.request?.headers as FoundrySdkHeaders | undefined), ...(options.headers ?? {}) },
+      headers: { ...(options.request?.headers as FoundrySdkHeaders | undefined), ...headers },
     });
     return response.data;
   } catch (error) {
@@ -2258,6 +2408,13 @@ fn render_validation_rule_remark(rule: &TsValidationRule) -> String {
             rule.code,
             rule.params.get("other").map(String::as_str).unwrap_or("")
         ),
+        "required_if" | "required_unless" => format!(
+            "{}({}, {})",
+            rule.code,
+            rule.params.get("other").map(String::as_str).unwrap_or(""),
+            rule.values.join(", ")
+        ),
+        "required_with" => format!("required_with({})", rule.values.join(", ")),
         "regex" => format!(
             "regex({})",
             rule.params.get("pattern").map(String::as_str).unwrap_or("")
@@ -2750,36 +2907,6 @@ fn response_type_reference(
     }
 }
 
-fn route_response_type(
-    route: &RouteManifestEntry,
-    schema_exports: &BTreeMap<String, serde_json::Value>,
-    exported_types: &BTreeMap<String, String>,
-    imports: &mut BTreeSet<String>,
-) -> String {
-    let mut responses = route
-        .responses
-        .iter()
-        .filter(|response| (200..300).contains(&response.status))
-        .map(|response| {
-            response_type_reference(
-                response.schema,
-                &response.schema_json,
-                schema_exports,
-                exported_types,
-                imports,
-            )
-        })
-        .collect::<Vec<_>>();
-    responses.sort();
-    responses.dedup();
-
-    match responses.as_slice() {
-        [] => "unknown".to_string(),
-        [one] => one.clone(),
-        many => many.join(" | "),
-    }
-}
-
 fn action_response_type(
     action: &ContractAction,
     schema_exports: &BTreeMap<String, serde_json::Value>,
@@ -2791,9 +2918,12 @@ fn action_response_type(
         .iter()
         .filter(|response| (200..300).contains(&response.status))
         .map(|response| {
+            let schema_json = schema_exports
+                .get(&response.schema)
+                .unwrap_or(&response.schema_json);
             response_type_reference(
                 &response.schema,
-                &response.schema_json,
+                schema_json,
                 schema_exports,
                 exported_types,
                 imports,
@@ -2810,15 +2940,31 @@ fn action_response_type(
     }
 }
 
-fn render_route_params_type(route: &RouteManifestEntry) -> String {
-    if route.params.is_empty() {
+fn render_route_params_type(
+    action: &ContractAction,
+    schema_exports: &BTreeMap<String, serde_json::Value>,
+) -> String {
+    let path_params = action
+        .parameters
+        .iter()
+        .filter(|parameter| parameter.location == ContractParameterLocation::Path)
+        .collect::<Vec<_>>();
+    if path_params.is_empty() {
         return "Record<never, never>".to_string();
     }
 
-    let fields = route
-        .params
+    let fields = path_params
         .iter()
-        .map(|param| format!("{}: RouteParamValue", json_string(param)))
+        .map(|parameter| {
+            format!(
+                "{}: {}",
+                json_string(&parameter.name),
+                schema_exports
+                    .get(&parameter.schema)
+                    .map(route_parameter_ts_type)
+                    .unwrap_or("RouteParamValue")
+            )
+        })
         .collect::<Vec<_>>();
     format!("{{ {} }}", fields.join("; "))
 }
@@ -2859,21 +3005,87 @@ fn action_method(action: &ContractAction) -> &str {
     }
 }
 
-fn action_params_type(action: &ContractAction) -> String {
-    match &action.transport {
-        ContractTransport::Http(http) if http.path_params.is_empty() => {
-            "Record<never, never>".to_string()
-        }
-        ContractTransport::Http(http) => {
-            let fields = http
-                .path_params
-                .iter()
-                .map(|param| format!("{}: RouteParamValue", json_string(param)))
-                .collect::<Vec<_>>();
-            format!("{{ {} }}", fields.join("; "))
-        }
-        ContractTransport::WebSocket(_) => "Record<never, never>".to_string(),
+fn action_parameter_group_type(
+    action: &ContractAction,
+    location: ContractParameterLocation,
+    schema_exports: &BTreeMap<String, serde_json::Value>,
+    exported_types: &BTreeMap<String, String>,
+    imports: &mut BTreeSet<String>,
+) -> String {
+    if !matches!(action.transport, ContractTransport::Http(_)) {
+        return "Record<never, never>".to_string();
     }
+    let parameters = action
+        .parameters
+        .iter()
+        .filter(|parameter| parameter.location == location)
+        .collect::<Vec<_>>();
+    if parameters.is_empty() {
+        return "Record<never, never>".to_string();
+    }
+    let fields = parameters
+        .iter()
+        .map(|parameter| {
+            let parameter_type = schema_exports
+                .get(&parameter.schema)
+                .map(|schema| {
+                    response_type_reference(
+                        &parameter.schema,
+                        schema,
+                        schema_exports,
+                        exported_types,
+                        imports,
+                    )
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let optional = if parameter.required { "" } else { "?" };
+            format!(
+                "{}{optional}: {parameter_type}",
+                json_string(&parameter.name)
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("{{ {} }}", fields.join("; "))
+}
+
+fn action_has_required_parameters(
+    action: &ContractAction,
+    location: ContractParameterLocation,
+) -> bool {
+    action
+        .parameters
+        .iter()
+        .any(|parameter| parameter.location == location && parameter.required)
+}
+
+fn action_error_type(
+    action: &ContractAction,
+    schema_exports: &BTreeMap<String, serde_json::Value>,
+    exported_types: &BTreeMap<String, String>,
+    imports: &mut BTreeSet<String>,
+) -> String {
+    let mut errors = action
+        .errors
+        .iter()
+        .filter_map(|error| error.schema.as_ref())
+        .filter_map(|schema| {
+            schema_exports.get(schema).map(|schema_json| {
+                response_type_reference(
+                    schema,
+                    schema_json,
+                    schema_exports,
+                    exported_types,
+                    imports,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if action.errors.iter().any(|error| error.schema.is_none()) || errors.is_empty() {
+        errors.push("FoundryErrorResponse".to_string());
+    }
+    errors.sort();
+    errors.dedup();
+    errors.join(" | ")
 }
 
 fn sdk_body_kind_literal(kind: ContractHttpBody) -> &'static str {
@@ -2891,7 +3103,13 @@ fn render_route_helper(
     exported_types: &BTreeMap<String, String>,
     validations: &BTreeMap<&'static str, TsValidationSchema>,
 ) -> Result<String> {
-    let route = helper.route;
+    let action = helper.action;
+    let ContractTransport::Http(http) = &action.transport else {
+        return Err(Error::message(format!(
+            "route form adapter `{}` requires an HTTP contract action",
+            action.id
+        )));
+    };
     let name = &helper.name;
     let endpoint_name = route_type_name(name, "Endpoint");
     let request_alias = route_type_name(name, "Request");
@@ -2903,13 +3121,16 @@ fn render_route_helper(
 
     let mut imports = BTreeSet::new();
     let request_type = schema_type_reference(
-        route.request,
+        action
+            .request
+            .as_ref()
+            .map(|request| request.schema.as_str()),
         exported_types,
         &mut imports,
         "Record<string, never>",
     );
-    let response_type = route_response_type(route, schema_exports, exported_types, &mut imports);
-    let params_type = render_route_params_type(route);
+    let response_type = action_response_type(action, schema_exports, exported_types, &mut imports);
+    let params_type = render_route_params_type(action, schema_exports);
 
     let import_lines = imports
         .iter()
@@ -2923,12 +3144,18 @@ fn render_route_helper(
         .collect::<Result<Vec<_>>>()?;
 
     let validation = render_validation_schema(
-        route.request.and_then(|request| validations.get(request)),
+        action
+            .request
+            .as_ref()
+            .and_then(|request| validations.get(request.schema.as_str())),
         &request_alias,
     );
-    let method = option_string_literal(route.method.as_deref());
-    let has_params = !route.params.is_empty();
-    let has_request = route.request.is_some();
+    let method = option_string_literal(http.method.as_deref());
+    let has_params = action
+        .parameters
+        .iter()
+        .any(|parameter| parameter.location == ContractParameterLocation::Path);
+    let has_request = action.request.is_some();
     let factory = match (has_params, has_request) {
         (true, true) => format!(
             "export function {name}(client: FoundryHttpClient, params: {params_alias}, data: {request_alias}): {endpoint_name} {{\n\
@@ -2971,9 +3198,9 @@ fn render_route_helper(
          }}\n\n\
          {factory}",
         import_lines.join("\n"),
-        json_string(&route.path),
+        json_string(&http.path),
         method,
-        json_string(route.id.as_str()),
+        json_string(&action.id),
         factory = factory,
     ))
 }
@@ -2988,6 +3215,12 @@ fn render_sdk_action(
     let request_alias = route_type_name(name, "SdkRequest");
     let response_alias = route_type_name(name, "SdkResponse");
     let params_alias = route_type_name(name, "SdkParams");
+    let query_alias = route_type_name(name, "SdkQuery");
+    let headers_alias = route_type_name(name, "SdkHeaders");
+    let cookies_alias = route_type_name(name, "SdkCookies");
+    let options_alias = route_type_name(name, "SdkOptions");
+    let error_response_alias = route_type_name(name, "SdkErrorResponse");
+    let error_alias = route_type_name(name, "SdkError");
     let definition_const = route_type_name(name, "ActionDefinition");
     let factory_name = format!("create{name}Action");
 
@@ -3004,7 +3237,36 @@ fn render_sdk_action(
     );
     let response_type =
         action_response_type(action.action, schema_exports, exported_types, &mut imports);
-    let params_type = action_params_type(action.action);
+    let params_type = action_parameter_group_type(
+        action.action,
+        ContractParameterLocation::Path,
+        schema_exports,
+        exported_types,
+        &mut imports,
+    );
+    let query_type = action_parameter_group_type(
+        action.action,
+        ContractParameterLocation::Query,
+        schema_exports,
+        exported_types,
+        &mut imports,
+    );
+    let headers_type = action_parameter_group_type(
+        action.action,
+        ContractParameterLocation::Header,
+        schema_exports,
+        exported_types,
+        &mut imports,
+    );
+    let cookies_type = action_parameter_group_type(
+        action.action,
+        ContractParameterLocation::Cookie,
+        schema_exports,
+        exported_types,
+        &mut imports,
+    );
+    let error_response_type =
+        action_error_type(action.action, schema_exports, exported_types, &mut imports);
     let import_lines = imports
         .iter()
         .filter_map(|import| {
@@ -3019,40 +3281,86 @@ fn render_sdk_action(
     let body = sdk_body_kind_literal(action_body_kind(action.action));
     let method = action_method(action.action);
     let route_id = &action.action.id;
+    let error_definitions = action
+        .action
+        .errors
+        .iter()
+        .map(|error| {
+            format!(
+                "{{ code: {}, status: {}, schema: {} }}",
+                json_string(&error.code),
+                error.status,
+                option_string_literal(error.schema.as_deref())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let accepts_request_payload = action_accepts_request_payload(action.action);
+    let options_are_required = [
+        ContractParameterLocation::Path,
+        ContractParameterLocation::Query,
+        ContractParameterLocation::Header,
+        ContractParameterLocation::Cookie,
+    ]
+    .into_iter()
+    .any(|location| action_has_required_parameters(action.action, location));
 
-    let action_signature = if accepts_request_payload {
-        format!(
-            "(request: {request_alias}, options?: FoundryActionOptions<{params_alias}>) => Promise<{response_alias}>"
-        )
+    let options_type = format!(
+        "FoundryActionOptions<{params_alias}, {query_alias}, {headers_alias}, {cookies_alias}> & {{ params{}: {params_alias}; query{}: {query_alias}; headers{}: {headers_alias}; cookies{}: {cookies_alias} }}",
+        if action_has_required_parameters(action.action, ContractParameterLocation::Path) { "" } else { "?" },
+        if action_has_required_parameters(action.action, ContractParameterLocation::Query) { "" } else { "?" },
+        if action_has_required_parameters(action.action, ContractParameterLocation::Header) { "" } else { "?" },
+        if action_has_required_parameters(action.action, ContractParameterLocation::Cookie) { "" } else { "?" },
+    );
+    let options_parameter = if options_are_required {
+        format!("options: {options_alias}")
     } else {
-        format!("(options?: FoundryActionOptions<{params_alias}>) => Promise<{response_alias}>")
+        format!("options?: {options_alias}")
     };
 
+    let action_signature = if accepts_request_payload {
+        format!("(request: {request_alias}, {options_parameter}) => Promise<{response_alias}>")
+    } else {
+        format!("({options_parameter}) => Promise<{response_alias}>")
+    };
+
+    let options_binding = if options_are_required {
+        "options"
+    } else {
+        "options = {}"
+    };
     let action_body = if accepts_request_payload {
         format!(
-            "  return (request, options = {{}}) => sendFoundryAction<{request_alias}, {response_alias}, {params_alias}>(transport, {definition_const}, request, mergeFoundryActionOptions(defaults, options));\n"
+            "  return (request, {options_binding}) => sendFoundryAction<{request_alias}, {response_alias}, {params_alias}, {query_alias}, {headers_alias}, {cookies_alias}>(transport, {definition_const}, request, mergeFoundryActionOptions(defaults, options));\n"
         )
     } else {
         format!(
-            "  return (options = {{}}) => sendFoundryAction<{request_alias}, {response_alias}, {params_alias}>(transport, {definition_const}, undefined, mergeFoundryActionOptions(defaults, options));\n"
+            "  return ({options_binding}) => sendFoundryAction<{request_alias}, {response_alias}, {params_alias}, {query_alias}, {headers_alias}, {cookies_alias}>(transport, {definition_const}, undefined, mergeFoundryActionOptions(defaults, options));\n"
         )
     };
 
     Ok(format!(
         "{TYPE_FILE_HEADER}\n\n\
+         import type {{ FoundryErrorResponse, FoundrySdkError }} from \"../FoundryErrors\";\n\
          import {{ mergeFoundryActionOptions, sendFoundryAction, type FoundryActionDefinition, type FoundryActionOptions, type FoundryClientOptions, type FoundrySdkTransport }} from \"../FoundrySdk\";\n\
          import type {{ RouteName, RouteParamValue }} from \"../RouteManifest\";\n\
          {}\n\
          export type {request_alias} = {request_type};\n\
          export type {response_alias} = {response_type};\n\
          export type {params_alias} = {params_type};\n\
+         export type {query_alias} = {query_type};\n\
+         export type {headers_alias} = {headers_type};\n\
+         export type {cookies_alias} = {cookies_type};\n\
+         export type {options_alias} = {options_type};\n\
+         export type {error_response_alias} = {error_response_type};\n\
+         export type {error_alias} = FoundrySdkError & {{ readonly response: {error_response_alias} }};\n\
          export type {action_name} = {action_signature};\n\n\
          export const {definition_const} = {{\n\
            routeName: {} as RouteName,\n\
            method: {},\n\
            body: {},\n\
+           errors: [{error_definitions}],\n\
          }} as const satisfies FoundryActionDefinition<{params_alias}>;\n\n\
          export function {factory_name}(transport: FoundrySdkTransport, defaults?: FoundryClientOptions): {action_name} {{\n\
          {action_body}\
@@ -3134,7 +3442,11 @@ pub fn export_all_with_context(
         .iter()
         .map(|schema| (schema.name.clone(), schema.schema.clone()))
         .collect::<BTreeMap<_, _>>();
-    let route_helpers = planned_route_helpers(routes)?;
+    let route_helpers = if context.route_form_adapter {
+        planned_route_helpers(&contract.actions)?
+    } else {
+        Vec::new()
+    };
     let sdk_actions = planned_sdk_actions(&contract)?;
     let output_files =
         planned_output_files(&ts_type_files, &app_enums, &route_helpers, &sdk_actions)?;
@@ -3187,7 +3499,7 @@ pub fn export_all_with_context(
     write_generated_file(
         dir,
         Path::new("RouteManifest.ts"),
-        render_route_manifest(routes)?,
+        render_route_manifest(&contract.actions, &schema_exports)?,
     )?;
     write_generated_file(
         dir,
@@ -3358,7 +3670,7 @@ fn planned_output_files(
         register_planned_output(
             &mut outputs,
             &helper.file,
-            format!("route endpoint `{}`", helper.route.id),
+            format!("route endpoint `{}`", helper.action.id),
         )?;
     }
     for action in sdk_actions {
@@ -3485,6 +3797,12 @@ pub fn builtin_cli_registrar(
                         .long("output")
                         .short('o')
                         .help("Output directory (overrides config)"),
+                )
+                .arg(
+                    clap::Arg::new("route-form-adapter")
+                        .long("route-form-adapter")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Generate optional form-oriented route adapters"),
                 ),
             move |invocation| {
                 let route_manifest = route_manifest.clone();
@@ -3545,6 +3863,7 @@ pub fn builtin_cli_registrar(
                                 locales,
                             }),
                             datatable_ids,
+                            route_form_adapter: invocation.matches().get_flag("route-form-adapter"),
                         },
                     )
                 }
@@ -3564,19 +3883,25 @@ mod tests {
 
     use crate::app_enum::{EnumKey, EnumKeyKind, EnumMeta, EnumOption};
     use crate::contract::{
-        ContractAuth, ContractPayload, ContractRealtimeChannel, ContractRealtimeEvent,
+        ContractAction, ContractAuth, ContractManifest, ContractPayload, ContractRealtimeChannel,
+        ContractRealtimeEvent,
     };
-    use crate::http::{RouteManifestEntry, RouteManifestResponse};
+    use crate::http::{
+        RouteManifestEntry, RouteManifestError, RouteManifestParameter, RouteManifestResponse,
+    };
     use crate::openapi::ApiSchema;
     use crate::support::{Collection, GuardId, PermissionId, RouteId};
 
     use super::contract_manifest;
     use super::export_all;
+    use super::export_all_with_context;
     use super::export_all_with_routes;
     use super::planned_output_files;
+    use super::planned_route_helpers;
     use super::planned_sdk_actions;
     use super::planned_ts_type_files;
     use super::render_app_enum;
+    use super::render_route_helper;
     use super::render_route_manifest;
     use super::render_websocket_manifest;
     use super::PlannedRouteHelper;
@@ -3585,7 +3910,7 @@ mod tests {
     use super::SDK_RUNTIME_FILE;
     use super::TYPES_EXPORT_MANIFEST;
     use super::TYPE_FILE_HEADER;
-    use super::{TsAppEnum, TsType};
+    use super::{TsAppEnum, TsType, TypeScriptExportContext};
 
     #[derive(Clone, Debug, PartialEq, Eq, crate::AppEnum)]
     enum MinimalExportStatus {
@@ -3610,7 +3935,7 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    #[derive(Clone, Debug, serde::Serialize, ts_rs::TS, crate::ApiSchema)]
+    #[derive(Clone, Debug, serde::Serialize, ts_rs::TS, crate::TS, crate::ApiSchema)]
     struct MinimalExportAppEnumDto {
         status: MinimalExportStatus,
         priority: Option<MinimalExportPriority>,
@@ -3625,7 +3950,9 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    #[derive(Clone, Debug, serde::Serialize, ts_rs::TS, crate::ApiSchema, crate::Validate)]
+    #[derive(
+        Clone, Debug, serde::Serialize, ts_rs::TS, crate::TS, crate::ApiSchema, crate::Validate,
+    )]
     struct MinimalLoginRequest {
         #[validate(required, email)]
         email: String,
@@ -3636,9 +3963,15 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    #[derive(Clone, Debug, serde::Serialize, ts_rs::TS, crate::ApiSchema)]
+    #[derive(Clone, Debug, serde::Serialize, ts_rs::TS, crate::TS, crate::ApiSchema)]
     struct MinimalLoginResponse {
         token: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Clone, Debug, serde::Serialize, ts_rs::TS, crate::TS, crate::ApiSchema)]
+    struct MinimalLoginError {
+        reason: String,
     }
 
     fn string_meta(values: &[&str]) -> EnumMeta {
@@ -3660,21 +3993,44 @@ mod tests {
     fn route_manifest_entry(id: &'static str, path: &str, params: &[&str]) -> RouteManifestEntry {
         RouteManifestEntry {
             id: RouteId::new(id),
+            action_name: Some(test_action_name(id)),
             path: path.to_string(),
             method: Some("get".to_string()),
-            params: params.iter().map(|param| (*param).to_string()).collect(),
+            parameters: params
+                .iter()
+                .map(|param| RouteManifestParameter {
+                    name: (*param).to_string(),
+                    location: crate::contract::ContractParameterLocation::Path,
+                    schema: "String",
+                    required: true,
+                    schema_json: serde_json::json!({"type": "string"}),
+                })
+                .collect(),
             client_export: true,
             guard: Some(GuardId::new("admin")),
             permissions: vec![PermissionId::new("users.read")],
             summary: Some("Show user".to_string()),
             request: Some("ShowUserRequest"),
+            request_content_type: None,
             request_schema_json: Some(serde_json::json!({"type": "object"})),
             responses: vec![RouteManifestResponse {
                 status: 200,
                 schema: "ShowUserResponse",
                 schema_json: serde_json::json!({"type": "object"}),
             }],
+            errors: Vec::new(),
         }
+    }
+
+    fn test_action_name(id: &str) -> String {
+        id.split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut characters = part.chars();
+                let first = characters.next().unwrap().to_ascii_uppercase();
+                format!("{first}{}", characters.as_str())
+            })
+            .collect()
     }
 
     #[test]
@@ -3685,6 +4041,9 @@ mod tests {
             replay_count: 0,
             allow_client_events: true,
             auth: ContractAuth::default(),
+            message_payload: Some(ContractPayload {
+                schema: "ChatMessagePayload".to_string(),
+            }),
             incoming: vec![
                 ContractRealtimeEvent {
                     event: "typing".to_string(),
@@ -3705,8 +4064,16 @@ mod tests {
             }],
         };
 
-        let rendered = render_websocket_manifest(&[channel], &BTreeMap::new()).unwrap();
+        let exported_types = BTreeMap::from([(
+            "ChatMessagePayload".to_string(),
+            "ChatMessagePayload.ts".to_string(),
+        )]);
+        let rendered = render_websocket_manifest(&[channel], &exported_types).unwrap();
 
+        assert!(rendered.contains("messagePayload: \"ChatMessagePayload\""));
+        assert!(rendered.contains("readonly \"chat\": ChatMessagePayload;"));
+        assert!(rendered.contains("TypedWebSocketMessageFrame"));
+        assert!(rendered.contains("typedMessageToChannel"));
         assert!(rendered.contains("clientPayloadEvents: [\"typing\"]"));
         assert!(rendered.contains("serverPayloadEvents: [\"message\"]"));
         assert!(rendered.contains("WebSocketChannelManifest[channel].serverPayloadEvents"));
@@ -3718,19 +4085,49 @@ mod tests {
     fn login_route_manifest_entry(client_export: bool) -> RouteManifestEntry {
         RouteManifestEntry {
             id: RouteId::new("user.portal.login"),
+            action_name: Some("AuthenticateUser".to_string()),
             path: "/api/v1/user-portal/login".to_string(),
             method: Some("post".to_string()),
-            params: Vec::new(),
+            parameters: vec![
+                RouteManifestParameter {
+                    name: "remember".to_string(),
+                    location: crate::contract::ContractParameterLocation::Query,
+                    schema: "bool",
+                    required: false,
+                    schema_json: bool::schema(),
+                },
+                RouteManifestParameter {
+                    name: "x-device-id".to_string(),
+                    location: crate::contract::ContractParameterLocation::Header,
+                    schema: "String",
+                    required: true,
+                    schema_json: String::schema(),
+                },
+                RouteManifestParameter {
+                    name: "locale".to_string(),
+                    location: crate::contract::ContractParameterLocation::Cookie,
+                    schema: "String",
+                    required: false,
+                    schema_json: String::schema(),
+                },
+            ],
             client_export,
             guard: None,
             permissions: Vec::new(),
             summary: Some("Login".to_string()),
             request: Some("MinimalLoginRequest"),
+            request_content_type: None,
             request_schema_json: Some(MinimalLoginRequest::schema()),
             responses: vec![RouteManifestResponse {
                 status: 200,
                 schema: "MinimalLoginResponse",
                 schema_json: MinimalLoginResponse::schema(),
+            }],
+            errors: vec![RouteManifestError {
+                code: "invalid_credentials".to_string(),
+                status: 401,
+                schema: Some("MinimalLoginError"),
+                schema_json: Some(MinimalLoginError::schema()),
             }],
         }
     }
@@ -3740,6 +4137,32 @@ mod tests {
             .as_array()
             .and_then(|schemas| schemas.iter().find(|schema| schema["name"] == name))
             .unwrap_or_else(|| panic!("expected contract schema `{name}` in manifest:\n{manifest}"))
+    }
+
+    fn route_contract(routes: &[RouteManifestEntry]) -> ContractManifest {
+        contract_manifest(routes, &BTreeMap::new(), Vec::new()).unwrap()
+    }
+
+    fn export_all_with_form_adapter(
+        dir: &Path,
+        routes: &[RouteManifestEntry],
+    ) -> crate::foundation::Result<()> {
+        export_all_with_context(
+            dir,
+            routes,
+            TypeScriptExportContext {
+                route_form_adapter: true,
+                ..TypeScriptExportContext::default()
+            },
+        )
+    }
+
+    fn contract_schema_exports(manifest: &ContractManifest) -> BTreeMap<String, serde_json::Value> {
+        manifest
+            .schemas
+            .iter()
+            .map(|schema| (schema.name.clone(), schema.schema.clone()))
+            .collect()
     }
 
     #[test]
@@ -3845,8 +4268,9 @@ mod tests {
     #[test]
     fn output_planning_rejects_registered_type_route_helper_collision() {
         let route = route_manifest_entry("admin.users.show", "/api/v1/admin/users/{id}", &["id"]);
+        let manifest = route_contract(&[route]);
         let helper = PlannedRouteHelper {
-            route: &route,
+            action: &manifest.actions[0],
             name: "AdminUsersShow".to_string(),
             file: "routes/AdminUsersShow.ts".to_string(),
         };
@@ -3871,7 +4295,7 @@ mod tests {
         let route = login_route_manifest_entry(true);
         let manifest = contract_manifest(&[route], &BTreeMap::new(), Vec::new()).unwrap();
         let actions = planned_sdk_actions(&manifest).unwrap();
-        let types = BTreeMap::from([("CustomSdkAction", "sdk/UserPortalLogin.ts".to_string())]);
+        let types = BTreeMap::from([("CustomSdkAction", "sdk/AuthenticateUser.ts".to_string())]);
 
         let error = planned_output_files(&types, &[], &[], &actions)
             .expect_err("registered types must not overwrite SDK actions");
@@ -3882,7 +4306,7 @@ mod tests {
         assert!(error.to_string().contains("SDK action `user.portal.login`"));
         assert!(error
             .to_string()
-            .contains("both write `sdk/UserPortalLogin.ts`"));
+            .contains("both write `sdk/AuthenticateUser.ts`"));
     }
 
     #[test]
@@ -4196,7 +4620,7 @@ mod tests {
             fs::read_to_string(dir.path().join("FoundryContractManifest.json")).unwrap();
         let contract_json: serde_json::Value = serde_json::from_str(&contract_manifest).unwrap();
         assert!(
-            contract_manifest.contains("\"version\": 1"),
+            contract_manifest.contains("\"version\": 2"),
             "expected contract manifest version:\n{contract_manifest}"
         );
         let login_schema = contract_schema(&contract_json, "MinimalLoginRequest");
@@ -4308,7 +4732,7 @@ mod tests {
         let outside = tempdir().unwrap();
         symlink(outside.path(), dir.path().join(ROUTE_HELPER_DIR)).unwrap();
 
-        let error = export_all_with_routes(
+        let error = export_all_with_form_adapter(
             dir.path(),
             &[route_manifest_entry(
                 "admin.users.show",
@@ -4341,7 +4765,7 @@ mod tests {
     #[test]
     fn exports_route_manifest_file_and_barrel_helpers() {
         let dir = tempdir().unwrap();
-        export_all_with_routes(
+        export_all_with_form_adapter(
             dir.path(),
             &[route_manifest_entry(
                 "admin.users.show",
@@ -4402,13 +4826,13 @@ mod tests {
         );
         assert!(
             sdk_action.contains(
-                "export type AdminUsersShowAction = (request: AdminUsersShowSdkRequest, options?: FoundryActionOptions<AdminUsersShowSdkParams>) => Promise<AdminUsersShowSdkResponse>"
+                "export type AdminUsersShowAction = (request: AdminUsersShowSdkRequest, options: AdminUsersShowSdkOptions) => Promise<AdminUsersShowSdkResponse>"
             ),
             "expected GET SDK action with a request schema to accept query payload:\n{sdk_action}"
         );
         assert!(
             sdk_action.contains(
-                "sendFoundryAction<AdminUsersShowSdkRequest, AdminUsersShowSdkResponse, AdminUsersShowSdkParams>(transport, AdminUsersShowActionDefinition, request, mergeFoundryActionOptions(defaults, options))"
+                "sendFoundryAction<AdminUsersShowSdkRequest, AdminUsersShowSdkResponse, AdminUsersShowSdkParams, AdminUsersShowSdkQuery, AdminUsersShowSdkHeaders, AdminUsersShowSdkCookies>(transport, AdminUsersShowActionDefinition, request, mergeFoundryActionOptions(defaults, options))"
             ),
             "expected GET SDK action to pass query payload to runtime:\n{sdk_action}"
         );
@@ -4417,7 +4841,7 @@ mod tests {
     #[test]
     fn exports_route_endpoint_helper_with_validation_metadata() {
         let dir = tempdir().unwrap();
-        export_all_with_routes(dir.path(), &[login_route_manifest_entry(true)]).unwrap();
+        export_all_with_form_adapter(dir.path(), &[login_route_manifest_entry(true)]).unwrap();
 
         let runtime = fs::read_to_string(dir.path().join("FoundryEndpoint.ts")).unwrap();
         assert!(
@@ -4431,6 +4855,24 @@ mod tests {
         assert!(
             runtime.contains("validateForm"),
             "expected endpoint runtime validation helper:\n{runtime}"
+        );
+        for rule in [
+            "required_if",
+            "required_unless",
+            "required_with",
+            "present",
+            "prohibited",
+            "boolean",
+            "distinct",
+        ] {
+            assert!(
+                runtime.contains(&format!("case \"{rule}\"")),
+                "expected {rule} client validation support:\n{runtime}"
+            );
+        }
+        assert!(
+            runtime.contains("rule.code === \"sometimes\""),
+            "expected sometimes presence gating in client validation:\n{runtime}"
         );
         assert!(
             runtime.contains(
@@ -4507,30 +4949,65 @@ mod tests {
             "expected route helper barrel export:\n{index}"
         );
         assert!(
-            index.contains("export * from \"./sdk/UserPortalLogin\";"),
+            index.contains("export * from \"./sdk/AuthenticateUser\";"),
             "expected SDK action barrel export:\n{index}"
         );
 
-        let sdk_action = fs::read_to_string(dir.path().join("sdk/UserPortalLogin.ts")).unwrap();
+        let sdk_action = fs::read_to_string(dir.path().join("sdk/AuthenticateUser.ts")).unwrap();
         assert!(
-            sdk_action.contains("export type UserPortalLoginAction ="),
+            sdk_action.contains("export type AuthenticateUserAction ="),
             "expected SDK action type:\n{sdk_action}"
         );
         assert!(
-            sdk_action.contains("export function createUserPortalLoginAction"),
+            sdk_action.contains("export function createAuthenticateUserAction"),
             "expected SDK action factory:\n{sdk_action}"
         );
         assert!(
             sdk_action.contains(
-                "sendFoundryAction<UserPortalLoginSdkRequest, UserPortalLoginSdkResponse"
+                "sendFoundryAction<AuthenticateUserSdkRequest, AuthenticateUserSdkResponse"
             ),
             "expected SDK action transport call:\n{sdk_action}"
+        );
+        assert!(
+            sdk_action
+                .contains("export type AuthenticateUserSdkQuery = { \"remember\"?: boolean }"),
+            "expected typed query parameters:\n{sdk_action}"
+        );
+        assert!(
+            sdk_action
+                .contains("export type AuthenticateUserSdkHeaders = { \"x-device-id\": string }"),
+            "expected typed header parameters:\n{sdk_action}"
+        );
+        assert!(
+            sdk_action.contains("export type AuthenticateUserSdkCookies = { \"locale\"?: string }"),
+            "expected typed cookie parameters:\n{sdk_action}"
+        );
+        assert!(
+            sdk_action.contains("export type AuthenticateUserSdkErrorResponse = MinimalLoginError"),
+            "expected action-specific error response:\n{sdk_action}"
+        );
+        assert!(
+            sdk_action.contains(
+                "{ code: \"invalid_credentials\", status: 401, schema: \"MinimalLoginError\" }"
+            ),
+            "expected action error metadata:\n{sdk_action}"
+        );
+
+        let sdk_runtime = fs::read_to_string(dir.path().join("FoundrySdk.ts")).unwrap();
+        assert!(sdk_runtime.contains("query?: TQuery;"));
+        assert!(sdk_runtime.contains("headers?: THeaders;"));
+        assert!(sdk_runtime.contains("cookies?: TCookies;"));
+        assert!(sdk_runtime.contains("if (cookies) headers.Cookie = cookies;"));
+        let error_runtime = fs::read_to_string(dir.path().join("FoundryErrors.ts")).unwrap();
+        assert!(
+            error_runtime.contains("...response,"),
+            "expected SDK errors to retain action-specific response fields:\n{error_runtime}"
         );
 
         let sdk_client = fs::read_to_string(dir.path().join("FoundryClient.ts")).unwrap();
         assert!(
             sdk_client
-                .contains("userPortalLogin: createUserPortalLoginAction(transport, defaults)"),
+                .contains("authenticateUser: createAuthenticateUserAction(transport, defaults)"),
             "expected SDK client business action:\n{sdk_client}"
         );
 
@@ -4538,8 +5015,25 @@ mod tests {
             fs::read_to_string(dir.path().join("FoundryContractManifest.json")).unwrap();
         let contract_json: serde_json::Value = serde_json::from_str(&contract_manifest).unwrap();
         assert!(
-            contract_manifest.contains("\"action_name\": \"UserPortalLogin\""),
+            contract_manifest.contains("\"action_name\": \"AuthenticateUser\""),
             "expected contract action name:\n{contract_manifest}"
+        );
+        assert_eq!(contract_json["actions"][0]["id"], "user.portal.login");
+        assert_eq!(
+            contract_json["actions"][0]["parameters"][0]["location"],
+            "query"
+        );
+        assert_eq!(
+            contract_json["actions"][0]["parameters"][1]["location"],
+            "header"
+        );
+        assert_eq!(
+            contract_json["actions"][0]["parameters"][1]["required"],
+            true
+        );
+        assert_eq!(
+            contract_json["actions"][0]["errors"][0]["code"],
+            "invalid_credentials"
         );
         assert_eq!(
             contract_schema(&contract_json, "MinimalLoginResponse")["schema"]["properties"]
@@ -4566,7 +5060,9 @@ mod tests {
             "expected generated manifest to track route helper files: {manifest:?}"
         );
         assert!(
-            manifest.iter().any(|file| file == "sdk/UserPortalLogin.ts"),
+            manifest
+                .iter()
+                .any(|file| file == "sdk/AuthenticateUser.ts"),
             "expected generated manifest to track SDK action files: {manifest:?}"
         );
     }
@@ -4574,14 +5070,14 @@ mod tests {
     #[test]
     fn route_endpoint_helper_export_can_be_disabled_per_route() {
         let dir = tempdir().unwrap();
-        export_all_with_routes(dir.path(), &[login_route_manifest_entry(false)]).unwrap();
+        export_all_with_form_adapter(dir.path(), &[login_route_manifest_entry(false)]).unwrap();
 
         assert!(
             !dir.path().join("routes/UserPortalLogin.ts").exists(),
             "did not expect opt-out route helper to be written"
         );
         assert!(
-            !dir.path().join("sdk/UserPortalLogin.ts").exists(),
+            !dir.path().join("sdk/AuthenticateUser.ts").exists(),
             "did not expect opt-out SDK action to be written"
         );
 
@@ -4597,9 +5093,42 @@ mod tests {
             "did not expect opt-out route helper in barrel:\n{index}"
         );
         assert!(
-            !index.contains("sdk/UserPortalLogin"),
+            !index.contains("sdk/AuthenticateUser"),
             "did not expect opt-out SDK action in barrel:\n{index}"
         );
+    }
+
+    #[test]
+    fn route_form_adapter_is_opt_in_while_contract_sdk_remains_default() {
+        let dir = tempdir().unwrap();
+        export_all_with_routes(dir.path(), &[login_route_manifest_entry(true)]).unwrap();
+
+        assert!(!dir.path().join("routes/UserPortalLogin.ts").exists());
+        assert!(dir.path().join("sdk/AuthenticateUser.ts").exists());
+        assert!(dir.path().join("RouteManifest.ts").exists());
+
+        let index = fs::read_to_string(dir.path().join("index.ts")).unwrap();
+        assert!(!index.contains("routes/UserPortalLogin"));
+        assert!(index.contains("sdk/AuthenticateUser"));
+    }
+
+    #[test]
+    fn route_generators_accept_a_serialized_contract_as_their_only_boundary() {
+        let route = route_manifest_entry("admin.users.show", "/api/v1/admin/users/{id}", &["id"]);
+        let frozen = route_contract(&[route]);
+        let manifest: ContractManifest =
+            serde_json::from_value(serde_json::to_value(frozen).unwrap()).unwrap();
+        let schemas = contract_schema_exports(&manifest);
+
+        let route_manifest = render_route_manifest(&manifest.actions, &schemas).unwrap();
+        let helpers = planned_route_helpers(&manifest.actions).unwrap();
+        let helper =
+            render_route_helper(&helpers[0], &schemas, &BTreeMap::new(), &BTreeMap::new()).unwrap();
+
+        assert!(route_manifest.contains("\"admin.users.show\""));
+        assert!(route_manifest.contains("\"id\": string"));
+        assert!(helper.contains("/api/v1/admin/users/{id}"));
+        assert!(helper.contains("admin.users.show"));
     }
 
     #[test]
@@ -4611,8 +5140,9 @@ mod tests {
             route_manifest_entry("legacy.users.show", "/legacy/users/:id", &["id"]),
             route_manifest_entry("health", "/health", &[]),
         ];
-
-        let rendered = render_route_manifest(&routes).unwrap();
+        let manifest = route_contract(&routes);
+        let schemas = contract_schema_exports(&manifest);
+        let rendered = render_route_manifest(&manifest.actions, &schemas).unwrap();
 
         assert!(
             rendered.contains("auditLogs: {"),
@@ -4627,7 +5157,7 @@ mod tests {
             "expected non-dotted route ids to remain usable:\n{rendered}"
         );
         assert!(
-            rendered.contains("\"admin.users.show\": { \"id\": RouteParamValue };"),
+            rendered.contains("\"admin.users.show\": { \"id\": string };"),
             "expected typed params for routes with params:\n{rendered}"
         );
         assert!(
@@ -4654,12 +5184,16 @@ mod tests {
 
     #[test]
     fn route_manifest_rejects_duplicate_route_ids() {
-        let routes = vec![
+        let routes = [
             route_manifest_entry("admin.users.show", "/users/{id}", &["id"]),
             route_manifest_entry("admin.users.show", "/admin/users/{id}", &["id"]),
         ];
+        let first = ContractAction::from_http_route(&routes[0]).unwrap();
+        let mut second = ContractAction::from_http_route(&routes[1]).unwrap();
+        second.action_name = "AdminUsersShowDuplicate".to_string();
+        let schemas = BTreeMap::from([("String".to_string(), String::schema())]);
 
-        let error = render_route_manifest(&routes)
+        let error = render_route_manifest(&[first, second], &schemas)
             .expect_err("duplicate route ids should fail manifest export");
 
         assert!(
@@ -4672,13 +5206,18 @@ mod tests {
 
     #[test]
     fn route_manifest_rejects_camel_case_route_id_collisions() {
-        let routes = vec![
+        let routes = [
             route_manifest_entry("admin.audit_logs.index", "/audit-logs", &[]),
             route_manifest_entry("admin.audit-logs.index", "/audit/logs", &[]),
         ];
+        let actions = routes
+            .iter()
+            .map(ContractAction::from_http_route)
+            .collect::<crate::foundation::Result<Vec<_>>>()
+            .unwrap();
 
-        let error =
-            render_route_manifest(&routes).expect_err("camelCase route id collisions should fail");
+        let error = render_route_manifest(&actions, &BTreeMap::new())
+            .expect_err("camelCase route id collisions should fail");
 
         assert!(
             error.to_string().contains("both normalize to `auditLogs`"),

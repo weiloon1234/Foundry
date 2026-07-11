@@ -6,6 +6,8 @@ use crate::foundation::{Error, Result};
 ///
 /// Templates are loaded from the filesystem at `templates/emails/` by default.
 /// Each template can have `.html` and `.txt` variants.
+/// HTML variables are escaped by default; `{{{variable}}}` opts trusted values
+/// into raw HTML. Text templates always render values without HTML escaping.
 ///
 /// ```ignore
 /// let renderer = TemplateRenderer::new("templates/emails");
@@ -40,7 +42,7 @@ impl TemplateRenderer {
         let text_path = self.base_path.join(format!("{template_name}.txt"));
 
         let html = match std::fs::read_to_string(&html_path) {
-            Ok(content) => Some(replace_variables(&content, variables)),
+            Ok(content) => Some(replace_variables(&content, variables, TemplateMode::Html)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
                 return Err(Error::message(format!(
@@ -51,7 +53,7 @@ impl TemplateRenderer {
         };
 
         let text = match std::fs::read_to_string(&text_path) {
-            Ok(content) => Some(replace_variables(&content, variables)),
+            Ok(content) => Some(replace_variables(&content, variables, TemplateMode::Text)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
                 return Err(Error::message(format!(
@@ -135,46 +137,75 @@ pub struct RenderedTemplate {
     pub text: Option<String>,
 }
 
-/// Replace `{{key}}` placeholders in content with values from the JSON variables.
+#[derive(Clone, Copy)]
+enum TemplateMode {
+    Html,
+    Text,
+}
+
+/// Replace placeholders in one pass over the original template.
 ///
-/// Supports nested access via dot notation: `{{user.name}}`.
-/// Unmatched placeholders are left as-is.
-fn replace_variables(content: &str, variables: &serde_json::Value) -> String {
-    let mut result = content.to_string();
-    let mut search_from = 0;
+/// Supports nested access via dot notation. Unmatched placeholders are left
+/// unchanged, and replacement values are never parsed as template syntax.
+fn replace_variables(content: &str, variables: &serde_json::Value, mode: TemplateMode) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut cursor = 0;
 
-    // Find all {{...}} patterns and replace them
-    while let Some(offset) = result[search_from..].find("{{") {
-        let start = search_from + offset;
-        let Some(close_offset) = result[start..].find("}}") else {
-            break;
+    while let Some(offset) = content[cursor..].find("{{") {
+        let start = cursor + offset;
+        result.push_str(&content[cursor..start]);
+
+        let raw = content[start..].starts_with("{{{");
+        let (opening_len, closing) = if raw { (3, "}}}") } else { (2, "}}") };
+        let value_start = start + opening_len;
+        let Some(close_offset) = content[value_start..].find(closing) else {
+            result.push_str(&content[start..]);
+            return result;
         };
-        let end = start + close_offset + 2;
+        let value_end = value_start + close_offset;
+        let end = value_end + closing.len();
+        let key = content[value_start..value_end].trim();
 
-        let key = result[start + 2..end - 2].trim();
-        let replacement = resolve_json_path(variables, key);
-        let replacement_len = replacement.len();
-        result.replace_range(start..end, &replacement);
-        // Advance past the replacement to avoid re-processing unmatched placeholders
-        search_from = start + replacement_len;
+        match resolve_json_path(variables, key) {
+            Some(value) if matches!(mode, TemplateMode::Html) && !raw => {
+                push_html_escaped(&mut result, &value);
+            }
+            Some(value) => result.push_str(&value),
+            None => result.push_str(&content[start..end]),
+        }
+        cursor = end;
     }
 
+    result.push_str(&content[cursor..]);
     result
 }
 
 /// Resolve a dot-notation path in a JSON value.
-fn resolve_json_path(value: &serde_json::Value, path: &str) -> String {
+fn resolve_json_path(value: &serde_json::Value, path: &str) -> Option<String> {
     let mut current = value;
     for segment in path.split('.') {
         match current.get(segment) {
             Some(v) => current = v,
-            None => return format!("{{{{{path}}}}}"), // leave unmatched as-is
+            None => return None,
         }
     }
-    match current {
+    Some(match current {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
+    })
+}
+
+fn push_html_escaped(output: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&#x27;"),
+            _ => output.push(ch),
+        }
     }
 }
 
@@ -187,7 +218,7 @@ mod tests {
     fn replace_simple_variables() {
         let content = "Hello {{name}}, welcome to {{app}}!";
         let vars = json!({"name": "Alice", "app": "MyApp"});
-        let result = replace_variables(content, &vars);
+        let result = replace_variables(content, &vars, TemplateMode::Text);
         assert_eq!(result, "Hello Alice, welcome to MyApp!");
     }
 
@@ -195,7 +226,7 @@ mod tests {
     fn replace_nested_variables() {
         let content = "Hello {{user.name}}!";
         let vars = json!({"user": {"name": "Bob"}});
-        let result = replace_variables(content, &vars);
+        let result = replace_variables(content, &vars, TemplateMode::Text);
         assert_eq!(result, "Hello Bob!");
     }
 
@@ -203,7 +234,7 @@ mod tests {
     fn unmatched_variables_preserved() {
         let content = "Hello {{name}}, your {{unknown}} is here.";
         let vars = json!({"name": "Alice"});
-        let result = replace_variables(content, &vars);
+        let result = replace_variables(content, &vars, TemplateMode::Text);
         assert_eq!(result, "Hello Alice, your {{unknown}} is here.");
     }
 
@@ -211,8 +242,59 @@ mod tests {
     fn whitespace_in_variable_names() {
         let content = "Hello {{ name }}!";
         let vars = json!({"name": "Alice"});
-        let result = replace_variables(content, &vars);
+        let result = replace_variables(content, &vars, TemplateMode::Text);
         assert_eq!(result, "Hello Alice!");
+    }
+
+    #[test]
+    fn html_variables_are_escaped_and_raw_variables_are_explicit() {
+        let content = "<p>{{value}}</p><div>{{{trusted}}}</div>";
+        let vars = json!({
+            "value": "<script>alert(\"x\")</script> & '",
+            "trusted": "<strong>safe</strong>"
+        });
+
+        let result = replace_variables(content, &vars, TemplateMode::Html);
+
+        assert_eq!(
+            result,
+            "<p>&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &#x27;</p><div><strong>safe</strong></div>"
+        );
+    }
+
+    #[test]
+    fn text_variables_remain_unescaped() {
+        let content = "Value: {{value}} / {{{value}}}";
+        let vars = json!({"value": "<hello> & goodbye"});
+
+        let result = replace_variables(content, &vars, TemplateMode::Text);
+
+        assert_eq!(result, "Value: <hello> & goodbye / <hello> & goodbye");
+    }
+
+    #[test]
+    fn replacement_values_are_not_reinterpreted_as_placeholders() {
+        let content = "{{first}} {{second}}";
+        let vars = json!({"first": "{{second}}", "second": "resolved"});
+
+        let result = replace_variables(content, &vars, TemplateMode::Text);
+
+        assert_eq!(result, "{{second}} resolved");
+    }
+
+    #[test]
+    fn renderer_uses_html_and_text_specific_escaping() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("welcome.html"), "<p>{{name}}</p>").unwrap();
+        std::fs::write(dir.path().join("welcome.txt"), "Hello {{name}}").unwrap();
+        let renderer = TemplateRenderer::new(dir.path());
+
+        let rendered = renderer
+            .render("welcome", &json!({"name": "<Admin>"}))
+            .unwrap();
+
+        assert_eq!(rendered.html.as_deref(), Some("<p>&lt;Admin&gt;</p>"));
+        assert_eq!(rendered.text.as_deref(), Some("Hello <Admin>"));
     }
 
     #[test]

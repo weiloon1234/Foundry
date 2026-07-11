@@ -9,6 +9,11 @@ Validation: 38+ rules, custom rules, request validation extractor
 ```rust
 struct EachValidator
   fn required(self) -> Self
+  fn required_if( self, other_field: impl Into<String>, other_value: impl Into<String>, expected_values: impl IntoIterator<Item = impl Into<String>>, ) -> Self
+  fn required_unless( self, other_field: impl Into<String>, other_value: impl Into<String>, expected_values: impl IntoIterator<Item = impl Into<String>>, ) -> Self
+  fn required_with<I, N, V>(self, other_fields: I) -> Self
+  fn present(self) -> Self
+  fn prohibited(self) -> Self
   fn email(self) -> Self
   fn min(self, length: usize) -> Self
   fn max(self, length: usize) -> Self
@@ -17,6 +22,7 @@ struct EachValidator
   fn url(self) -> Self
   fn uuid(self) -> Self
   fn numeric(self) -> Self
+  fn boolean(self) -> Self
   fn alpha(self) -> Self
   fn alpha_numeric(self) -> Self
   fn in_list( self, values: impl IntoIterator<Item = impl Into<String>>, ) -> Self
@@ -47,13 +53,20 @@ struct EachValidator
   fn unique(self, table: impl Into<String>, column: impl Into<String>) -> Self
   fn exists(self, table: impl Into<String>, column: impl Into<String>) -> Self
   fn app_enum<E: FoundryAppEnum>(self) -> Self
+  fn distinct(self) -> Self
   fn nullable(self) -> Self
+  fn sometimes(self) -> Self
   fn bail(self) -> Self
   fn with_message(self, message: impl Into<String>) -> Self
   async fn apply(self) -> Result<()>
 struct FieldError
 struct FieldValidator
   fn required(self) -> Self
+  fn required_if( self, other_field: impl Into<String>, other_value: impl Into<String>, expected_values: impl IntoIterator<Item = impl Into<String>>, ) -> Self
+  fn required_unless( self, other_field: impl Into<String>, other_value: impl Into<String>, expected_values: impl IntoIterator<Item = impl Into<String>>, ) -> Self
+  fn required_with<I, N, V>(self, other_fields: I) -> Self
+  fn present(self) -> Self
+  fn prohibited(self) -> Self
   fn email(self) -> Self
   fn min(self, length: usize) -> Self
   fn max(self, length: usize) -> Self
@@ -62,6 +75,7 @@ struct FieldValidator
   fn url(self) -> Self
   fn uuid(self) -> Self
   fn numeric(self) -> Self
+  fn boolean(self) -> Self
   fn alpha(self) -> Self
   fn alpha_numeric(self) -> Self
   fn in_list( self, values: impl IntoIterator<Item = impl Into<String>>, ) -> Self
@@ -92,7 +106,9 @@ struct FieldValidator
   fn unique(self, table: impl Into<String>, column: impl Into<String>) -> Self
   fn exists(self, table: impl Into<String>, column: impl Into<String>) -> Self
   fn app_enum<E: FoundryAppEnum>(self) -> Self
+  fn distinct(self) -> Self
   fn nullable(self) -> Self
+  fn sometimes(self) -> Self
   fn bail(self) -> Self
   fn with_message(self, message: impl Into<String>) -> Self
   async fn apply(self) -> Result<()>
@@ -118,6 +134,8 @@ struct Validator
   fn new(app: AppContext) -> Self
   fn app(&self) -> &AppContext
   fn field<'a>( &'a mut self, name: impl Into<String>, value: impl Into<String>, ) -> FieldValidator<'a>
+  fn field_with_presence<'a>( &'a mut self, name: impl Into<String>, value: impl Into<String>, present: bool, ) -> FieldValidator<'a>
+  fn optional_field<'a, T>( &'a mut self, name: impl Into<String>, value: Option<T>, ) -> FieldValidator<'a>
   fn each<'a, T>( &'a mut self, field: impl Into<String>, items: &'a [T], ) -> EachValidator<'a, T>
   fn finish(self) -> Result<(), ValidationErrors>
   fn add_error(&mut self, field: &str, code: &str, params: &[(&str, &str)])
@@ -127,6 +145,7 @@ struct Validator
   fn custom_attribute( &mut self, field: impl Into<String>, name: impl Into<String>, )
 trait FromMultipart
   fn from_multipart<'life0, 'async_trait>(
+  fn from_multipart_with_presence<'life0, 'async_trait>(
   fn cleanup_multipart_files<'life0, 'async_trait>(
 trait RequestValidator
   fn validate<'life0, 'life1, 'async_trait>(

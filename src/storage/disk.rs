@@ -1,10 +1,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::foundation::Result;
+use tokio::io::AsyncRead;
+
+use crate::foundation::{Error, Result};
 use crate::support::DateTime;
 
-use super::adapter::{StorageAdapter, StorageVisibility};
+use super::adapter::{StorageAdapter, StorageReadStream, StorageVisibility, StorageWriteStream};
 use super::callback;
 use super::path::{normalize_path, normalize_prefix};
 use super::stored_file::{StorageObject, StoredFile};
@@ -46,26 +48,32 @@ impl StorageDisk {
         self.visibility
     }
 
+    fn finish_put(&self, mut file: StoredFile) -> StoredFile {
+        file.disk = self.name.clone();
+        if self.visibility == StorageVisibility::Private {
+            file.url = None;
+        }
+        file
+    }
+
     pub async fn put(&self, path: &str, contents: impl AsRef<[u8]>) -> Result<StoredFile> {
         let path = normalize_path(path)?;
         let bytes = contents.as_ref();
-        let mut file = callback::run_storage_operation(&self.name, "put", || {
+        let file = callback::run_storage_operation(&self.name, "put", || {
             self.adapter.put_bytes(&path, bytes, None, self.visibility)
         })
         .await?;
-        file.disk = self.name.clone();
-        Ok(file)
+        Ok(self.finish_put(file))
     }
 
     pub async fn put_bytes(&self, path: &str, bytes: impl AsRef<[u8]>) -> Result<StoredFile> {
         let path = normalize_path(path)?;
         let bytes = bytes.as_ref();
-        let mut file = callback::run_storage_operation(&self.name, "put_bytes", || {
+        let file = callback::run_storage_operation(&self.name, "put_bytes", || {
             self.adapter.put_bytes(&path, bytes, None, self.visibility)
         })
         .await?;
-        file.disk = self.name.clone();
-        Ok(file)
+        Ok(self.finish_put(file))
     }
 
     pub async fn put_file(
@@ -75,18 +83,42 @@ impl StorageDisk {
         content_type: Option<&str>,
     ) -> Result<StoredFile> {
         let path = normalize_path(path)?;
-        let mut file = callback::run_storage_operation(&self.name, "put_file", || {
+        let file = callback::run_storage_operation(&self.name, "put_file", || {
             self.adapter
                 .put_file(&path, temp_path, content_type, self.visibility)
         })
         .await?;
-        file.disk = self.name.clone();
-        Ok(file)
+        Ok(self.finish_put(file))
+    }
+
+    pub async fn put_stream<R>(
+        &self,
+        path: &str,
+        stream: R,
+        content_type: Option<&str>,
+    ) -> Result<StoredFile>
+    where
+        R: AsyncRead + Send + 'static,
+    {
+        let path = normalize_path(path)?;
+        let stream: StorageWriteStream = Box::pin(stream);
+        let file = callback::run_storage_operation(&self.name, "put_stream", || {
+            self.adapter
+                .put_stream(&path, stream, content_type, self.visibility)
+        })
+        .await?;
+        Ok(self.finish_put(file))
     }
 
     pub async fn get(&self, path: &str) -> Result<Vec<u8>> {
         let path = normalize_path(path)?;
         callback::run_storage_operation(&self.name, "get", || self.adapter.get(&path)).await
+    }
+
+    pub async fn get_stream(&self, path: &str) -> Result<StorageReadStream> {
+        let path = normalize_path(path)?;
+        callback::run_storage_operation(&self.name, "get_stream", || self.adapter.get_stream(&path))
+            .await
     }
 
     pub async fn delete(&self, path: &str) -> Result<()> {
@@ -114,6 +146,12 @@ impl StorageDisk {
 
     pub async fn url(&self, path: &str) -> Result<String> {
         let path = normalize_path(path)?;
+        if self.visibility == StorageVisibility::Private {
+            return Err(Error::message(format!(
+                "storage disk `{}` is private and does not expose stable public URLs",
+                self.name
+            )));
+        }
         callback::run_storage_operation(&self.name, "url", || self.adapter.url(&path)).await
     }
 
@@ -132,14 +170,38 @@ impl StorageDisk {
         })
         .await
     }
+
+    pub async fn list_prefix_after(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StorageObject>> {
+        let prefix = normalize_prefix(prefix)?;
+        let after = after.map(normalize_path).transpose()?;
+        if after
+            .as_deref()
+            .is_some_and(|cursor| !cursor.starts_with(&prefix))
+        {
+            return Err(Error::message(format!(
+                "storage list cursor must be inside prefix `{prefix}`"
+            )));
+        }
+        callback::run_storage_operation(&self.name, "list_prefix_after", || {
+            self.adapter
+                .list_prefix_after(&prefix, after.as_deref(), limit)
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use futures_util::StreamExt as _;
 
     use super::*;
     use crate::foundation::Error;
@@ -254,6 +316,70 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BufferedDefaultAdapter {
+        bytes: Mutex<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl StorageAdapter for BufferedDefaultAdapter {
+        async fn put_bytes(
+            &self,
+            path: &str,
+            bytes: &[u8],
+            content_type: Option<&str>,
+            _visibility: StorageVisibility,
+        ) -> Result<StoredFile> {
+            *self.bytes.lock().unwrap() = bytes.to_vec();
+            Ok(StoredFile {
+                disk: String::new(),
+                path: path.to_string(),
+                name: path.to_string(),
+                size: bytes.len() as u64,
+                content_type: content_type.map(ToOwned::to_owned),
+                url: Some("https://should-be-hidden.example/file".to_string()),
+            })
+        }
+
+        async fn put_file(
+            &self,
+            _path: &str,
+            _temp_path: &Path,
+            _content_type: Option<&str>,
+            _visibility: StorageVisibility,
+        ) -> Result<StoredFile> {
+            Err(Error::message("not used"))
+        }
+
+        async fn get(&self, _path: &str) -> Result<Vec<u8>> {
+            Ok(self.bytes.lock().unwrap().clone())
+        }
+
+        async fn delete(&self, _path: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn exists(&self, _path: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn copy(&self, _from: &str, _to: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn move_to(&self, _from: &str, _to: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn url(&self, path: &str) -> Result<String> {
+            Ok(format!("https://example.com/{path}"))
+        }
+
+        async fn temporary_url(&self, _path: &str, _expires_at: DateTime) -> Result<String> {
+            Err(Error::message("not used"))
+        }
+    }
+
     fn disk(adapter: impl StorageAdapter) -> StorageDisk {
         StorageDisk::new(
             "panic".to_string(),
@@ -296,8 +422,27 @@ mod tests {
             "put file exploded",
         );
         assert_storage_panic(
+            disk.put_stream(
+                "file.txt",
+                std::io::Cursor::new(b"hello".to_vec()),
+                Some("text/plain"),
+            )
+            .await
+            .unwrap_err(),
+            "put_stream",
+            "put bytes exploded",
+        );
+        assert_storage_panic(
             disk.get("file.txt").await.unwrap_err(),
             "get",
+            "get exploded",
+        );
+        assert_storage_panic(
+            disk.get_stream("file.txt")
+                .await
+                .err()
+                .expect("stream open should fail"),
+            "get_stream",
             "get exploded",
         );
         assert_storage_panic(
@@ -320,8 +465,13 @@ mod tests {
             "move_to",
             "move exploded",
         );
+        let public_disk = StorageDisk::new(
+            "panic".to_string(),
+            StorageVisibility::Public,
+            Arc::new(PanickingAdapter),
+        );
         assert_storage_panic(
-            disk.url("file.txt").await.unwrap_err(),
+            public_disk.url("file.txt").await.unwrap_err(),
             "url",
             "url exploded",
         );
@@ -357,6 +507,40 @@ mod tests {
         assert!(error
             .to_string()
             .contains("storage adapter does not support prefix listing"));
+    }
+
+    #[tokio::test]
+    async fn custom_adapters_get_backward_compatible_streaming_defaults() {
+        let disk = StorageDisk::new(
+            "memory".to_string(),
+            StorageVisibility::Private,
+            Arc::new(BufferedDefaultAdapter::default()),
+        );
+
+        let stored = disk
+            .put_stream(
+                "files/report.txt",
+                std::io::Cursor::new(b"streamed through defaults".to_vec()),
+                Some("text/plain"),
+            )
+            .await
+            .unwrap();
+        let mut stream = disk.get_stream("files/report.txt").await.unwrap();
+        let chunk = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(stored.disk, "memory");
+        assert!(stored.url.is_none());
+        assert_eq!(chunk, b"streamed through defaults");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn private_disk_rejects_stable_urls_before_calling_the_adapter() {
+        let disk = disk(PanickingAdapter);
+
+        let error = disk.url("file.txt").await.unwrap_err();
+
+        assert!(error.to_string().contains("disk `panic` is private"));
     }
 
     #[tokio::test]

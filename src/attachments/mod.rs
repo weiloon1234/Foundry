@@ -1,7 +1,8 @@
 mod callback;
 mod orphans;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+#[cfg(test)]
 use std::future::Future;
 use std::io::Cursor;
 use std::marker::PhantomData;
@@ -14,9 +15,9 @@ use crate::database::extensions::{
     current_extension_scope, uuid_array_from_ids, AnyModelExtension, ModelExtensionLoader,
 };
 use crate::database::{DbType, DbValue, OrderBy, Query, QueryExecutor};
-use crate::foundation::{AppContext, Error, Result};
-use crate::imaging::ImageFormat;
-use crate::storage::{StorageConfig, UploadedFile};
+use crate::foundation::{AppContext, AppTransaction, Error, Result};
+use crate::imaging::{ImageDecodeLimitViolation, ImageDecodeLimits, ImageFormat};
+use crate::storage::UploadedFile;
 use crate::support::DateTime;
 
 const LOCALIZED_COLLECTION_SEPARATOR: &str = ":";
@@ -153,7 +154,8 @@ impl Attachment {
         let storage = app.storage()?;
         let disk = storage.disk(&self.disk)?;
         let bytes = disk.get(&self.path).await?;
-        crate::imaging::ImageProcessor::from_bytes(&bytes)
+        let limits = app.config().storage()?.image_decode_limits();
+        crate::imaging::ImageProcessor::process_bytes_with_limits(bytes, limits, Ok).await
     }
 }
 
@@ -420,6 +422,11 @@ pub struct AttachmentUploadBuilder {
     require_image: bool,
 }
 
+struct PreparedAttachment {
+    attachment: Attachment,
+    attachable_uuid: Uuid,
+}
+
 pub(crate) fn attachment_extension_loader<M>(collection: String) -> AnyModelExtension<M>
 where
     M: HasAttachments + Send + Sync + 'static,
@@ -549,8 +556,53 @@ impl AttachmentUploadBuilder {
         attachable_type: &str,
         attachable_id: &str,
     ) -> Result<Attachment> {
+        let prepared = self.prepare(app, attachable_type, attachable_id).await?;
+        let transaction = match app.begin_transaction().await {
+            Ok(transaction) => transaction,
+            Err(error) => return cleanup_prepared_attachment(app, &prepared, error).await,
+        };
+        if let Err(error) = acquire_attachment_collection_lock(
+            &transaction,
+            attachable_type,
+            prepared.attachable_uuid,
+            &prepared.attachment.collection,
+        )
+        .await
+        {
+            return rollback_prepared_attachment(transaction, app, &prepared, error).await;
+        }
+        let sort_order = match next_attachment_sort_order(
+            &transaction,
+            attachable_type,
+            prepared.attachable_uuid,
+            &prepared.attachment.collection,
+        )
+        .await
+        {
+            Ok(sort_order) => sort_order,
+            Err(error) => {
+                return rollback_prepared_attachment(transaction, app, &prepared, error).await;
+            }
+        };
+        let attachment = match prepared.insert_with(&transaction, sort_order).await {
+            Ok(attachment) => attachment,
+            Err(error) => {
+                return rollback_prepared_attachment(transaction, app, &prepared, error).await;
+            }
+        };
+        transaction.commit().await?;
+        invalidate_attachment_cache(attachable_type, attachable_id, Some(&attachment.collection));
+        Ok(attachment)
+    }
+
+    async fn prepare(
+        self,
+        app: &AppContext,
+        attachable_type: &str,
+        attachable_id: &str,
+    ) -> Result<PreparedAttachment> {
+        let attachable_uuid = parse_attachment_uuid(attachable_id, "attachable_id")?;
         let storage = app.storage()?;
-        let db = app.database()?;
 
         let disk_name = self.disk.clone().unwrap_or_else(|| {
             app.config()
@@ -579,7 +631,7 @@ impl AttachmentUploadBuilder {
                     quality: self.quality,
                     allow_upscale: self.allow_upscale,
                     require_image: self.require_image,
-                    safety_limits: ImageSafetyLimits::from_storage_config(&app.config().storage()?),
+                    decode_limits: app.config().storage()?.image_decode_limits(),
                 },
             )
             .await?
@@ -605,65 +657,195 @@ impl AttachmentUploadBuilder {
             let ct = self.file.content_type.clone().or(stored.content_type);
             (stored.path, stored.name, size, ct)
         };
-
-        let rows = match parse_attachment_uuid(attachable_id, "attachable_id") {
-            Ok(attachable_uuid) => Query::insert_into(ATTACHMENTS_TABLE)
-                .values([
-                    (
-                        "attachable_type",
-                        DbValue::Text(attachable_type.to_string()),
-                    ),
-                    ("attachable_id", DbValue::Uuid(attachable_uuid)),
-                    ("collection", DbValue::Text(self.collection.clone())),
-                    ("disk", DbValue::Text(disk_name.clone())),
-                    ("path", DbValue::Text(path.clone())),
-                    ("name", DbValue::Text(name.clone())),
-                    ("original_name", opt_text(&original_name)),
-                    ("mime_type", opt_text(&content_type)),
-                    ("size", DbValue::Int64(size)),
-                    ("sort_order", DbValue::Int32(0)),
-                    ("custom_properties", DbValue::Json(serde_json::json!({}))),
-                ])
-                .returning(["id"])
-                .get(&*db)
-                .await
-                .map(|rows| rows.into_vec()),
-            Err(error) => Err(error),
-        };
-
-        // Clean up stored file if DB insert fails
-        if let Err(e) = &rows {
-            if let Ok(d) = storage.disk(&disk_name) {
-                let _ = d.delete(&path).await;
-            }
-            return Err(crate::foundation::Error::message(format!(
-                "failed to create attachment record: {e}"
-            )));
-        }
-
-        let id = rows?
-            .first()
-            .and_then(|r| match r.get("id") {
-                Some(DbValue::Uuid(u)) => Some(u.to_string()),
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        Ok(Attachment {
-            id,
-            attachable_type: attachable_type.to_string(),
-            attachable_id: attachable_id.to_string(),
-            collection: self.collection,
-            disk: disk_name,
-            path,
-            name,
-            original_name,
-            mime_type: content_type,
-            size,
-            sort_order: 0,
-            custom_properties: serde_json::json!({}),
+        Ok(PreparedAttachment {
+            attachable_uuid,
+            attachment: Attachment {
+                id: Uuid::now_v7().to_string(),
+                attachable_type: attachable_type.to_string(),
+                attachable_id: attachable_id.to_string(),
+                collection: self.collection,
+                disk: disk_name,
+                path,
+                name,
+                original_name,
+                mime_type: content_type,
+                size,
+                sort_order: 0,
+                custom_properties: serde_json::json!({}),
+            },
         })
     }
+}
+
+impl PreparedAttachment {
+    async fn insert_with<E>(&self, executor: &E, sort_order: i32) -> Result<Attachment>
+    where
+        E: QueryExecutor,
+    {
+        let attachment_id = parse_attachment_uuid(&self.attachment.id, "id")?;
+        Query::insert_into(ATTACHMENTS_TABLE)
+            .values([
+                ("id", DbValue::Uuid(attachment_id)),
+                (
+                    "attachable_type",
+                    DbValue::Text(self.attachment.attachable_type.clone()),
+                ),
+                ("attachable_id", DbValue::Uuid(self.attachable_uuid)),
+                (
+                    "collection",
+                    DbValue::Text(self.attachment.collection.clone()),
+                ),
+                ("disk", DbValue::Text(self.attachment.disk.clone())),
+                ("path", DbValue::Text(self.attachment.path.clone())),
+                ("name", DbValue::Text(self.attachment.name.clone())),
+                ("original_name", opt_text(&self.attachment.original_name)),
+                ("mime_type", opt_text(&self.attachment.mime_type)),
+                ("size", DbValue::Int64(self.attachment.size)),
+                ("sort_order", DbValue::Int32(sort_order)),
+                (
+                    "custom_properties",
+                    DbValue::Json(self.attachment.custom_properties.clone()),
+                ),
+            ])
+            .execute(executor)
+            .await
+            .map_err(|error| {
+                Error::message(format!("failed to create attachment record: {error}"))
+            })?;
+
+        let mut attachment = self.attachment.clone();
+        attachment.sort_order = sort_order;
+        Ok(attachment)
+    }
+
+    async fn delete_file(&self, app: &AppContext) -> Result<()> {
+        app.storage()?
+            .disk(&self.attachment.disk)?
+            .delete(&self.attachment.path)
+            .await
+    }
+}
+
+async fn acquire_attachment_collection_lock<E>(
+    executor: &E,
+    attachable_type: &str,
+    attachable_id: Uuid,
+    collection: &str,
+) -> Result<()>
+where
+    E: QueryExecutor,
+{
+    let identity = serde_json::to_string(&(attachable_type, attachable_id.to_string(), collection))
+        .map_err(Error::other)?;
+    executor
+        .raw_query(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))::text AS locked",
+            &[DbValue::Text(identity)],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn next_attachment_sort_order<E>(
+    executor: &E,
+    attachable_type: &str,
+    attachable_id: Uuid,
+    collection: &str,
+) -> Result<i32>
+where
+    E: QueryExecutor,
+{
+    let rows = executor
+        .raw_query(
+            "SELECT (COALESCE(MAX(sort_order), -1)::BIGINT + 1) AS next_sort_order FROM attachments WHERE attachable_type = $1 AND attachable_id = $2 AND collection = $3",
+            &[
+                DbValue::Text(attachable_type.to_string()),
+                DbValue::Uuid(attachable_id),
+                DbValue::Text(collection.to_string()),
+            ],
+        )
+        .await?;
+    let next: i64 = rows
+        .first()
+        .ok_or_else(|| Error::message("attachment sort query returned no row"))?
+        .decode("next_sort_order")?;
+    i32::try_from(next).map_err(|_| Error::message("attachment sort order exceeds i32 capacity"))
+}
+
+async fn rollback_prepared_attachment<T>(
+    transaction: AppTransaction,
+    app: &AppContext,
+    prepared: &PreparedAttachment,
+    error: Error,
+) -> Result<T> {
+    let rollback_error = transaction.rollback().await.err();
+    let cleanup_error = prepared.delete_file(app).await.err();
+    match (rollback_error, cleanup_error) {
+        (None, None) => Err(error),
+        (rollback, cleanup) => Err(Error::message(format!(
+            "attachment operation failed: {error}; rollback cleanup: {}; storage cleanup: {}",
+            rollback
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_string()),
+            cleanup
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_string())
+        ))),
+    }
+}
+
+async fn cleanup_prepared_attachment<T>(
+    app: &AppContext,
+    prepared: &PreparedAttachment,
+    error: Error,
+) -> Result<T> {
+    match prepared.delete_file(app).await {
+        Ok(()) => Err(error),
+        Err(cleanup_error) => Err(Error::message(format!(
+            "attachment operation failed: {error}; storage cleanup failed: {cleanup_error}"
+        ))),
+    }
+}
+
+async fn rollback_attachment_transaction<T>(
+    transaction: AppTransaction,
+    error: Error,
+) -> Result<T> {
+    match transaction.rollback().await {
+        Ok(()) => Err(error),
+        Err(rollback_error) => Err(Error::message(format!(
+            "attachment operation failed: {error}; rollback failed: {rollback_error}"
+        ))),
+    }
+}
+
+fn validate_attachment_reorder(
+    existing: &[Attachment],
+    ordered_ids: &[String],
+) -> Result<Vec<Uuid>> {
+    let existing_ids = existing
+        .iter()
+        .map(|attachment| parse_attachment_uuid(&attachment.id, "id"))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut requested_ids = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(ordered_ids.len());
+    for id in ordered_ids {
+        let id = parse_attachment_uuid(id, "id")?;
+        if !requested_ids.insert(id) {
+            return Err(Error::message(format!(
+                "attachment `{id}` appears more than once in the requested order"
+            )));
+        }
+        ordered.push(id);
+    }
+    if existing_ids != requested_ids {
+        return Err(Error::message(format!(
+            "attachment reorder must contain every current collection ID exactly once (expected {}, received {})",
+            existing_ids.len(),
+            requested_ids.len()
+        )));
+    }
+    Ok(ordered)
 }
 
 // ---------------------------------------------------------------------------
@@ -845,6 +1027,94 @@ pub trait HasAttachments: Send + Sync {
         attachments_for_identity(app, attachable_type, &attachable_id, collection).await
     }
 
+    /// Replace a collection's order with an exact permutation of its attachment IDs.
+    ///
+    /// The collection is locked while the current membership is validated and positions are
+    /// rewritten. Omitting, duplicating, or adding an ID fails without changing any row.
+    async fn reorder_attachments(
+        &self,
+        app: &AppContext,
+        collection: &str,
+        ordered_ids: &[String],
+    ) -> Result<Vec<Attachment>> {
+        if ordered_ids.len() > i32::MAX as usize {
+            return Err(Error::message(
+                "attachment collection exceeds i32 sort-order capacity",
+            ));
+        }
+        let attachable_type = attachment_model_type::<Self>()?;
+        let attachable_id = attachment_model_id(self)?;
+        let attachable_uuid = parse_attachment_uuid(&attachable_id, "attachable_id")?;
+        let transaction = app.begin_transaction().await?;
+        if let Err(error) = acquire_attachment_collection_lock(
+            &transaction,
+            attachable_type,
+            attachable_uuid,
+            collection,
+        )
+        .await
+        {
+            return rollback_attachment_transaction(transaction, error).await;
+        }
+        let existing = match attachments_for_identity_with(
+            &transaction,
+            attachable_type,
+            &attachable_id,
+            collection,
+            true,
+        )
+        .await
+        {
+            Ok(existing) => existing,
+            Err(error) => return rollback_attachment_transaction(transaction, error).await,
+        };
+        let ordered_uuids = match validate_attachment_reorder(&existing, ordered_ids) {
+            Ok(ids) => ids,
+            Err(error) => return rollback_attachment_transaction(transaction, error).await,
+        };
+
+        for (position, attachment_id) in ordered_uuids.iter().enumerate() {
+            let affected = match Query::update_table(ATTACHMENTS_TABLE)
+                .value("sort_order", DbValue::Int32(position as i32))
+                .where_eq("id", *attachment_id)
+                .where_eq("attachable_type", attachable_type.to_string())
+                .where_eq("attachable_id", attachable_uuid)
+                .where_eq("collection", collection.to_string())
+                .execute(&transaction)
+                .await
+            {
+                Ok(affected) => affected,
+                Err(error) => return rollback_attachment_transaction(transaction, error).await,
+            };
+            if affected != 1 {
+                return rollback_attachment_transaction(
+                    transaction,
+                    Error::message(format!(
+                        "attachment `{attachment_id}` changed while reordering collection `{collection}`"
+                    )),
+                )
+                .await;
+            }
+        }
+        transaction.commit().await?;
+        invalidate_attachment_cache(attachable_type, &attachable_id, Some(collection));
+
+        let mut by_id = existing
+            .into_iter()
+            .map(|attachment| (attachment.id.clone(), attachment))
+            .collect::<HashMap<_, _>>();
+        Ok(ordered_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(position, id)| {
+                by_id.remove(id).map(|mut attachment| {
+                    attachment.sort_order = position as i32;
+                    attachment
+                })
+            })
+            .collect())
+    }
+
     /// Delete an attachment and its file from storage.
     async fn detach(&self, app: &AppContext, attachment_id: &str) -> Result<()> {
         let attachable_type = attachment_model_type::<Self>()?;
@@ -942,69 +1212,13 @@ struct ProcessedImage {
     format: ImageFormat,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ImageSafetyLimits {
-    max_input_bytes: u64,
-    max_pixels: u64,
-    max_width: u64,
-    max_height: u64,
-}
-
-impl ImageSafetyLimits {
-    fn from_storage_config(config: &StorageConfig) -> Self {
-        Self {
-            max_input_bytes: config.image_max_input_bytes,
-            max_pixels: config.image_max_pixels,
-            max_width: config.image_max_width,
-            max_height: config.image_max_height,
-        }
-    }
-
-    fn validate_input_bytes(&self, len: usize) -> Result<()> {
-        if self.max_input_bytes > 0 && len as u64 > self.max_input_bytes {
-            return Err(attachment_image_input_too_large_error(
-                len as u64,
-                self.max_input_bytes,
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_dimensions(&self, width: u32, height: u32) -> Result<()> {
-        let width = width as u64;
-        let height = height as u64;
-        let pixels = width.saturating_mul(height);
-
-        if (self.max_width > 0 && width > self.max_width)
-            || (self.max_height > 0 && height > self.max_height)
-            || (self.max_pixels > 0 && pixels > self.max_pixels)
-        {
-            return Err(attachment_image_dimensions_too_large_error(
-                width,
-                height,
-                self.max_width,
-                self.max_height,
-                self.max_pixels,
-            ));
-        }
-
-        Ok(())
-    }
-}
-
-impl Default for ImageSafetyLimits {
-    fn default() -> Self {
-        Self::from_storage_config(&StorageConfig::default())
-    }
-}
-
 struct ImageProcessingOptions<'a> {
     transforms: &'a [ImageTransform],
     output_format: Option<ImageFormat>,
     quality: Option<u8>,
     allow_upscale: bool,
     require_image: bool,
-    safety_limits: ImageSafetyLimits,
+    decode_limits: ImageDecodeLimits,
 }
 
 struct OwnedImageProcessingOptions {
@@ -1013,7 +1227,7 @@ struct OwnedImageProcessingOptions {
     quality: Option<u8>,
     allow_upscale: bool,
     require_image: bool,
-    safety_limits: ImageSafetyLimits,
+    decode_limits: ImageDecodeLimits,
 }
 
 impl ImageProcessingOptions<'_> {
@@ -1037,7 +1251,7 @@ async fn process_image_bytes_blocking(
             quality: owned_options.quality,
             allow_upscale: owned_options.allow_upscale,
             require_image: owned_options.require_image,
-            safety_limits: owned_options.safety_limits,
+            decode_limits: owned_options.decode_limits,
         };
         process_image_bytes(&bytes, original_name.as_deref(), &options)
     })
@@ -1067,19 +1281,68 @@ where
             .as_ref()
             .map(|resolved| resolved.spec.is_single())
             .unwrap_or(false);
-    let existing = if should_replace {
-        attachments_for_identity(app, attachable_type, &attachable_id, collection).await?
-    } else {
-        Vec::new()
-    };
-
     let file_for_hooks = file.clone();
     let mut builder = Attachment::upload(file).collection(collection);
     if let Some(resolved) = &resolved {
         builder = builder.apply_spec(&resolved.spec);
     }
-
-    let attachment = builder.store(app, attachable_type, &attachable_id).await?;
+    let prepared = builder
+        .prepare(app, attachable_type, &attachable_id)
+        .await?;
+    let transaction = match app.begin_transaction().await {
+        Ok(transaction) => transaction,
+        Err(error) => return cleanup_prepared_attachment(app, &prepared, error).await,
+    };
+    if let Err(error) = acquire_attachment_collection_lock(
+        &transaction,
+        attachable_type,
+        prepared.attachable_uuid,
+        collection,
+    )
+    .await
+    {
+        return rollback_prepared_attachment(transaction, app, &prepared, error).await;
+    }
+    let existing = if should_replace {
+        match attachments_for_identity_with(
+            &transaction,
+            attachable_type,
+            &attachable_id,
+            collection,
+            true,
+        )
+        .await
+        {
+            Ok(existing) => existing,
+            Err(error) => {
+                return rollback_prepared_attachment(transaction, app, &prepared, error).await;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let sort_order = match existing.first() {
+        Some(existing) => existing.sort_order,
+        None => match next_attachment_sort_order(
+            &transaction,
+            attachable_type,
+            prepared.attachable_uuid,
+            collection,
+        )
+        .await
+        {
+            Ok(sort_order) => sort_order,
+            Err(error) => {
+                return rollback_prepared_attachment(transaction, app, &prepared, error).await;
+            }
+        },
+    };
+    let attachment = match prepared.insert_with(&transaction, sort_order).await {
+        Ok(attachment) => attachment,
+        Err(error) => {
+            return rollback_prepared_attachment(transaction, app, &prepared, error).await;
+        }
+    };
 
     if let Some(resolved) = &resolved {
         if let Err(error) = run_after_store_hooks(
@@ -1092,26 +1355,31 @@ where
         )
         .await
         {
-            return cleanup_after_store_failure(error, || async {
-                detach_attachment_by_identity(
-                    app,
-                    attachable_type,
-                    &attachable_id,
-                    &attachment.id,
-                    true,
-                )
-                .await
-            })
-            .await;
+            return rollback_prepared_attachment(transaction, app, &prepared, error).await;
         }
     }
 
-    for old in existing {
-        if old.id != attachment.id {
-            detach_attachment_by_identity(app, attachable_type, &attachable_id, &old.id, true)
-                .await?;
+    if !existing.is_empty() {
+        let existing_ids = match existing
+            .iter()
+            .map(|attachment| parse_attachment_uuid(&attachment.id, "id"))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                return rollback_prepared_attachment(transaction, app, &prepared, error).await;
+            }
+        };
+        if let Err(error) = Query::delete_from(ATTACHMENTS_TABLE)
+            .where_in("id", existing_ids)
+            .execute(&transaction)
+            .await
+        {
+            return rollback_prepared_attachment(transaction, app, &prepared, error).await;
         }
     }
+    transaction.commit().await?;
+    delete_attachment_values(app, &existing).await;
 
     invalidate_attachment_cache(attachable_type, &attachable_id, Some(collection));
 
@@ -1130,7 +1398,27 @@ async fn attachments_for_identity(
         return Ok(rows);
     }
 
-    let rows = order_attachment_rows(
+    attachments_for_identity_with(
+        app.database()?.as_ref(),
+        attachable_type,
+        attachable_id,
+        collection,
+        false,
+    )
+    .await
+}
+
+async fn attachments_for_identity_with<E>(
+    executor: &E,
+    attachable_type: &str,
+    attachable_id: &str,
+    collection: &str,
+    for_update: bool,
+) -> Result<Vec<Attachment>>
+where
+    E: QueryExecutor,
+{
+    let query = order_attachment_rows(
         attachment_select_query()
             .where_eq("attachable_type", attachable_type.to_string())
             .where_eq(
@@ -1138,9 +1426,13 @@ async fn attachments_for_identity(
                 parse_attachment_uuid(attachable_id, "attachable_id")?,
             )
             .where_eq("collection", collection.to_string()),
-    )
-    .get(&*app.database()?)
-    .await?;
+    );
+    let query = if for_update {
+        query.for_update()
+    } else {
+        query
+    };
+    let rows = query.get(executor).await?;
     rows.iter().map(row_to_attachment).collect()
 }
 
@@ -1198,6 +1490,18 @@ async fn delete_attachment_files(app: &AppContext, rows: &[crate::database::DbRe
             continue;
         };
         let _ = disk.delete(path).await;
+    }
+}
+
+async fn delete_attachment_values(app: &AppContext, attachments: &[Attachment]) {
+    let Ok(storage) = app.storage() else {
+        return;
+    };
+    for attachment in attachments {
+        let Ok(disk) = storage.disk(&attachment.disk) else {
+            continue;
+        };
+        let _ = disk.delete(&attachment.path).await;
     }
 }
 
@@ -1259,6 +1563,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 async fn cleanup_after_store_failure<T, C, Fut>(error: Error, cleanup: C) -> Result<T>
 where
     C: FnOnce() -> Fut,
@@ -1320,12 +1625,19 @@ fn process_image_bytes(
         return Ok(None);
     }
 
-    options.safety_limits.validate_input_bytes(bytes.len())?;
+    options
+        .decode_limits
+        .check_input_bytes(bytes.len() as u64)
+        .map_err(attachment_image_decode_limit_error)?;
     let (width, height) = image_dimensions_from_bytes(bytes)?;
-    options.safety_limits.validate_dimensions(width, height)?;
+    options
+        .decode_limits
+        .check_dimensions(width, height)
+        .map_err(attachment_image_decode_limit_error)?;
 
-    let mut processor = crate::imaging::ImageProcessor::from_bytes(bytes)
-        .map_err(|_| invalid_attachment_image_error())?;
+    let mut processor =
+        crate::imaging::ImageProcessor::from_bytes_with_limits(bytes, options.decode_limits)
+            .map_err(|_| invalid_attachment_image_error())?;
     let detected_format = processor.format();
     let needs_reencode = !options.transforms.is_empty()
         || options.output_format.is_some()
@@ -1440,6 +1752,23 @@ fn attachment_image_too_small_error(width: u32, height: u32) -> Error {
         format!("attachment image must be at least {width}x{height}"),
         "attachment_image_too_small",
     )
+}
+
+fn attachment_image_decode_limit_error(violation: ImageDecodeLimitViolation) -> Error {
+    match violation {
+        ImageDecodeLimitViolation::InputBytes { actual, max } => {
+            attachment_image_input_too_large_error(actual, max)
+        }
+        ImageDecodeLimitViolation::Dimensions {
+            width,
+            height,
+            max_width,
+            max_height,
+            max_pixels,
+        } => attachment_image_dimensions_too_large_error(
+            width, height, max_width, max_height, max_pixels,
+        ),
+    }
 }
 
 fn attachment_image_input_too_large_error(actual: u64, max: u64) -> Error {
@@ -2293,10 +2622,10 @@ mod tests {
         let options = image_processing_options(
             &transforms,
             Some(ImageFormat::WebP),
-            Some(85),
+            None,
             true,
             true,
-            ImageSafetyLimits::default(),
+            ImageDecodeLimits::default(),
         );
         let processed = process_image_bytes(&input, Some("voucher.png"), &options)
             .unwrap()
@@ -2305,6 +2634,26 @@ mod tests {
         assert_eq!(processed.format, ImageFormat::WebP);
         let image = crate::imaging::ImageProcessor::from_bytes(&processed.bytes).unwrap();
         assert_eq!((image.width(), image.height()), (1200, 630));
+    }
+
+    #[test]
+    fn image_policy_rejects_quality_for_webp_output() {
+        let input = test_image_bytes(20, 10, ImageFormat::Png);
+        let options = image_processing_options(
+            &[],
+            Some(ImageFormat::WebP),
+            Some(80),
+            true,
+            true,
+            ImageDecodeLimits::default(),
+        );
+
+        let error = process_image_bytes(&input, Some("image.png"), &options).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "image quality is only supported for JPEG output; WebP output is lossless"
+        );
     }
 
     #[tokio::test]
@@ -2316,10 +2665,10 @@ mod tests {
             OwnedImageProcessingOptions {
                 transforms: vec![ImageTransform::ResizeToFill(1200, 630)],
                 output_format: Some(ImageFormat::WebP),
-                quality: Some(85),
+                quality: None,
                 allow_upscale: true,
                 require_image: true,
-                safety_limits: ImageSafetyLimits::default(),
+                decode_limits: ImageDecodeLimits::default(),
             },
         )
         .await
@@ -2334,7 +2683,7 @@ mod tests {
     #[test]
     fn image_policy_rejects_invalid_images() {
         let options =
-            image_processing_options(&[], None, None, true, true, ImageSafetyLimits::default());
+            image_processing_options(&[], None, None, true, true, ImageDecodeLimits::default());
         let error = process_image_bytes(b"not an image", None, &options).unwrap_err();
 
         assert_error_code(error, "invalid_attachment_image");
@@ -2343,9 +2692,9 @@ mod tests {
     #[test]
     fn image_policy_rejects_oversized_image_input_before_decode() {
         let input = test_image_bytes(10, 10, ImageFormat::Png);
-        let limits = ImageSafetyLimits {
+        let limits = ImageDecodeLimits {
             max_input_bytes: (input.len() - 1) as u64,
-            ..ImageSafetyLimits::default()
+            ..ImageDecodeLimits::default()
         };
 
         let options =
@@ -2358,7 +2707,7 @@ mod tests {
     #[test]
     fn image_policy_rejects_oversized_image_dimensions() {
         let input = test_image_bytes(20, 10, ImageFormat::Png);
-        let limits = ImageSafetyLimits {
+        let limits = ImageDecodeLimits {
             max_input_bytes: 0,
             max_pixels: 0,
             max_width: 10,
@@ -2382,7 +2731,7 @@ mod tests {
             None,
             false,
             true,
-            ImageSafetyLimits::default(),
+            ImageDecodeLimits::default(),
         );
         let error = process_image_bytes(&input, Some("small.png"), &options).unwrap_err();
 
@@ -2395,7 +2744,7 @@ mod tests {
         quality: Option<u8>,
         allow_upscale: bool,
         require_image: bool,
-        safety_limits: ImageSafetyLimits,
+        decode_limits: ImageDecodeLimits,
     ) -> ImageProcessingOptions<'a> {
         ImageProcessingOptions {
             transforms,
@@ -2403,7 +2752,7 @@ mod tests {
             quality,
             allow_upscale,
             require_image,
-            safety_limits,
+            decode_limits,
         }
     }
 

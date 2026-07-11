@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::foundation::AppContext;
 use crate::validation::executor::{fallback_message, interpolate_message};
@@ -11,6 +11,7 @@ pub struct Validator {
     pub(crate) locale: Option<String>,
     pub(crate) custom_messages: HashMap<(String, String), String>,
     pub(crate) custom_attributes: HashMap<String, String>,
+    pub(crate) present_fields: Option<HashSet<String>>,
 }
 
 impl Validator {
@@ -21,6 +22,7 @@ impl Validator {
             locale: None,
             custom_messages: HashMap::new(),
             custom_attributes: HashMap::new(),
+            present_fields: None,
         }
     }
 
@@ -33,14 +35,47 @@ impl Validator {
         name: impl Into<String>,
         value: impl Into<String>,
     ) -> FieldValidator<'a> {
+        self.field_with_presence(name, value, true)
+    }
+
+    /// Validate a value while explicitly describing whether its input field was present.
+    pub fn field_with_presence<'a>(
+        &'a mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+        present: bool,
+    ) -> FieldValidator<'a> {
+        let name = name.into();
+        let present = self
+            .present_fields
+            .as_ref()
+            .map_or(present, |fields| fields.contains(&name));
         FieldValidator {
             validator: self,
-            field: name.into(),
+            field: name,
             value: value.into(),
+            present,
             steps: Vec::new(),
             nullable: false,
+            sometimes: false,
             bail: false,
         }
+    }
+
+    /// Validate a field whose presence is represented by an [`Option`].
+    ///
+    /// `None` is treated as absent, while `Some("")` is present but empty. This
+    /// distinction powers the `present`, `sometimes`, and `prohibited` rules.
+    pub fn optional_field<'a, T>(
+        &'a mut self,
+        name: impl Into<String>,
+        value: Option<T>,
+    ) -> FieldValidator<'a>
+    where
+        T: Into<String>,
+    {
+        let present = value.is_some();
+        self.field_with_presence(name, value.map(Into::into).unwrap_or_default(), present)
     }
 
     pub fn each<'a, T>(
@@ -57,6 +92,7 @@ impl Validator {
             items,
             steps: Vec::new(),
             nullable: false,
+            sometimes: false,
             bail: false,
         }
     }
@@ -67,6 +103,10 @@ impl Validator {
         } else {
             Err(ValidationErrors::new(self.errors))
         }
+    }
+
+    pub(crate) fn set_present_fields(&mut self, fields: Option<HashSet<String>>) {
+        self.present_fields = fields;
     }
 
     pub(crate) fn push_error(&mut self, field: String, error: ValidationError) {
@@ -160,6 +200,33 @@ impl Validator {
         params: &[(&str, &str)],
         custom_message: Option<&str>,
     ) -> String {
+        self.resolve_message_with_fallback(field, code, params, custom_message, None)
+    }
+
+    pub(crate) fn resolve_named_rule_message(
+        &self,
+        field: &str,
+        code: &str,
+        returned_message: &str,
+        custom_message: Option<&str>,
+    ) -> String {
+        self.resolve_message_with_fallback(
+            field,
+            code,
+            &[],
+            custom_message,
+            (!returned_message.trim().is_empty()).then_some(returned_message),
+        )
+    }
+
+    fn resolve_message_with_fallback(
+        &self,
+        field: &str,
+        code: &str,
+        params: &[(&str, &str)],
+        custom_message: Option<&str>,
+        returned_message: Option<&str>,
+    ) -> String {
         let attribute = self.resolve_field_attribute(field);
         let mut all_params = vec![("attribute", attribute.as_str())];
         all_params.extend_from_slice(params);
@@ -196,7 +263,12 @@ impl Validator {
             }
         }
 
-        // Priority 5: hardcoded fallback
+        // Priority 5: message returned by a named custom rule
+        if let Some(message) = returned_message {
+            return interpolate_message(message, &all_params);
+        }
+
+        // Priority 6: hardcoded fallback
         fallback_message(&attribute, code, params)
     }
 }

@@ -24,6 +24,7 @@ struct AppBuilder
   fn new() -> Self
   fn serve_spa(self, dir: impl Into<PathBuf>) -> Self
   fn load_env(self) -> Self
+  fn use_external_tracing_subscriber(self) -> Self
   fn load_config_dir(self, path: impl Into<PathBuf>) -> Self
   fn register_plugin<P>(self, plugin: P) -> Self
   fn register_plugins<I, P>(self, plugins: I) -> Self
@@ -67,12 +68,14 @@ struct AppContext
   fn auth(&self) -> Result<Arc<AuthManager>>
   fn authorizer(&self) -> Result<Arc<Authorizer>>
   fn jobs(&self) -> Result<Arc<JobDispatcher>>
+  fn audit(&self) -> Result<Arc<AuditManager>>
   fn websocket(&self) -> Result<Arc<WebSocketPublisher>>
   fn websocket_channels(&self) -> Result<Arc<WebSocketChannelRegistry>>
   fn database(&self) -> Result<Arc<DatabaseManager>>
   fn redis(&self) -> Result<Arc<RedisManager>>
   fn storage(&self) -> Result<Arc<StorageManager>>
   fn email(&self) -> Result<Arc<EmailManager>>
+  fn http_client(&self) -> Result<Arc<HttpClient>>
   fn hash(&self) -> Result<Arc<HashManager>>
   fn crypt(&self) -> Result<Arc<CryptManager>>
   async fn begin_transaction(&self) -> Result<AppTransaction>
@@ -94,6 +97,7 @@ struct AppContext
   fn signed_route_url<I>( &self, name: I, params: &[(&str, &str)], expires_at: DateTime, ) -> Result<String>
   fn verify_signed_url(&self, url: &str) -> Result<()>
   async fn shutdown_plugins(&self) -> Result<()>
+  async fn shutdown(&self) -> Result<()>
 struct AppTransaction
   fn app(&self) -> &AppContext
   fn transaction(&self) -> &DatabaseTransaction
@@ -101,6 +105,7 @@ struct AppTransaction
   fn set_actor(&mut self, actor: Actor)
   fn actor(&self) -> Option<&Actor>
   fn dispatch_after_commit<J: Job>(&self, job: J)
+  fn dispatch_event_after_commit<E: Event>(&self, event: E)
   fn notify_after_commit( &self, notifiable: &dyn Notifiable, notification: &dyn Notification, ) -> Result<()>
   fn after_commit<F, Fut>(&self, callback: F)
   async fn commit(self) -> Result<()>
@@ -124,6 +129,7 @@ struct ServiceRegistrar
   fn register_job<J>(&self) -> Result<()>
   fn register_job_middleware<M: JobMiddleware>( &self, middleware: M, ) -> Result<()>
   fn register_guard<I, G>(&self, id: I, guard: G) -> Result<()>
+  fn register_actor_hydrator<I, H>(&self, guard: I, hydrator: H) -> Result<()>
   fn register_policy<I, P>(&self, id: I, policy: P) -> Result<()>
   fn register_authenticatable<M>(&self) -> Result<()>
   fn register_readiness_check<I, C>(&self, id: I, check: C) -> Result<()>

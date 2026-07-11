@@ -65,6 +65,8 @@ struct OptionalActor
 struct StaticBearerAuthenticator
   fn new() -> Self
   fn token(self, token: impl Into<String>, actor: Actor) -> Self
+trait ActorHydrator
+  fn hydrate<'life0, 'life1, 'life2, 'async_trait>(
 trait Authenticatable
   fn guard() -> GuardId
   fn resolve_from_actor<'life0, 'life1, 'async_trait, E>(

@@ -125,7 +125,6 @@ async fn upload_avatar(
         .collection("avatar")
         .resize_to_fill(512, 512)
         .format(ImageFormat::WebP)
-        .quality(85)
         .store(&app, User::attachable_type(), &user.attachable_id())
         .await?;
 

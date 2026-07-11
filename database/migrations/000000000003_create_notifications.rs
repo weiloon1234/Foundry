@@ -10,6 +10,7 @@ impl MigrationFile for Entry {
             r#"
             CREATE TABLE notifications (
                 id UUID PRIMARY KEY DEFAULT uuidv7(),
+                notifiable_type TEXT NOT NULL DEFAULT 'default',
                 notifiable_id TEXT NOT NULL,
                 type TEXT NOT NULL,
                 data JSONB NOT NULL DEFAULT '{}',
@@ -22,7 +23,13 @@ impl MigrationFile for Entry {
         .await?;
 
         ctx.raw_execute(
-            "CREATE INDEX idx_notifications_notifiable ON notifications (notifiable_id, read_at)",
+            "CREATE INDEX idx_notifications_notifiable ON notifications (notifiable_type, notifiable_id, created_at DESC, id DESC)",
+            &[],
+        )
+        .await?;
+
+        ctx.raw_execute(
+            "CREATE INDEX idx_notifications_unread ON notifications (notifiable_type, notifiable_id, created_at DESC, id DESC) WHERE read_at IS NULL",
             &[],
         )
         .await?;

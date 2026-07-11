@@ -10,18 +10,13 @@ Channel-based real-time communication with presence tracking, rooms, auth, and s
 const CHAT: ChannelId = ChannelId::new("chat");
 const MESSAGE: ChannelEventId = ChannelEventId::new("message");
 
-struct ChatHandler;
-
-#[async_trait]
-impl ChannelHandler for ChatHandler {
-    async fn handle(&self, ctx: WebSocketContext, payload: Value) -> Result<()> {
-        // Broadcast to all subscribers
-        ctx.publish(MESSAGE, &payload).await
-    }
-}
+#[derive(serde::Deserialize, foundry::ApiSchema)]
+struct ChatMessage { text: String }
 
 fn ws_routes(r: &mut WebSocketRegistrar) -> Result<()> {
-    r.channel(CHAT, ChatHandler)?;
+    r.typed_channel::<ChatMessage, _>(CHAT, |ctx, payload| async move {
+        ctx.publish(MESSAGE, serde_json::json!({ "text": payload.text })).await
+    })?;
     Ok(())
 }
 ```
@@ -47,8 +42,16 @@ Clients connect to `ws://host:3010/ws` and subscribe to channels by sending:
 ### Basic Channel
 
 ```rust
-r.channel(ChannelId::new("chat"), ChatHandler)?;
+r.typed_channel::<ChatMessage, _>(ChannelId::new("chat"), |ctx, payload| async move {
+    ctx.publish(MESSAGE, serde_json::json!({ "text": payload.text })).await
+})?;
 ```
+
+`typed_channel::<Payload, _>` deserializes each inbound `message` payload before
+the handler runs and records the payload schema in the realtime contract.
+Invalid payloads receive a 422 acknowledgement. Use `raw_channel` when a
+channel deliberately owns dynamic `serde_json::Value`; legacy `channel` remains
+an alias for the raw form.
 
 For per-user notification broadcasts, use `register_notification_websocket_channel` rather than a
 public basic channel; it enforces guard and room ownership checks.
@@ -56,9 +59,15 @@ public basic channel; it enforces guard and room ownership checks.
 ### Channel with Options
 
 ```rust
-r.channel_with_options(
+#[derive(serde::Deserialize, foundry::ApiSchema)]
+struct OrderMessage { order_id: String }
+
+r.typed_channel_with_options::<OrderMessage, _>(
     ChannelId::new("orders"),
-    OrderHandler,
+    |ctx, payload| async move {
+        tracing::info!(order_id = %payload.order_id, "received order message");
+        Ok(())
+    },
     WebSocketChannelOptions::new()
         .guard(Guard::User)                         // require auth
         .permission(Permission::OrdersView)          // require permission
@@ -263,13 +272,24 @@ impl Job for ProcessOrderJob {
 
 ### Force Disconnect
 
-Kick a user from all WebSocket connections (e.g., after ban):
+Kick an actor from one guard's WebSocket connections (e.g., after ban):
 
 ```rust
-app.websocket()?.disconnect_user(&user_id).await?;
+app.websocket()?
+    .disconnect_actor(GuardId::new("web"), &user_id)
+    .await?;
 ```
 
-Works across distributed instances via Redis pub/sub.
+This works across distributed instances via Redis pub/sub and matches the exact
+`(guard, actor ID)` pair. Equal actor IDs under another guard remain connected.
+
+### Server Shutdown
+
+Graceful shutdown rejects racing WebSocket handshakes with HTTP 503, sends each
+live socket close code `1001` with reason `server shutdown`, then drains hub
+registrations, actor tracking, subscriptions, presence state, and `on_leave`
+hooks. The existing `app.background_shutdown_timeout_ms` bounds the complete
+cleanup; `0` requests immediate cutoff.
 
 ---
 

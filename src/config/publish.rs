@@ -110,8 +110,11 @@ pub(crate) fn config_publish_cli_registrar() -> CommandRegistrar {
                 println!("  [crypt]");
                 println!("  key = \"{crypt_key}\"\n");
                 println!("Or set via environment variables:\n");
-                println!("  APP__SIGNING_KEY={signing_key}");
-                println!("  CRYPT__KEY={crypt_key}");
+                println!(
+                    "  {}APP__SIGNING_KEY={signing_key}",
+                    super::ENV_OVERLAY_PREFIX
+                );
+                println!("  {}CRYPT__KEY={crypt_key}", super::ENV_OVERLAY_PREFIX);
 
                 Ok(())
             },
@@ -201,6 +204,7 @@ pub(crate) fn config_publish_cli_registrar() -> CommandRegistrar {
 
                 let app_config = config.app().unwrap_or_default();
                 println!("  Environment:  {}", app_config.environment);
+                println!("  Security tier: {}", app_config.resolved_security_tier());
                 println!("  Timezone:     {}", app_config.timezone);
 
                 let signing = if app_config.signing_key.is_empty() {
@@ -432,6 +436,16 @@ const FRAMEWORK_MIGRATIONS: &[(&str, &str)] = &[
     (
         "000000000012_index_job_history_created_at.rs",
         include_str!("../../database/migrations/000000000012_index_job_history_created_at.rs"),
+    ),
+    (
+        "000000000013_alter_model_translation_ids_to_text.rs",
+        include_str!(
+            "../../database/migrations/000000000013_alter_model_translation_ids_to_text.rs"
+        ),
+    ),
+    (
+        "000000000014_add_notification_notifiable_type.rs",
+        include_str!("../../database/migrations/000000000014_add_notification_notifiable_type.rs"),
     ),
 ];
 

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures_util::stream::BoxStream;
 use serde::Serialize;
 
 use crate::auth::Actor;
@@ -31,6 +32,10 @@ pub trait DatatableQuery<Row>: private::Sealed + Clone + Send + Sync + 'static {
 
     fn apply_limit(self, limit: u64) -> Self;
 
+    fn stream<'a, E>(&'a self, executor: &'a E) -> Result<BoxStream<'a, Result<Row>>>
+    where
+        E: QueryExecutor;
+
     async fn get<E>(&self, executor: &E) -> Result<Collection<Row>>
     where
         E: QueryExecutor;
@@ -61,6 +66,13 @@ where
 
     fn apply_limit(self, limit: u64) -> Self {
         self.limit(limit)
+    }
+
+    fn stream<'a, E>(&'a self, executor: &'a E) -> Result<BoxStream<'a, Result<M>>>
+    where
+        E: QueryExecutor,
+    {
+        ModelQuery::stream(self, executor)
     }
 
     async fn get<E>(&self, executor: &E) -> Result<Collection<M>>
@@ -99,6 +111,13 @@ where
 
     fn apply_limit(self, limit: u64) -> Self {
         self.limit(limit)
+    }
+
+    fn stream<'a, E>(&'a self, executor: &'a E) -> Result<BoxStream<'a, Result<P>>>
+    where
+        E: QueryExecutor,
+    {
+        ProjectionQuery::stream(self, executor)
     }
 
     async fn get<E>(&self, executor: &E) -> Result<Collection<P>>

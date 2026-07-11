@@ -10,6 +10,7 @@ Structured logging, observability, health probes, diagnostics
 pub const FRAMEWORK_BOOTSTRAP_PROBE: ProbeId;
 pub const REDIS_PING_PROBE: ProbeId;
 pub const REQUEST_ID_HEADER: &str;
+pub const REQUEST_ID_MAX_LENGTH: usize;
 pub const RUNTIME_BACKEND_PROBE: ProbeId;
 enum AuthOutcome { Success, Unauthorized, Forbidden, Error }
 enum HttpOutcomeClass { Informational, Success, Redirection, ClientError, ServerError }
@@ -21,6 +22,7 @@ enum LogLevel { Trace, Debug, Info, Warn, Error }
 enum PanicContext { Http, Job, Scheduler, Other }
 enum ProbeState { Healthy, Unhealthy }
   fn is_healthy(self) -> bool
+enum RequestIdError { Empty, TooLong, InvalidCharacter }
 enum RuntimeBackendKind { Redis, Memory }
 enum SchedulerLeadershipState { Acquired, Lost }
 enum WebSocketConnectionState { Opened, Closed }
@@ -28,6 +30,7 @@ struct CurrentRequest
 struct HandlerErrorReport
 struct JobDeadLetteredReport
 struct LivenessReport
+struct LogWriterRuntimeSnapshot
 struct ObservabilityOptions
   fn new() -> Self
   fn public() -> Self
@@ -45,6 +48,8 @@ struct ProbeResult
 struct ReadinessReport
 struct RequestId
   fn new(value: impl Into<String>) -> Self
+  fn try_new(value: impl Into<String>) -> Result<Self, RequestIdError>
+  fn generate() -> Self
   fn as_str(&self) -> &str
 struct RuntimeDiagnostics
   fn backend_kind(&self) -> RuntimeBackendKind

@@ -20,7 +20,10 @@ pub mod value;
 pub use column::DatatableColumn;
 pub use context::DatatableContext;
 pub use datatable_trait::{Datatable, DatatableQuery};
-pub use export::{DatatableExportDelivery, GeneratedDatatableExport, NoopExportDelivery};
+pub use export::{
+    DatatableExportDelivery, GeneratedDatatableExport, GeneratedDatatableExportFile,
+    LEGACY_DATATABLE_EXPORT_MAX_BYTES,
+};
 pub use filter_meta::{
     DatatableFilterBinding, DatatableFilterField, DatatableFilterKind, DatatableFilterOption,
     DatatableFilterRow, DatatableFilterValueKind,

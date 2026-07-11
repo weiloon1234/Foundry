@@ -1,6 +1,7 @@
 pub mod cookie;
 pub mod download;
 pub mod middleware;
+mod model_path;
 pub mod resource;
 pub mod response;
 pub mod routes;
@@ -22,11 +23,13 @@ use crate::auth::{
     token::{actor_has_mfa_pending, mfa_pending_auth_error},
     AccessScope, Actor, AuthError, Authenticatable,
 };
+use crate::contract::ContractParameterLocation;
 use crate::foundation::{AppContext, Error, Result};
 use crate::http::middleware::MiddlewareConfig;
 use crate::logging::{catch_future_panic, catch_sync_panic, panic_payload_message, AuthOutcome};
 use crate::support::{GuardId, MiddlewareGroupId, PermissionId, RouteId};
 pub use crate::validation::{JsonValidated, Validated};
+pub use model_path::ModelPath;
 
 pub type RouteRegistrar = Arc<dyn Fn(&mut HttpRegistrar) -> Result<()> + Send + Sync>;
 pub type HttpRouter = Router<AppContext>;
@@ -112,16 +115,36 @@ fn http_registration_panic_error(
 #[derive(Clone, Debug, PartialEq)]
 pub struct RouteManifestEntry {
     pub id: RouteId,
+    pub action_name: Option<String>,
     pub path: String,
     pub method: Option<String>,
-    pub params: Vec<String>,
+    pub parameters: Vec<RouteManifestParameter>,
     pub client_export: bool,
     pub guard: Option<GuardId>,
     pub permissions: Vec<PermissionId>,
     pub summary: Option<String>,
     pub request: Option<&'static str>,
+    pub request_content_type: Option<String>,
     pub(crate) request_schema_json: Option<serde_json::Value>,
     pub responses: Vec<RouteManifestResponse>,
+    pub errors: Vec<RouteManifestError>,
+}
+
+impl RouteManifestEntry {
+    pub fn path_params(&self) -> impl Iterator<Item = &RouteManifestParameter> {
+        self.parameters
+            .iter()
+            .filter(|parameter| parameter.location == ContractParameterLocation::Path)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteManifestParameter {
+    pub name: String,
+    pub location: ContractParameterLocation,
+    pub schema: &'static str,
+    pub required: bool,
+    pub(crate) schema_json: serde_json::Value,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +152,14 @@ pub struct RouteManifestResponse {
     pub status: u16,
     pub schema: &'static str,
     pub(crate) schema_json: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteManifestError {
+    pub code: String,
+    pub status: u16,
+    pub schema: Option<&'static str>,
+    pub(crate) schema_json: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -325,6 +356,13 @@ impl HttpRouteOptions {
         self
     }
 
+    /// Set the explicit business action name used by contract and SDK generation.
+    pub fn action_name(mut self, action_name: impl Into<String>) -> Self {
+        let doc = self.doc.take().unwrap_or_default().action_name(action_name);
+        self.doc = Some(doc);
+        self
+    }
+
     /// Add an OpenAPI description without building a full [`crate::openapi::RouteDoc`] manually.
     pub fn description(mut self, description: &str) -> Self {
         let doc = self.doc.take().unwrap_or_default().description(description);
@@ -338,8 +376,81 @@ impl HttpRouteOptions {
         self
     }
 
+    pub fn request_content_type(mut self, content_type: impl Into<String>) -> Self {
+        let doc = self
+            .doc
+            .take()
+            .unwrap_or_default()
+            .request_content_type(content_type);
+        self.doc = Some(doc);
+        self
+    }
+
+    pub fn parameter<T: crate::openapi::ApiSchema>(
+        mut self,
+        name: impl Into<String>,
+        location: ContractParameterLocation,
+        required: bool,
+    ) -> Self {
+        let doc = self
+            .doc
+            .take()
+            .unwrap_or_default()
+            .parameter::<T>(name, location, required);
+        self.doc = Some(doc);
+        self
+    }
+
+    pub fn path_parameter<T: crate::openapi::ApiSchema>(self, name: impl Into<String>) -> Self {
+        self.parameter::<T>(name, ContractParameterLocation::Path, true)
+    }
+
+    pub fn query_parameter<T: crate::openapi::ApiSchema>(
+        self,
+        name: impl Into<String>,
+        required: bool,
+    ) -> Self {
+        self.parameter::<T>(name, ContractParameterLocation::Query, required)
+    }
+
+    pub fn header_parameter<T: crate::openapi::ApiSchema>(
+        self,
+        name: impl Into<String>,
+        required: bool,
+    ) -> Self {
+        self.parameter::<T>(name, ContractParameterLocation::Header, required)
+    }
+
+    pub fn cookie_parameter<T: crate::openapi::ApiSchema>(
+        self,
+        name: impl Into<String>,
+        required: bool,
+    ) -> Self {
+        self.parameter::<T>(name, ContractParameterLocation::Cookie, required)
+    }
+
     pub fn response<T: crate::openapi::ApiSchema>(mut self, status: u16) -> Self {
         let doc = self.doc.take().unwrap_or_default().response::<T>(status);
+        self.doc = Some(doc);
+        self
+    }
+
+    pub fn error<T: crate::openapi::ApiSchema>(
+        mut self,
+        status: u16,
+        code: impl Into<String>,
+    ) -> Self {
+        let doc = self.doc.take().unwrap_or_default().error::<T>(status, code);
+        self.doc = Some(doc);
+        self
+    }
+
+    pub fn error_without_schema(mut self, status: u16, code: impl Into<String>) -> Self {
+        let doc = self
+            .doc
+            .take()
+            .unwrap_or_default()
+            .error_without_schema(status, code);
         self.doc = Some(doc);
         self
     }
@@ -394,7 +505,9 @@ impl HttpRouteOptions {
         self.doc = match (self.doc.take(), defaults.doc.as_ref()) {
             (Some(doc), Some(default_doc)) => Some(doc.merge_defaults(default_doc)),
             (Some(doc), None) => Some(doc),
-            (None, Some(default_doc)) => Some(default_doc.clone()),
+            (None, Some(default_doc)) => {
+                Some(crate::openapi::RouteDoc::new().merge_defaults(default_doc))
+            }
             (None, None) => None,
         };
 
@@ -431,12 +544,33 @@ fn merge_audit_area_setting(
 
 #[derive(Default)]
 pub struct HttpResourceRoutes {
-    index: Option<MethodRouter<AppContext>>,
-    store: Option<MethodRouter<AppContext>>,
-    show: Option<MethodRouter<AppContext>>,
-    update: Option<MethodRouter<AppContext>>,
-    destroy: Option<MethodRouter<AppContext>>,
+    index: Option<HttpResourceRoute>,
+    store: Option<HttpResourceRoute>,
+    show: Option<HttpResourceRoute>,
+    update: Option<HttpResourceRoute>,
+    destroy: Option<HttpResourceRoute>,
     id_param: String,
+}
+
+struct HttpResourceRoute {
+    router: MethodRouter<AppContext>,
+    action_name: Option<String>,
+}
+
+impl HttpResourceRoute {
+    fn new(router: MethodRouter<AppContext>) -> Self {
+        Self {
+            router,
+            action_name: None,
+        }
+    }
+
+    fn with_action(router: MethodRouter<AppContext>, action_name: impl Into<String>) -> Self {
+        Self {
+            router,
+            action_name: Some(action_name.into()),
+        }
+    }
 }
 
 impl HttpResourceRoutes {
@@ -448,33 +582,90 @@ impl HttpResourceRoutes {
     }
 
     pub fn index(mut self, route: MethodRouter<AppContext>) -> Self {
-        self.index = Some(route);
+        self.index = Some(HttpResourceRoute::new(route));
+        self
+    }
+
+    pub fn index_with_action(
+        mut self,
+        route: MethodRouter<AppContext>,
+        action_name: impl Into<String>,
+    ) -> Self {
+        self.index = Some(HttpResourceRoute::with_action(route, action_name));
         self
     }
 
     pub fn store(mut self, route: MethodRouter<AppContext>) -> Self {
-        self.store = Some(route);
+        self.store = Some(HttpResourceRoute::new(route));
+        self
+    }
+
+    pub fn store_with_action(
+        mut self,
+        route: MethodRouter<AppContext>,
+        action_name: impl Into<String>,
+    ) -> Self {
+        self.store = Some(HttpResourceRoute::with_action(route, action_name));
         self
     }
 
     pub fn show(mut self, route: MethodRouter<AppContext>) -> Self {
-        self.show = Some(route);
+        self.show = Some(HttpResourceRoute::new(route));
+        self
+    }
+
+    pub fn show_with_action(
+        mut self,
+        route: MethodRouter<AppContext>,
+        action_name: impl Into<String>,
+    ) -> Self {
+        self.show = Some(HttpResourceRoute::with_action(route, action_name));
         self
     }
 
     pub fn update(mut self, route: MethodRouter<AppContext>) -> Self {
-        self.update = Some(route);
+        self.update = Some(HttpResourceRoute::new(route));
+        self
+    }
+
+    pub fn update_with_action(
+        mut self,
+        route: MethodRouter<AppContext>,
+        action_name: impl Into<String>,
+    ) -> Self {
+        self.update = Some(HttpResourceRoute::with_action(route, action_name));
         self
     }
 
     pub fn destroy(mut self, route: MethodRouter<AppContext>) -> Self {
-        self.destroy = Some(route);
+        self.destroy = Some(HttpResourceRoute::new(route));
+        self
+    }
+
+    pub fn destroy_with_action(
+        mut self,
+        route: MethodRouter<AppContext>,
+        action_name: impl Into<String>,
+    ) -> Self {
+        self.destroy = Some(HttpResourceRoute::with_action(route, action_name));
         self
     }
 
     pub fn id_param(mut self, id_param: impl Into<String>) -> Self {
         self.id_param = id_param.into();
         self
+    }
+}
+
+fn resource_route_options(
+    options: HttpRouteOptions,
+    method: &str,
+    action_name: Option<String>,
+) -> HttpRouteOptions {
+    let options = options.document_method(method);
+    match action_name {
+        Some(action_name) => options.action_name(action_name),
+        None => options,
     }
 }
 
@@ -782,6 +973,9 @@ pub struct HttpRouteBuilder {
 impl HttpRouteBuilder {
     fn from_defaults(defaults: &HttpRouteOptions, method: &str) -> Self {
         let mut options = defaults.clone();
+        if let Some(doc) = options.doc.as_mut() {
+            doc.action_name = None;
+        }
         mutate_doc(&mut options, |doc| doc.method(method));
 
         Self {
@@ -892,6 +1086,11 @@ impl HttpRouteBuilder {
         self
     }
 
+    pub fn action_name(&mut self, action_name: impl Into<String>) -> &mut Self {
+        mutate_doc(&mut self.options, |doc| doc.action_name(action_name));
+        self
+    }
+
     pub fn description(&mut self, description: &str) -> &mut Self {
         mutate_doc(&mut self.options, |doc| doc.description(description));
         self
@@ -902,8 +1101,74 @@ impl HttpRouteBuilder {
         self
     }
 
+    pub fn request_content_type(&mut self, content_type: impl Into<String>) -> &mut Self {
+        mutate_doc(&mut self.options, |doc| {
+            doc.request_content_type(content_type)
+        });
+        self
+    }
+
+    pub fn parameter<T: crate::openapi::ApiSchema>(
+        &mut self,
+        name: impl Into<String>,
+        location: ContractParameterLocation,
+        required: bool,
+    ) -> &mut Self {
+        mutate_doc(&mut self.options, |doc| {
+            doc.parameter::<T>(name, location, required)
+        });
+        self
+    }
+
+    pub fn path_parameter<T: crate::openapi::ApiSchema>(
+        &mut self,
+        name: impl Into<String>,
+    ) -> &mut Self {
+        self.parameter::<T>(name, ContractParameterLocation::Path, true)
+    }
+
+    pub fn query_parameter<T: crate::openapi::ApiSchema>(
+        &mut self,
+        name: impl Into<String>,
+        required: bool,
+    ) -> &mut Self {
+        self.parameter::<T>(name, ContractParameterLocation::Query, required)
+    }
+
+    pub fn header_parameter<T: crate::openapi::ApiSchema>(
+        &mut self,
+        name: impl Into<String>,
+        required: bool,
+    ) -> &mut Self {
+        self.parameter::<T>(name, ContractParameterLocation::Header, required)
+    }
+
+    pub fn cookie_parameter<T: crate::openapi::ApiSchema>(
+        &mut self,
+        name: impl Into<String>,
+        required: bool,
+    ) -> &mut Self {
+        self.parameter::<T>(name, ContractParameterLocation::Cookie, required)
+    }
+
     pub fn response<T: crate::openapi::ApiSchema>(&mut self, status: u16) -> &mut Self {
         mutate_doc(&mut self.options, |doc| doc.response::<T>(status));
+        self
+    }
+
+    pub fn error<T: crate::openapi::ApiSchema>(
+        &mut self,
+        status: u16,
+        code: impl Into<String>,
+    ) -> &mut Self {
+        mutate_doc(&mut self.options, |doc| doc.error::<T>(status, code));
+        self
+    }
+
+    pub fn error_without_schema(&mut self, status: u16, code: impl Into<String>) -> &mut Self {
+        mutate_doc(&mut self.options, |doc| {
+            doc.error_without_schema(status, code)
+        });
         self
     }
 
@@ -1359,16 +1624,16 @@ impl HttpRegistrar {
             self.route_named_with_options(
                 RouteId::owned(format!("{name}.index")),
                 path,
-                route,
-                options.clone().document_method("get"),
+                route.router,
+                resource_route_options(options.clone(), "get", route.action_name),
             );
         }
         if let Some(route) = routes.store {
             self.route_named_with_options(
                 RouteId::owned(format!("{name}.store")),
                 path,
-                route,
-                options.clone().document_method("post"),
+                route.router,
+                resource_route_options(options.clone(), "post", route.action_name),
             );
         }
 
@@ -1377,24 +1642,24 @@ impl HttpRegistrar {
             self.route_named_with_options(
                 RouteId::owned(format!("{name}.show")),
                 &member_path,
-                route,
-                options.clone().document_method("get"),
+                route.router,
+                resource_route_options(options.clone(), "get", route.action_name),
             );
         }
         if let Some(route) = routes.update {
             self.route_named_with_options(
                 RouteId::owned(format!("{name}.update")),
                 &member_path,
-                route,
-                options.clone().document_method("put"),
+                route.router,
+                resource_route_options(options.clone(), "put", route.action_name),
             );
         }
         if let Some(route) = routes.destroy {
             self.route_named_with_options(
                 RouteId::owned(format!("{name}.destroy")),
                 &member_path,
-                route,
-                options.document_method("delete"),
+                route.router,
+                resource_route_options(options, "delete", route.action_name),
             );
         }
 
@@ -1415,6 +1680,18 @@ impl HttpRegistrar {
                             .unwrap_or_else(|| "get".into()),
                         path: route.path.clone(),
                         doc: doc.clone(),
+                        auth: crate::contract::ContractAuth {
+                            guard: route
+                                .options
+                                .guard_id()
+                                .map(|guard| guard.as_str().to_string()),
+                            permissions: route
+                                .options
+                                .permissions_set()
+                                .into_iter()
+                                .map(|permission| permission.as_str().to_string())
+                                .collect(),
+                        },
                     });
                 }
             }
@@ -1665,26 +1942,179 @@ impl HttpRegistrar {
                 })
                 .unwrap_or_default();
             responses.sort_by_key(|response| response.status);
+            validate_route_request_content_type(id, doc)?;
+            let parameters = collect_route_manifest_parameters(&route.path, id, doc)?;
+            let errors = collect_route_manifest_errors(id, doc)?;
 
             manifest.push(RouteManifestEntry {
                 id: id.clone(),
+                action_name: doc.and_then(|doc| doc.action_name.clone()),
                 path: route.path.clone(),
                 method,
-                params: route_path_params(&route.path),
+                parameters,
                 client_export: route.options.client_export,
                 guard: route.options.guard_id().cloned(),
                 permissions: route.options.permissions_set().into_iter().collect(),
                 summary: doc.and_then(|doc| doc.summary.clone()),
                 request: doc.and_then(|doc| doc.request.as_ref().map(|schema| schema.name)),
+                request_content_type: doc.and_then(|doc| doc.request_content_type.clone()),
                 request_schema_json: doc
                     .and_then(|doc| doc.request.as_ref().map(|schema| (schema.schema_fn)())),
                 responses,
+                errors,
             });
         }
 
         manifest.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         Ok(manifest)
     }
+}
+
+fn validate_route_request_content_type(
+    route_id: &RouteId,
+    doc: Option<&crate::openapi::RouteDoc>,
+) -> Result<()> {
+    let Some(content_type) = doc.and_then(|doc| doc.request_content_type.as_deref()) else {
+        return Ok(());
+    };
+    if doc.and_then(|doc| doc.request.as_ref()).is_none() {
+        return Err(Error::message(format!(
+            "route `{route_id}` declares request content type `{content_type}` without a request schema"
+        )));
+    }
+    let essence = content_type.split(';').next().unwrap_or_default().trim();
+    let (kind, subtype) = essence.split_once('/').unwrap_or_default();
+    if kind.is_empty()
+        || subtype.is_empty()
+        || kind.chars().any(char::is_whitespace)
+        || subtype.chars().any(char::is_whitespace)
+    {
+        return Err(Error::message(format!(
+            "route `{route_id}` request content type `{content_type}` must be a valid MIME type"
+        )));
+    }
+    Ok(())
+}
+
+fn collect_route_manifest_parameters(
+    path: &str,
+    route_id: &RouteId,
+    doc: Option<&crate::openapi::RouteDoc>,
+) -> Result<Vec<RouteManifestParameter>> {
+    let path_params = route_path_params(path);
+    let mut parameters = doc
+        .into_iter()
+        .flat_map(|doc| doc.parameters.iter())
+        .map(|parameter| RouteManifestParameter {
+            name: parameter.name.clone(),
+            location: parameter.location,
+            schema: parameter.schema.name,
+            required: parameter.required,
+            schema_json: (parameter.schema.schema_fn)(),
+        })
+        .collect::<Vec<_>>();
+
+    let mut identities = HashSet::new();
+    for parameter in &parameters {
+        if parameter.name.trim().is_empty() {
+            return Err(Error::message(format!(
+                "route `{route_id}` declares an HTTP parameter with an empty name"
+            )));
+        }
+        if !identities.insert((parameter.location, parameter.name.as_str())) {
+            return Err(Error::message(format!(
+                "route `{route_id}` declares duplicate {:?} parameter `{}`",
+                parameter.location, parameter.name
+            )));
+        }
+        if parameter.location == ContractParameterLocation::Path {
+            if !path_params.contains(&parameter.name) {
+                return Err(Error::message(format!(
+                    "route `{route_id}` declares path parameter `{}` but `{path}` has no matching segment",
+                    parameter.name
+                )));
+            }
+            if !parameter.required {
+                return Err(Error::message(format!(
+                    "route `{route_id}` path parameter `{}` must be required",
+                    parameter.name
+                )));
+            }
+            if !matches!(
+                parameter
+                    .schema_json
+                    .get("type")
+                    .and_then(serde_json::Value::as_str),
+                Some("string" | "integer" | "number" | "boolean")
+            ) {
+                return Err(Error::message(format!(
+                    "route `{route_id}` path parameter `{}` must use a string, integer, number, or boolean schema",
+                    parameter.name
+                )));
+            }
+        }
+    }
+
+    for name in path_params {
+        if parameters.iter().any(|parameter| {
+            parameter.location == ContractParameterLocation::Path && parameter.name == name
+        }) {
+            continue;
+        }
+        parameters.push(RouteManifestParameter {
+            name,
+            location: ContractParameterLocation::Path,
+            schema: <String as crate::openapi::ApiSchema>::schema_name(),
+            required: true,
+            schema_json: <String as crate::openapi::ApiSchema>::schema(),
+        });
+    }
+
+    parameters.sort_by(|left, right| {
+        left.location
+            .cmp(&right.location)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(parameters)
+}
+
+fn collect_route_manifest_errors(
+    route_id: &RouteId,
+    doc: Option<&crate::openapi::RouteDoc>,
+) -> Result<Vec<RouteManifestError>> {
+    let mut errors = Vec::new();
+    let mut identities = HashSet::new();
+    for error in doc.into_iter().flat_map(|doc| doc.errors.iter()) {
+        if error.code.trim().is_empty() {
+            return Err(Error::message(format!(
+                "route `{route_id}` declares an action error with an empty code"
+            )));
+        }
+        if !(400..=599).contains(&error.status) {
+            return Err(Error::message(format!(
+                "route `{route_id}` action error `{}` must use an HTTP error status (400-599), got {}",
+                error.code, error.status
+            )));
+        }
+        if !identities.insert((error.status, error.code.as_str())) {
+            return Err(Error::message(format!(
+                "route `{route_id}` declares duplicate action error `{}` for status {}",
+                error.code, error.status
+            )));
+        }
+        errors.push(RouteManifestError {
+            code: error.code.clone(),
+            status: error.status,
+            schema: error.schema.as_ref().map(|schema| schema.name),
+            schema_json: error.schema.as_ref().map(|schema| (schema.schema_fn)()),
+        });
+    }
+    errors.sort_by(|left, right| {
+        left.status
+            .cmp(&right.status)
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    Ok(errors)
 }
 
 trait DocumentMethod {
@@ -1761,14 +2191,34 @@ async fn http_auth_middleware(
             return internal_error_response(error);
         }
     };
-    let actor = match auth
-        .authenticate_headers(request.headers(), state.options.guard_id())
-        .await
+    let actor = if let Some(actor) = request
+        .extensions()
+        .get::<crate::auth::TestActorOverride>()
+        .map(|value| value.0.clone())
     {
-        Ok(actor) => actor,
-        Err(error) => {
-            record_auth_outcome(&state.app, auth_outcome_from_error(&error));
+        let expected_guard = state
+            .options
+            .guard_id()
+            .unwrap_or_else(|| auth.default_guard());
+        if &actor.guard != expected_guard {
+            let error = AuthError::unauthorized(format!(
+                "test actor guard `{}` does not match route guard `{expected_guard}`",
+                actor.guard
+            ));
+            record_auth_outcome(&state.app, AuthOutcome::Unauthorized);
             return error.into_response();
+        }
+        actor
+    } else {
+        match auth
+            .authenticate_headers(request.headers(), state.options.guard_id())
+            .await
+        {
+            Ok(actor) => actor,
+            Err(error) => {
+                record_auth_outcome(&state.app, auth_outcome_from_error(&error));
+                return error.into_response();
+            }
         }
     };
 
@@ -1950,6 +2400,7 @@ mod tests {
     };
     use crate::auth::Actor;
     use crate::config::ConfigRepository;
+    use crate::contract::ContractParameterLocation;
     use crate::foundation::{AppContext, Container};
     use crate::http::middleware::{MiddlewareGroups, RateLimit, RateLimitWindow};
     use crate::support::{GuardId, MiddlewareGroupId, PermissionId, RouteId};
@@ -2196,6 +2647,7 @@ mod tests {
                 "/api",
                 HttpRouteOptions::new()
                     .guard(GuardId::new("api"))
+                    .action_name("GroupDefaultMustNotLeak")
                     .tag("outer"),
                 |routes| {
                     routes.scope("/admin", |admin| {
@@ -2218,6 +2670,7 @@ mod tests {
         let health_doc = health.options.doc.as_ref().expect("docs should exist");
         assert_eq!(health.options.guard_id(), Some(&GuardId::new("api")));
         assert_eq!(health_doc.tags, vec!["outer".to_string()]);
+        assert_eq!(health_doc.action_name, None);
 
         let login = route_by_path(&registrar, "/api/admin/login");
         let login_doc = login.options.doc.as_ref().expect("docs should exist");
@@ -2225,6 +2678,7 @@ mod tests {
         assert!(login.options.permissions_set().is_empty());
         assert!(!login.options.requires_auth());
         assert_eq!(login_doc.tags, vec!["outer".to_string()]);
+        assert_eq!(login_doc.action_name, None);
     }
 
     #[test]
@@ -2234,11 +2688,11 @@ mod tests {
             "users",
             "/users",
             HttpResourceRoutes::new()
-                .index(get(ok))
-                .store(post(ok))
-                .show(get(ok))
-                .update(put(ok))
-                .destroy(delete(ok)),
+                .index_with_action(get(ok), "ListUsers")
+                .store_with_action(post(ok), "CreateUser")
+                .show_with_action(get(ok), "GetUser")
+                .update_with_action(put(ok), "UpdateUser")
+                .destroy_with_action(delete(ok), "DeleteUser"),
             HttpRouteOptions::new().guard(GuardId::new("api")),
         );
 
@@ -2258,6 +2712,21 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(registered_paths.contains(&"/users"));
         assert!(registered_paths.contains(&"/users/:id"));
+
+        let manifest = registrar.collect_route_manifest().unwrap();
+        assert_eq!(
+            manifest
+                .iter()
+                .map(|route| route.action_name.as_deref().unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "CreateUser",
+                "DeleteUser",
+                "GetUser",
+                "ListUsers",
+                "UpdateUser",
+            ])
+        );
     }
 
     #[test]
@@ -2356,13 +2825,19 @@ mod tests {
                     admin.scope("/users", |users| {
                         users.name_prefix("users");
                         users.get("", "index", ok, |route| {
+                            route.action_name("ListUsers");
                             route.summary("List admin users");
+                            route.query_parameter::<String>("cursor", false);
                             route.response::<String>(200);
                         });
                         users.get("/{id}", "show", ok, |route| {
+                            route.action_name("GetUser");
                             route.summary("Show admin user");
+                            route.path_parameter::<i64>("id");
+                            route.header_parameter::<String>("x-request-source", false);
                             route.request::<String>();
                             route.response::<String>(200);
+                            route.error::<String>(404, "user_not_found");
                         });
                         Ok(())
                     })?;
@@ -2381,22 +2856,46 @@ mod tests {
             .expect("index route manifest entry");
         assert_eq!(index.path, "/api/v1/admin/users");
         assert_eq!(index.method.as_deref(), Some("get"));
-        assert!(index.params.is_empty());
+        assert!(index.path_params().next().is_none());
         assert!(index.client_export);
         assert_eq!(index.guard, Some(GuardId::new("admin")));
         assert_eq!(index.permissions, vec![PermissionId::new("users.read")]);
         assert_eq!(index.summary.as_deref(), Some("List admin users"));
+        assert_eq!(index.action_name.as_deref(), Some("ListUsers"));
+        assert!(index.parameters.iter().any(|parameter| {
+            parameter.location == ContractParameterLocation::Query
+                && parameter.name == "cursor"
+                && !parameter.required
+                && parameter.schema == "String"
+        }));
 
         let show = manifest
             .iter()
             .find(|route| route.id == RouteId::new("admin.users.show"))
             .expect("show route manifest entry");
         assert_eq!(show.path, "/api/v1/admin/users/{id}");
-        assert_eq!(show.params, vec!["id".to_string()]);
+        assert_eq!(
+            show.path_params()
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id"]
+        );
         assert_eq!(show.request, Some("String"));
         assert_eq!(show.responses.len(), 1);
         assert_eq!(show.responses[0].status, 200);
         assert_eq!(show.responses[0].schema, "String");
+        let id = show.path_params().next().unwrap();
+        assert_eq!(id.schema, "i64");
+        assert_eq!(id.schema_json["type"], "integer");
+        assert!(show.parameters.iter().any(|parameter| {
+            parameter.location == ContractParameterLocation::Header
+                && parameter.name == "x-request-source"
+                && !parameter.required
+        }));
+        assert_eq!(show.errors.len(), 1);
+        assert_eq!(show.errors[0].code, "user_not_found");
+        assert_eq!(show.errors[0].status, 404);
+        assert_eq!(show.errors[0].schema, Some("String"));
     }
 
     #[test]
@@ -2408,6 +2907,7 @@ mod tests {
             post(ok),
             HttpRouteOptions::new()
                 .request::<String>()
+                .request_content_type("application/x-www-form-urlencoded")
                 .response::<String>(200)
                 .without_client_export(),
         );
@@ -2420,6 +2920,40 @@ mod tests {
 
         assert!(!login.client_export);
         assert_eq!(login.request, Some("String"));
+        assert_eq!(
+            login.request_content_type.as_deref(),
+            Some("application/x-www-form-urlencoded")
+        );
+    }
+
+    #[test]
+    fn collect_route_manifest_rejects_non_scalar_path_parameter_schema() {
+        let mut registrar = HttpRegistrar::new();
+        registrar.get(RouteId::new("users.show"), "/users/{id}", ok, |route| {
+            route.path_parameter::<serde_json::Value>("id");
+        });
+
+        let error = registrar.collect_route_manifest().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "route `users.show` path parameter `id` must use a string, integer, number, or boolean schema"
+        );
+    }
+
+    #[test]
+    fn collect_route_manifest_rejects_request_content_type_without_schema() {
+        let mut registrar = HttpRegistrar::new();
+        registrar.post(RouteId::new("sessions.store"), "/sessions", ok, |route| {
+            route.request_content_type("application/x-www-form-urlencoded");
+        });
+
+        let error = registrar.collect_route_manifest().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "route `sessions.store` declares request content type `application/x-www-form-urlencoded` without a request schema"
+        );
     }
 
     #[test]
@@ -2822,6 +3356,17 @@ mod tests {
         assert_eq!(
             spec["paths"]["/api/v1/admin/profile"]["put"]["tags"][0],
             "admin:profile"
+        );
+        assert!(spec["paths"]["/api/v1/admin/auth/login"]["post"]
+            .get("security")
+            .is_none());
+        assert_eq!(
+            spec["paths"]["/api/v1/admin/profile"]["put"]["security"],
+            serde_json::json!([{ "bearerAuth": [] }])
+        );
+        assert_eq!(
+            spec["components"]["securitySchemes"]["bearerAuth"]["scheme"],
+            "bearer"
         );
     }
 }

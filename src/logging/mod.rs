@@ -1,4 +1,5 @@
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::Deserialize;
 use tracing_subscriber::fmt::format::Writer;
@@ -6,8 +7,9 @@ use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{ConfigRepository, ObservabilityConfig};
-use crate::foundation::Result;
+use crate::config::{ConfigRepository, LoggingConfig, ObservabilityConfig};
+use crate::foundation::{Error, Result};
+use crate::support::sync::lock_unpoisoned;
 use crate::support::{Clock, Timezone};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -32,6 +34,7 @@ mod types;
 
 pub(crate) use diagnostics::{HttpRequestRecord, RuntimeDiagnosticsConfig};
 pub use diagnostics::{RuntimeDiagnostics, RuntimeSnapshot};
+pub use file_writer::LogWriterRuntimeSnapshot;
 pub use observability::ObservabilityOptions;
 pub use probes::{
     LivenessReport, ProbeResult, ReadinessCheck, ReadinessReport, FRAMEWORK_BOOTSTRAP_PROBE,
@@ -41,7 +44,7 @@ pub(crate) use probes::{ReadinessRegistryBuilder, ReadinessRegistryHandle};
 pub use reporter::{
     ErrorReporter, HandlerErrorReport, JobDeadLetteredReport, PanicContext, PanicReport,
 };
-pub use request_id::{RequestId, REQUEST_ID_HEADER};
+pub use request_id::{RequestId, RequestIdError, REQUEST_ID_HEADER, REQUEST_ID_MAX_LENGTH};
 pub use types::{
     AuthOutcome, HttpOutcomeClass, JobOutcome, LogLevel, ProbeState, RuntimeBackendKind,
     SchedulerLeadershipState, WebSocketConnectionState,
@@ -82,9 +85,11 @@ impl FormatTime for FoundryTimer {
 }
 
 pub fn init(config: &ConfigRepository) -> Result<()> {
-    static LOGGING: OnceLock<()> = OnceLock::new();
+    static LOGGING: OnceLock<Mutex<bool>> = OnceLock::new();
+    let initialized = LOGGING.get_or_init(|| Mutex::new(false));
+    let mut initialized = lock_unpoisoned(initialized, "logging initialization");
 
-    if LOGGING.get().is_some() {
+    if *initialized {
         return Ok(());
     }
 
@@ -95,13 +100,7 @@ pub fn init(config: &ConfigRepository) -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
     match logging_config.format {
-        LogFormat::Json => init_json(
-            filter,
-            &logging_config.log_dir,
-            logging_config.retention_days,
-            &timezone,
-            &observability_config,
-        )?,
+        LogFormat::Json => init_json(filter, &logging_config, &timezone, &observability_config)?,
         LogFormat::Text => init_text(filter, &observability_config)?,
     }
 
@@ -127,23 +126,20 @@ pub fn init(config: &ConfigRepository) -> Result<()> {
         reporter::report_panic_from_hook(message, location);
     }));
 
-    let _ = LOGGING.set(());
+    *initialized = true;
     Ok(())
 }
 
 fn init_json(
     filter: EnvFilter,
-    log_dir: &str,
-    retention_days: u32,
+    logging_config: &LoggingConfig,
     timezone: &Timezone,
     _otel_config: &ObservabilityConfig,
 ) -> Result<()> {
-    use crate::foundation::Error;
-
     let timer = FoundryTimer::new(timezone.clone());
     let clock = Clock::new(timezone.clone());
 
-    if log_dir.is_empty() {
+    if logging_config.log_dir.is_empty() {
         // stdout only
         let stdout_layer = tracing_subscriber::fmt::layer()
             .json()
@@ -156,14 +152,28 @@ fn init_json(
             .with(stdout_layer);
 
         #[cfg(feature = "otel")]
-        let registry = registry.with(build_otel_layer(_otel_config));
+        let registry = registry.with(build_otel_layer(_otel_config)?);
 
-        let _ = registry.try_init();
+        finish_subscriber_install(registry.try_init())?;
     } else {
-        // stdout + date-rotating file
-        let file_writer =
-            file_writer::DateRotatingFileWriter::open(log_dir, &clock, retention_days)
-                .map_err(|e| Error::message(format!("failed to open log dir '{log_dir}': {e}")))?;
+        if logging_config.file_flush_timeout_ms == 0 {
+            return Err(Error::message(
+                "logging file_flush_timeout_ms must be greater than zero",
+            ));
+        }
+        let (file_writer, file_writer_controller) = file_writer::BoundedFileWriter::open(
+            &logging_config.log_dir,
+            &clock,
+            logging_config.retention_days,
+            logging_config.file_queue_capacity,
+            logging_config.file_max_record_bytes,
+        )
+        .map_err(|error| {
+            Error::message(format!(
+                "failed to open log dir '{}': {error}",
+                logging_config.log_dir
+            ))
+        })?;
 
         let stdout_layer = tracing_subscriber::fmt::layer()
             .json()
@@ -184,9 +194,15 @@ fn init_json(
             .with(file_layer);
 
         #[cfg(feature = "otel")]
-        let registry = registry.with(build_otel_layer(_otel_config));
+        let registry = registry.with(build_otel_layer(_otel_config)?);
 
-        let _ = registry.try_init();
+        if let Err(error) = finish_subscriber_install(registry.try_init()) {
+            let _ = file_writer_controller.shutdown(Duration::from_secs(1));
+            return Err(error);
+        }
+        file_writer_controller.install_global().map_err(|error| {
+            Error::message(format!("failed to install log file writer: {error}"))
+        })?;
     }
     Ok(())
 }
@@ -197,10 +213,24 @@ fn init_text(filter: EnvFilter, _otel_config: &ObservabilityConfig) -> Result<()
     let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
 
     #[cfg(feature = "otel")]
-    let registry = registry.with(build_otel_layer(_otel_config));
+    let registry = registry.with(build_otel_layer(_otel_config)?);
 
-    let _ = registry.try_init();
-    Ok(())
+    finish_subscriber_install(registry.try_init())
+}
+
+fn finish_subscriber_install<E>(result: std::result::Result<(), E>) -> Result<()>
+where
+    E: std::fmt::Display,
+{
+    result.map_err(|error| {
+        Error::message(format!(
+            "failed to install Foundry tracing subscriber; use App::builder().use_external_tracing_subscriber() when the host owns tracing: {error}"
+        ))
+    })
+}
+
+pub(crate) async fn flush_file_writer(timeout: Duration) -> Result<()> {
+    file_writer::flush_global(timeout).await
 }
 
 /// Builds the OpenTelemetry tracing layer. Called only when the `otel` feature is enabled.
@@ -208,7 +238,7 @@ fn init_text(filter: EnvFilter, _otel_config: &ObservabilityConfig) -> Result<()
 #[cfg(feature = "otel")]
 fn build_otel_layer<S>(
     config: &ObservabilityConfig,
-) -> Option<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>
+) -> Result<Option<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
@@ -216,14 +246,14 @@ where
     use opentelemetry_otlp::WithExportConfig as _;
 
     if !config.tracing_enabled {
-        return None;
+        return Ok(None);
     }
 
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(&config.otlp_endpoint)
         .build()
-        .ok()?;
+        .map_err(|error| Error::message(format!("failed to build OTLP span exporter: {error}")))?;
 
     let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
         .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
@@ -235,7 +265,7 @@ where
     let tracer = tracer_provider.tracer(config.service_name.clone());
     opentelemetry::global::set_tracer_provider(tracer_provider);
 
-    Some(tracing_opentelemetry::layer().with_tracer(tracer))
+    Ok(Some(tracing_opentelemetry::layer().with_tracer(tracer)))
 }
 
 #[cfg(test)]
@@ -247,8 +277,8 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{
-        ProbeResult, ProbeState, ReadinessCheck, ReadinessRegistryBuilder, RuntimeBackendKind,
-        RuntimeDiagnostics,
+        finish_subscriber_install, ProbeResult, ProbeState, ReadinessCheck,
+        ReadinessRegistryBuilder, RuntimeBackendKind, RuntimeDiagnostics,
     };
     use crate::config::ConfigRepository;
     use crate::foundation::{AppContext, Container, Error};
@@ -256,6 +286,20 @@ mod tests {
     use crate::validation::RuleRegistry;
 
     struct PassingProbe;
+
+    #[test]
+    fn subscriber_install_failure_is_returned_with_hosted_runtime_guidance() {
+        let error =
+            finish_subscriber_install::<&str>(Err("global subscriber already set")).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to install Foundry tracing subscriber"));
+        assert!(error
+            .to_string()
+            .contains("use_external_tracing_subscriber"));
+        assert!(error.to_string().contains("global subscriber already set"));
+    }
 
     #[async_trait]
     impl ReadinessCheck for PassingProbe {

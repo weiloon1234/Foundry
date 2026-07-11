@@ -51,6 +51,12 @@ pub(crate) fn notifiable_id(notifiable: &dyn Notifiable) -> Result<String> {
     catch_notification_callback("notifiable id callback", || notifiable.notification_id())
 }
 
+pub(crate) fn notifiable_type(notifiable: &dyn Notifiable) -> Result<String> {
+    catch_notification_callback("notifiable type callback", || {
+        notifiable.notifiable_type().to_string()
+    })
+}
+
 pub(crate) fn route_notification_for(
     notifiable: &dyn Notifiable,
     channel: &str,

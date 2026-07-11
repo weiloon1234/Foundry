@@ -1,19 +1,20 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::foundation::{Error, Result};
 use crate::support::DateTime;
 
-use super::adapter::{StorageAdapter, StorageVisibility};
+use super::adapter::{StorageAdapter, StorageReadStream, StorageVisibility, StorageWriteStream};
 use super::config::ResolvedLocalConfig;
-use super::path::{normalize_path, normalize_prefix};
+use super::path::{join_url_prefix, normalize_path, normalize_prefix};
 use super::stored_file::{StorageObject, StoredFile};
 
 pub struct LocalStorageAdapter {
     root: PathBuf,
     url: Option<String>,
+    visibility: StorageVisibility,
 }
 
 impl LocalStorageAdapter {
@@ -21,6 +22,7 @@ impl LocalStorageAdapter {
         Ok(Self {
             root: PathBuf::from(&config.root),
             url: config.url.clone(),
+            visibility: config.visibility,
         })
     }
 
@@ -34,6 +36,33 @@ impl LocalStorageAdapter {
             .and_then(|n| n.to_str())
             .unwrap_or(path)
             .to_string()
+    }
+
+    fn public_url(&self, path: &str) -> Option<String> {
+        self.url
+            .as_deref()
+            .and_then(|prefix| join_url_prefix(prefix, path))
+    }
+
+    fn stored_file(
+        &self,
+        path: String,
+        size: u64,
+        content_type: Option<&str>,
+        visibility: StorageVisibility,
+    ) -> StoredFile {
+        StoredFile {
+            disk: String::new(),
+            name: Self::file_name(&path),
+            size,
+            content_type: content_type.map(ToOwned::to_owned),
+            url: if visibility == StorageVisibility::Public {
+                self.public_url(&path)
+            } else {
+                None
+            },
+            path,
+        }
     }
 
     fn object_path(&self, full_path: &Path) -> Result<String> {
@@ -128,6 +157,32 @@ impl LocalStorageAdapter {
         result
     }
 
+    async fn write_stream_atomically(
+        &self,
+        full: &Path,
+        mut stream: StorageWriteStream,
+    ) -> Result<u64> {
+        let (temp_path, mut file) = self.open_unique_temp_file(full).await?;
+        let result = async {
+            let bytes = tokio::io::copy(&mut stream, &mut file)
+                .await
+                .map_err(Error::other)?;
+            file.flush().await.map_err(Error::other)?;
+            drop(file);
+            tokio::fs::rename(&temp_path, full)
+                .await
+                .map_err(Error::other)?;
+            Ok(bytes)
+        }
+        .await;
+
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+        }
+
+        result
+    }
+
     async fn resolve_read_path(&self, path: &str) -> Result<(String, PathBuf)> {
         let path = normalize_path(path)?;
         self.reject_symlink_components(&path, true).await?;
@@ -179,20 +234,13 @@ impl StorageAdapter for LocalStorageAdapter {
         path: &str,
         bytes: &[u8],
         content_type: Option<&str>,
-        _visibility: StorageVisibility,
+        visibility: StorageVisibility,
     ) -> Result<StoredFile> {
         let (path, full) = self.prepare_write_path(path).await?;
 
         self.write_bytes_atomically(&full, bytes).await?;
 
-        Ok(StoredFile {
-            disk: String::new(),
-            path: path.clone(),
-            name: Self::file_name(&path),
-            size: bytes.len() as u64,
-            content_type: content_type.map(|s| s.to_string()),
-            url: None,
-        })
+        Ok(self.stored_file(path, bytes.len() as u64, content_type, visibility))
     }
 
     async fn put_file(
@@ -200,20 +248,26 @@ impl StorageAdapter for LocalStorageAdapter {
         path: &str,
         temp_path: &Path,
         content_type: Option<&str>,
-        _visibility: StorageVisibility,
+        visibility: StorageVisibility,
     ) -> Result<StoredFile> {
         let (path, full) = self.prepare_write_path(path).await?;
 
-        let metadata = self.copy_file_atomically(temp_path, &full).await?;
+        let size = self.copy_file_atomically(temp_path, &full).await?;
 
-        Ok(StoredFile {
-            disk: String::new(),
-            path: path.clone(),
-            name: Self::file_name(&path),
-            size: metadata,
-            content_type: content_type.map(|s| s.to_string()),
-            url: None,
-        })
+        Ok(self.stored_file(path, size, content_type, visibility))
+    }
+
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: StorageWriteStream,
+        content_type: Option<&str>,
+        visibility: StorageVisibility,
+    ) -> Result<StoredFile> {
+        let (path, full) = self.prepare_write_path(path).await?;
+        let size = self.write_stream_atomically(&full, stream).await?;
+
+        Ok(self.stored_file(path, size, content_type, visibility))
     }
 
     async fn get(&self, path: &str) -> Result<Vec<u8>> {
@@ -221,6 +275,29 @@ impl StorageAdapter for LocalStorageAdapter {
         tokio::fs::read(&full)
             .await
             .map_err(|e| Error::message(format!("Failed to read file '{path}': {e}")))
+    }
+
+    async fn get_stream(&self, path: &str) -> Result<StorageReadStream> {
+        const READ_CHUNK_SIZE: usize = 64 * 1024;
+
+        let (path, full) = self.resolve_read_path(path).await?;
+        let file = tokio::fs::File::open(&full)
+            .await
+            .map_err(|error| Error::message(format!("Failed to read file '{path}': {error}")))?;
+        let stream =
+            futures_util::stream::try_unfold((file, path), |(mut file, path)| async move {
+                let mut chunk = vec![0; READ_CHUNK_SIZE];
+                let read = file.read(&mut chunk).await.map_err(|error| {
+                    Error::message(format!("Failed to stream file '{path}': {error}"))
+                })?;
+                if read == 0 {
+                    return Ok(None);
+                }
+                chunk.truncate(read);
+                Ok(Some((chunk, (file, path))))
+            });
+
+        Ok(Box::pin(stream))
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
@@ -274,12 +351,17 @@ impl StorageAdapter for LocalStorageAdapter {
 
     async fn url(&self, path: &str) -> Result<String> {
         let path = normalize_path(path)?;
-        match &self.url {
-            Some(base) => Ok(format!("{}/{path}", base.trim_end_matches('/'))),
-            None => Err(Error::message(
-                "URL generation not supported for this disk (no url configured)",
-            )),
+        if self.visibility == StorageVisibility::Private {
+            return Err(Error::message(
+                "private storage disks do not expose stable public URLs",
+            ));
         }
+
+        self.public_url(&path).ok_or_else(|| {
+            Error::message(
+                "stable public URL generation is not supported for this local disk (no url configured)",
+            )
+        })
     }
 
     async fn temporary_url(&self, path: &str, _expires_at: DateTime) -> Result<String> {
@@ -290,11 +372,30 @@ impl StorageAdapter for LocalStorageAdapter {
     }
 
     async fn list_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<StorageObject>> {
+        self.list_prefix_after(prefix, None, limit).await
+    }
+
+    async fn list_prefix_after(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StorageObject>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
 
-        let (_prefix, start) = self.resolve_prefix_path(prefix).await?;
+        let prefix = normalize_prefix(prefix)?;
+        let after = after.map(normalize_path).transpose()?;
+        if after
+            .as_deref()
+            .is_some_and(|cursor| !cursor.starts_with(&prefix))
+        {
+            return Err(Error::message(format!(
+                "storage list cursor must be inside prefix `{prefix}`"
+            )));
+        }
+        let (_prefix, start) = self.resolve_prefix_path(&prefix).await?;
         if tokio::fs::metadata(&start)
             .await
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
@@ -338,6 +439,9 @@ impl StorageAdapter for LocalStorageAdapter {
         }
 
         objects.sort_by(|left, right| left.path.cmp(&right.path));
+        if let Some(after) = after.as_deref() {
+            objects.retain(|object| object.path.as_str() > after);
+        }
         objects.truncate(limit);
         Ok(objects)
     }
@@ -346,8 +450,13 @@ impl StorageAdapter for LocalStorageAdapter {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
 
+    use futures_util::StreamExt as _;
     use tempfile::TempDir;
+    use tokio::io::{AsyncRead, ReadBuf};
 
     use super::*;
 
@@ -355,6 +464,7 @@ mod tests {
         LocalStorageAdapter {
             root: dir.path().to_path_buf(),
             url: None,
+            visibility: StorageVisibility::Private,
         }
     }
 
@@ -362,6 +472,27 @@ mod tests {
         LocalStorageAdapter {
             root: dir.path().to_path_buf(),
             url: Some(url.to_string()),
+            visibility: StorageVisibility::Public,
+        }
+    }
+
+    struct FailingReader {
+        yielded: bool,
+    }
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.yielded {
+                return Poll::Ready(Err(std::io::Error::other("stream failed")));
+            }
+
+            self.yielded = true;
+            buffer.put_slice(b"partial");
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -421,6 +552,98 @@ mod tests {
 
         let data = adapter.get("uploads/file.bin").await.unwrap();
         assert_eq!(data, b"file contents");
+    }
+
+    #[tokio::test]
+    async fn streams_large_files_in_bounded_chunks_with_a_timeout() {
+        let dir = TempDir::new().unwrap();
+        let adapter = make_adapter(&dir);
+        let contents = vec![42; 160 * 1024];
+
+        let stored = tokio::time::timeout(
+            Duration::from_secs(2),
+            adapter.put_stream(
+                "streams/large.bin",
+                Box::pin(std::io::Cursor::new(contents.clone())),
+                Some("application/octet-stream"),
+                StorageVisibility::Private,
+            ),
+        )
+        .await
+        .expect("streaming write timed out")
+        .unwrap();
+        assert_eq!(stored.size, contents.len() as u64);
+
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            adapter.get_stream("streams/large.bin"),
+        )
+        .await
+        .expect("opening streaming read timed out")
+        .unwrap();
+        let mut read_back = Vec::new();
+        let mut chunks = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            assert!(chunk.len() <= 64 * 1024);
+            chunks += 1;
+            read_back.extend_from_slice(&chunk);
+        }
+
+        assert!(chunks > 1);
+        assert_eq!(read_back, contents);
+    }
+
+    #[tokio::test]
+    async fn failed_streaming_write_removes_temp_and_target_files() {
+        let dir = TempDir::new().unwrap();
+        let adapter = make_adapter(&dir);
+
+        let error = adapter
+            .put_stream(
+                "streams/failure.bin",
+                Box::pin(FailingReader { yielded: false }),
+                None,
+                StorageVisibility::Private,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("stream failed"));
+        assert!(!dir.path().join("streams/failure.bin").exists());
+        let files = std::fs::read_dir(dir.path().join("streams"))
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_writes_include_configured_url_and_private_writes_do_not() {
+        let dir = TempDir::new().unwrap();
+        let adapter = make_adapter_with_url(&dir, "/storage/");
+
+        let public = adapter
+            .put_bytes(
+                "images/public.jpg",
+                b"public",
+                None,
+                StorageVisibility::Public,
+            )
+            .await
+            .unwrap();
+        let private = adapter
+            .put_bytes(
+                "images/private.jpg",
+                b"private",
+                None,
+                StorageVisibility::Private,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(public.url.as_deref(), Some("/storage/images/public.jpg"));
+        assert!(private.url.is_none());
     }
 
     #[tokio::test]
@@ -514,11 +737,23 @@ mod tests {
     #[tokio::test]
     async fn url_returns_error_when_not_configured() {
         let dir = TempDir::new().unwrap();
-        let adapter = make_adapter(&dir);
+        let mut adapter = make_adapter(&dir);
+        adapter.visibility = StorageVisibility::Public;
 
         let result = adapter.url("test.txt").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("URL"));
+    }
+
+    #[tokio::test]
+    async fn private_url_is_unsupported_even_when_a_base_url_is_configured() {
+        let dir = TempDir::new().unwrap();
+        let mut adapter = make_adapter_with_url(&dir, "/storage");
+        adapter.visibility = StorageVisibility::Private;
+
+        let error = adapter.url("test.txt").await.unwrap_err();
+
+        assert!(error.to_string().contains("private storage disks"));
     }
 
     #[tokio::test]
@@ -569,6 +804,18 @@ mod tests {
         let limited = adapter.list_prefix("attachments/", 1).await.unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].path, "attachments/b.txt");
+
+        let next = adapter
+            .list_prefix_after("attachments/", Some("attachments/b.txt"), 1)
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].path, "attachments/nested/a.txt");
+        assert!(adapter
+            .list_prefix_after("attachments/", Some("attachments/nested/a.txt"), 1)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -586,7 +833,11 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let root = workspace.path().join("storage");
         std::fs::create_dir_all(&root).unwrap();
-        let adapter = LocalStorageAdapter { root, url: None };
+        let adapter = LocalStorageAdapter {
+            root,
+            url: None,
+            visibility: StorageVisibility::Private,
+        };
         let outside = workspace.path().join("outside.txt");
 
         let error = adapter

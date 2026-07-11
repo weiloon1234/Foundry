@@ -5,7 +5,6 @@ use crate::foundation::{AppContext, Result};
 use crate::jobs::{Job, JobContext};
 use crate::support::{JobId, Timezone};
 
-use super::export::DatatableExportDelivery;
 use super::request::DatatableRequest;
 use super::response::{DatatableActorSnapshot, DatatableExportAccepted};
 
@@ -38,6 +37,7 @@ impl Job for DatatableExportJob {
 
     async fn handle(&self, context: JobContext) -> Result<()> {
         let app = context.app();
+        let delivery = resolve_export_delivery(app)?;
         let registry = app.datatables()?;
 
         let datatable = registry.get(&self.payload.datatable_id).ok_or_else(|| {
@@ -52,36 +52,31 @@ impl Job for DatatableExportJob {
 
         let request = self.payload.request.clone();
 
-        // Use the download path to generate the export data, then deliver
-        let response = datatable.download(app, actor.as_ref(), request).await?;
+        // Preserve the dispatch-time presentation context across the worker boundary.
+        let export = super::context::scope_datatable_context(
+            self.payload.locale.clone(),
+            self.payload.timezone.clone(),
+            datatable.export_file(app, actor.as_ref(), request),
+        )
+        .await?;
 
-        // Extract bytes from the response body
-        let (_, body) = response.into_parts();
-        let bytes = axum::body::to_bytes(body, usize::MAX).await.map_err(|e| {
-            crate::foundation::Error::message(format!("failed to read export body: {e}"))
-        })?;
-
-        let export = super::export::GeneratedDatatableExport {
-            datatable_id: self.payload.datatable_id.clone(),
-            filename: format!("{}.xlsx", self.payload.datatable_id),
-            data: bytes.to_vec(),
-            columns: Vec::new(),
-        };
-
-        // Resolve delivery implementation from container, fall back to no-op
-        match app.resolve::<Box<dyn super::export::DatatableExportDelivery>>() {
-            Ok(delivery) => delivery.deliver(export, &self.payload.recipient).await,
-            Err(_) => {
-                super::export::NoopExportDelivery
-                    .deliver(export, &self.payload.recipient)
-                    .await
-            }
-        }
+        delivery.deliver_file(export, &self.payload.recipient).await
     }
 
     fn max_retries(&self) -> Option<u32> {
         Some(3)
     }
+}
+
+fn resolve_export_delivery(
+    app: &AppContext,
+) -> Result<std::sync::Arc<Box<dyn super::export::DatatableExportDelivery>>> {
+    app.resolve::<Box<dyn super::export::DatatableExportDelivery>>()
+        .map_err(|error| {
+            crate::foundation::Error::message(format!(
+                "datatable export delivery is not registered: {error}"
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +99,7 @@ pub async fn dispatch_export<D: super::datatable_trait::Datatable + ?Sized>(
             datatable_id: D::ID.to_string(),
             request,
             actor: actor_snapshot,
-            locale: None,
+            locale: Some(crate::translations::current_locale(app)),
             timezone,
             recipient: recipient.to_string(),
         },
@@ -118,4 +113,27 @@ pub async fn dispatch_export<D: super::datatable_trait::Datatable + ?Sized>(
         recipient: recipient.to_string(),
         status: "queued".to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_export_delivery;
+    use crate::config::ConfigRepository;
+    use crate::foundation::{AppContext, Container};
+    use crate::validation::RuleRegistry;
+
+    #[test]
+    fn missing_delivery_is_an_explicit_error() {
+        let app = AppContext::new(
+            Container::new(),
+            ConfigRepository::empty(),
+            RuleRegistry::new(),
+        )
+        .unwrap();
+
+        let error = resolve_export_delivery(&app).err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("datatable export delivery is not registered"));
+    }
 }

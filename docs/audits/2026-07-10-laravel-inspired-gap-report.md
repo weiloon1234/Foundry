@@ -2,6 +2,8 @@
 
 Status: **complete — every public module and every repository-wide theme in the coverage matrix was reviewed at least once.**
 
+Implementation follow-up: [98-item implementation and verification ledger](2026-07-10-gap-implementation-verification.md). The scaffold finding was implemented only as one-file application component generators; no starter/skeleton project generator or installer is included.
+
 Repository snapshot: `75d0444310b5e28d8f7e2969045c6274fe989312`
 
 This report complements the earlier [security, typing, and correctness audit](2026-07-10-framework-audit.md). It does not replace that audit. This pass concentrates on product completeness, truthful contracts, production ergonomics, and Laravel-inspired developer experience.

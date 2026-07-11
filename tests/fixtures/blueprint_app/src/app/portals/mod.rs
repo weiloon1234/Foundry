@@ -35,14 +35,22 @@ impl foundry::validation::FromMultipart for CreateUser {
     ) -> foundry::foundation::Result<Self> {
         let mut email = None;
         let mut phone = None;
-        while let Some(field) = multipart.next_field().await
+        while let Some(field) = multipart
+            .next_field()
+            .await
             .map_err(|e| foundry::foundation::Error::message(format!("multipart error: {e}")))?
         {
             match field.name().unwrap_or("") {
-                "email" => email = Some(field.text().await
-                    .map_err(|e| foundry::foundation::Error::message(format!("field error: {e}")))?),
-                "phone" => phone = Some(field.text().await
-                    .map_err(|e| foundry::foundation::Error::message(format!("field error: {e}")))?),
+                "email" => {
+                    email = Some(field.text().await.map_err(|e| {
+                        foundry::foundation::Error::message(format!("field error: {e}"))
+                    })?)
+                }
+                "phone" => {
+                    phone = Some(field.text().await.map_err(|e| {
+                        foundry::foundation::Error::message(format!("field error: {e}"))
+                    })?)
+                }
                 _ => {}
             }
         }
@@ -54,12 +62,18 @@ impl foundry::validation::FromMultipart for CreateUser {
 }
 
 pub fn router(registrar: &mut HttpRegistrar) -> Result<()> {
-    registrar.route_named(ids::Route::Health, "/health", get(health));
+    registrar.route_named_with_options(
+        ids::Route::Health,
+        "/health",
+        get(health),
+        HttpRouteOptions::new().action_name("GetHealthStatus"),
+    );
     registrar.route_named_with_options(
         ids::Route::UsersStore,
         "/users",
         post(create_user),
         HttpRouteOptions::new()
+            .action_name("CreateUser")
             .guard(ids::AuthGuard::Api)
             .permission(ids::Ability::DashboardView),
     );
@@ -73,7 +87,10 @@ async fn health(State(app): State<AppContext>) -> impl IntoResponse {
     }))
 }
 
-async fn create_user(_actor: CurrentActor, Validated(payload): Validated<CreateUser>) -> impl IntoResponse {
+async fn create_user(
+    _actor: CurrentActor,
+    Validated(payload): Validated<CreateUser>,
+) -> impl IntoResponse {
     (
         StatusCode::CREATED,
         Json(serde_json::json!({

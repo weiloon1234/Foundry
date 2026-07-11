@@ -1,9 +1,126 @@
-use std::io::Cursor;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Cursor, Seek};
 use std::path::Path;
 
-use image::DynamicImage;
+use image::{DynamicImage, ImageDecoder};
 
 use crate::foundation::{Error, Result};
+
+// ---------------------------------------------------------------------------
+// ImageDecodeLimits
+// ---------------------------------------------------------------------------
+
+/// Resource limits applied before and during image decoding.
+///
+/// A zero value disables that individual limit. Use [`Self::unbounded`] only
+/// for trusted input when the caller explicitly accepts unbounded decoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageDecodeLimits {
+    pub max_input_bytes: u64,
+    pub max_pixels: u64,
+    pub max_width: u64,
+    pub max_height: u64,
+}
+
+impl ImageDecodeLimits {
+    pub const DEFAULT_MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
+    pub const DEFAULT_MAX_PIXELS: u64 = 50_000_000;
+    pub const DEFAULT_MAX_WIDTH: u64 = 12_000;
+    pub const DEFAULT_MAX_HEIGHT: u64 = 12_000;
+
+    /// Construct a fully unbounded limit set for explicitly trusted input.
+    pub const fn unbounded() -> Self {
+        Self {
+            max_input_bytes: 0,
+            max_pixels: 0,
+            max_width: 0,
+            max_height: 0,
+        }
+    }
+
+    pub(crate) fn check_input_bytes(
+        self,
+        actual: u64,
+    ) -> std::result::Result<(), ImageDecodeLimitViolation> {
+        if self.max_input_bytes > 0 && actual > self.max_input_bytes {
+            return Err(ImageDecodeLimitViolation::InputBytes {
+                actual,
+                max: self.max_input_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_dimensions(
+        self,
+        width: u32,
+        height: u32,
+    ) -> std::result::Result<(), ImageDecodeLimitViolation> {
+        let width = u64::from(width);
+        let height = u64::from(height);
+        let pixels = width.saturating_mul(height);
+
+        if (self.max_width > 0 && width > self.max_width)
+            || (self.max_height > 0 && height > self.max_height)
+            || (self.max_pixels > 0 && pixels > self.max_pixels)
+        {
+            return Err(ImageDecodeLimitViolation::Dimensions {
+                width,
+                height,
+                max_width: self.max_width,
+                max_height: self.max_height,
+                max_pixels: self.max_pixels,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn decoder_limits(self) -> image::Limits {
+        if self == Self::unbounded() {
+            return image::Limits::no_limits();
+        }
+
+        let mut limits = image::Limits::default();
+        limits.max_image_width = nonzero_u32_limit(self.max_width);
+        limits.max_image_height = nonzero_u32_limit(self.max_height);
+        limits
+    }
+}
+
+impl Default for ImageDecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_input_bytes: Self::DEFAULT_MAX_INPUT_BYTES,
+            max_pixels: Self::DEFAULT_MAX_PIXELS,
+            max_width: Self::DEFAULT_MAX_WIDTH,
+            max_height: Self::DEFAULT_MAX_HEIGHT,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageDecodeLimitViolation {
+    InputBytes {
+        actual: u64,
+        max: u64,
+    },
+    Dimensions {
+        width: u64,
+        height: u64,
+        max_width: u64,
+        max_height: u64,
+        max_pixels: u64,
+    },
+}
+
+fn nonzero_u32_limit(value: u64) -> Option<u32> {
+    if value == 0 {
+        None
+    } else {
+        Some(u32::try_from(value).unwrap_or(u32::MAX))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ImageFormat
@@ -104,6 +221,8 @@ pub enum Rotation {
 // ImageProcessor
 // ---------------------------------------------------------------------------
 
+const DEFAULT_JPEG_QUALITY: u8 = 85;
+
 /// A chainable image processing builder.
 ///
 /// # Example
@@ -123,47 +242,134 @@ pub enum Rotation {
 pub struct ImageProcessor {
     image: DynamicImage,
     format: Option<ImageFormat>,
-    quality: u8,
+    jpeg_quality: Option<u8>,
 }
 
 impl ImageProcessor {
     // -- constructors -------------------------------------------------------
 
-    /// Open an image from a file path.
+    /// Open an image from a file path with [`ImageDecodeLimits::default`].
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_limits(path, ImageDecodeLimits::default())
+    }
+
+    /// Open an image from a file path with custom decode limits.
+    pub fn open_with_limits<P: AsRef<Path>>(path: P, limits: ImageDecodeLimits) -> Result<Self> {
         let path = path.as_ref();
         let format = path
             .extension()
             .and_then(|e| e.to_str())
             .and_then(ImageFormat::from_extension);
+        let file = File::open(path)
+            .map_err(|error| Error::message(format!("Failed to open image: {error}")))?;
+        let input_bytes = file
+            .metadata()
+            .map_err(|error| Error::message(format!("Failed to inspect image: {error}")))?
+            .len();
+        limits
+            .check_input_bytes(input_bytes)
+            .map_err(image_decode_limit_error)?;
 
-        let img =
-            image::open(path).map_err(|e| Error::Message(format!("Failed to open image: {e}")))?;
+        let inner = BufReader::new(file);
+        let reader = match image::ImageFormat::from_path(path) {
+            Ok(format) => image::ImageReader::with_format(inner, format),
+            Err(_) => image::ImageReader::new(inner),
+        };
+        let image = decode_reader(reader, limits, "Failed to open image")?;
 
         Ok(Self {
-            image: img,
+            image,
             format,
-            quality: 85,
+            jpeg_quality: None,
         })
     }
 
-    /// Create an image processor from raw bytes.
+    /// Open an image without decode limits. Use only for explicitly trusted input.
+    pub fn open_unbounded<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_limits(path, ImageDecodeLimits::unbounded())
+    }
+
+    /// Create an image processor from raw bytes with [`ImageDecodeLimits::default`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::from_bytes_with_limits(bytes, ImageDecodeLimits::default())
+    }
+
+    /// Create an image processor from raw bytes with custom decode limits.
+    pub fn from_bytes_with_limits(bytes: &[u8], limits: ImageDecodeLimits) -> Result<Self> {
+        limits
+            .check_input_bytes(bytes.len() as u64)
+            .map_err(image_decode_limit_error)?;
+
         let reader = image::ImageReader::new(Cursor::new(bytes))
             .with_guessed_format()
-            .map_err(|e| Error::Message(format!("Failed to guess image format: {e}")))?;
+            .map_err(|error| Error::message(format!("Failed to guess image format: {error}")))?;
 
         let format = reader.format().and_then(|f| ImageFormat::try_from(f).ok());
-
-        let img = reader
-            .decode()
-            .map_err(|e| Error::Message(format!("Failed to decode image: {e}")))?;
+        let image = decode_reader(reader, limits, "Failed to decode image")?;
 
         Ok(Self {
-            image: img,
+            image,
             format,
-            quality: 85,
+            jpeg_quality: None,
         })
+    }
+
+    /// Decode raw bytes without limits. Use only for explicitly trusted input.
+    pub fn from_bytes_unbounded(bytes: &[u8]) -> Result<Self> {
+        Self::from_bytes_with_limits(bytes, ImageDecodeLimits::unbounded())
+    }
+
+    /// Decode and process an image file on Tokio's blocking thread pool.
+    pub async fn process_file<P, T, F>(path: P, process: F) -> Result<T>
+    where
+        P: AsRef<Path>,
+        T: Send + 'static,
+        F: FnOnce(Self) -> Result<T> + Send + 'static,
+    {
+        Self::process_file_with_limits(path, ImageDecodeLimits::default(), process).await
+    }
+
+    /// Decode and process an image file with custom limits on Tokio's blocking thread pool.
+    pub async fn process_file_with_limits<P, T, F>(
+        path: P,
+        limits: ImageDecodeLimits,
+        process: F,
+    ) -> Result<T>
+    where
+        P: AsRef<Path>,
+        T: Send + 'static,
+        F: FnOnce(Self) -> Result<T> + Send + 'static,
+    {
+        let path = path.as_ref().to_path_buf();
+        crate::support::run_blocking("image file processing", move || {
+            process(Self::open_with_limits(path, limits)?)
+        })
+        .await
+    }
+
+    /// Decode and process owned image bytes on Tokio's blocking thread pool.
+    pub async fn process_bytes<T, F>(bytes: Vec<u8>, process: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Self) -> Result<T> + Send + 'static,
+    {
+        Self::process_bytes_with_limits(bytes, ImageDecodeLimits::default(), process).await
+    }
+
+    /// Decode and process owned bytes with custom limits on Tokio's blocking thread pool.
+    pub async fn process_bytes_with_limits<T, F>(
+        bytes: Vec<u8>,
+        limits: ImageDecodeLimits,
+        process: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Self) -> Result<T> + Send + 'static,
+    {
+        crate::support::run_blocking("image byte processing", move || {
+            process(Self::from_bytes_with_limits(&bytes, limits)?)
+        })
+        .await
     }
 
     // -- info ---------------------------------------------------------------
@@ -219,9 +425,12 @@ impl ImageProcessor {
 
     // -- quality ------------------------------------------------------------
 
-    /// Set the JPEG/WebP encoding quality (1-100). Values are clamped.
+    /// Set JPEG encoding quality (1-100). Values are clamped.
+    ///
+    /// Encoding any non-JPEG format after setting quality returns an error.
+    /// WebP output remains available through the built-in lossless encoder.
     pub fn quality(mut self, q: u8) -> Self {
-        self.quality = q.clamp(1, 100);
+        self.jpeg_quality = Some(q.clamp(1, 100));
         self
     }
 
@@ -318,12 +527,15 @@ impl ImageProcessor {
         writer: &mut W,
         format: ImageFormat,
     ) -> Result<()> {
+        self.validate_quality_for_format(format)?;
         let img = &self.image;
 
         match format {
             ImageFormat::Jpeg => {
-                let encoder =
-                    image::codecs::jpeg::JpegEncoder::new_with_quality(writer, self.quality);
+                let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                    writer,
+                    self.jpeg_quality.unwrap_or(DEFAULT_JPEG_QUALITY),
+                );
                 img.write_with_encoder(encoder)
                     .map_err(|e| Error::Message(format!("JPEG encode failed: {e}")))?;
             }
@@ -333,8 +545,7 @@ impl ImageProcessor {
                     .map_err(|e| Error::Message(format!("PNG encode failed: {e}")))?;
             }
             ImageFormat::WebP => {
-                // WebP encoder in the image crate does not support quality setting directly.
-                // Use the standard save path.
+                // The image crate's built-in WebP encoder is lossless.
                 img.write_to(writer, image::ImageFormat::WebP)
                     .map_err(|e| Error::Message(format!("WebP encode failed: {e}")))?;
             }
@@ -364,6 +575,77 @@ impl ImageProcessor {
 
         Ok(())
     }
+
+    fn validate_quality_for_format(&self, format: ImageFormat) -> Result<()> {
+        if self.jpeg_quality.is_none() || format == ImageFormat::Jpeg {
+            return Ok(());
+        }
+
+        if format == ImageFormat::WebP {
+            return Err(Error::message(
+                "image quality is only supported for JPEG output; WebP output is lossless",
+            ));
+        }
+
+        Err(Error::message(format!(
+            "image quality is only supported for JPEG output, not .{}",
+            format.extension()
+        )))
+    }
+}
+
+fn decode_reader<R>(
+    mut reader: image::ImageReader<R>,
+    limits: ImageDecodeLimits,
+    error_context: &'static str,
+) -> Result<DynamicImage>
+where
+    R: BufRead + Seek,
+{
+    let mut decoder_limits = limits.decoder_limits();
+    reader.limits(decoder_limits.clone());
+
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|error| image_reader_error(error_context, error))?;
+    let (width, height) = decoder.dimensions();
+    limits
+        .check_dimensions(width, height)
+        .map_err(image_decode_limit_error)?;
+
+    decoder_limits
+        .reserve(decoder.total_bytes())
+        .map_err(|error| image_reader_error(error_context, error))?;
+    decoder
+        .set_limits(decoder_limits)
+        .map_err(|error| image_reader_error(error_context, error))?;
+
+    DynamicImage::from_decoder(decoder).map_err(|error| image_reader_error(error_context, error))
+}
+
+fn image_reader_error(error_context: &'static str, error: image::ImageError) -> Error {
+    if matches!(&error, image::ImageError::Limits(_)) {
+        return Error::message(format!("Image exceeds configured decode limits: {error}"));
+    }
+
+    Error::message(format!("{error_context}: {error}"))
+}
+
+fn image_decode_limit_error(violation: ImageDecodeLimitViolation) -> Error {
+    match violation {
+        ImageDecodeLimitViolation::InputBytes { actual, max } => Error::message(format!(
+            "Image input exceeds decode limit ({actual} bytes; max {max})"
+        )),
+        ImageDecodeLimitViolation::Dimensions {
+            width,
+            height,
+            max_width,
+            max_height,
+            max_pixels,
+        } => Error::message(format!(
+            "Image dimensions exceed decode limits ({width}x{height}; max width {max_width}, max height {max_height}, max pixels {max_pixels})"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +654,8 @@ impl ImageProcessor {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use image::DynamicImage;
 
@@ -380,8 +664,18 @@ mod tests {
         ImageProcessor {
             image: img,
             format: Some(ImageFormat::Png),
-            quality: 85,
+            jpeg_quality: None,
         }
+    }
+
+    fn test_image_bytes(width: u32, height: u32, format: ImageFormat) -> Vec<u8> {
+        ImageProcessor {
+            image: DynamicImage::new_rgba8(width, height),
+            format: Some(format),
+            jpeg_quality: None,
+        }
+        .to_bytes(format)
+        .unwrap()
     }
 
     #[test]
@@ -441,13 +735,41 @@ mod tests {
     #[test]
     fn quality_clamping() {
         let proc = test_image().quality(0);
-        assert_eq!(proc.quality, 1);
+        assert_eq!(proc.jpeg_quality, Some(1));
 
         let proc = test_image().quality(150);
-        assert_eq!(proc.quality, 100);
+        assert_eq!(proc.jpeg_quality, Some(100));
 
         let proc = test_image().quality(75);
-        assert_eq!(proc.quality, 75);
+        assert_eq!(proc.jpeg_quality, Some(75));
+    }
+
+    #[test]
+    fn webp_is_lossless_and_rejects_explicit_quality() {
+        let bytes = test_image().to_bytes(ImageFormat::WebP).unwrap();
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WEBP");
+
+        let error = test_image()
+            .quality(80)
+            .to_bytes(ImageFormat::WebP)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "image quality is only supported for JPEG output; WebP output is lossless"
+        );
+    }
+
+    #[test]
+    fn explicit_quality_is_rejected_for_other_non_jpeg_formats() {
+        let error = test_image()
+            .quality(80)
+            .to_bytes(ImageFormat::Png)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "image quality is only supported for JPEG output, not .png"
+        );
     }
 
     #[test]
@@ -481,7 +803,7 @@ mod tests {
         let proc = ImageProcessor {
             image: img,
             format: Some(ImageFormat::Png),
-            quality: 85,
+            jpeg_quality: None,
         };
         let proc = proc.rotate(Rotation::Deg90);
         assert_eq!(proc.width(), 50);
@@ -503,6 +825,103 @@ mod tests {
         assert_eq!(loaded.width(), 100);
         assert_eq!(loaded.height(), 100);
         assert_eq!(loaded.format(), Some(ImageFormat::Png));
+    }
+
+    #[test]
+    fn bounded_bytes_reject_input_size_and_pixel_limits() {
+        let bytes = test_image_bytes(20, 10, ImageFormat::Png);
+        let input_error = ImageProcessor::from_bytes_with_limits(
+            &bytes,
+            ImageDecodeLimits {
+                max_input_bytes: bytes.len() as u64 - 1,
+                ..ImageDecodeLimits::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(input_error
+            .to_string()
+            .contains("Image input exceeds decode limit"));
+
+        let pixel_error = ImageProcessor::from_bytes_with_limits(
+            &bytes,
+            ImageDecodeLimits {
+                max_input_bytes: 0,
+                max_pixels: 199,
+                max_width: 0,
+                max_height: 0,
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(pixel_error
+            .to_string()
+            .contains("Image dimensions exceed decode limits (20x10"));
+    }
+
+    #[test]
+    fn public_defaults_are_bounded_and_unbounded_constructor_is_explicit() {
+        let bytes = test_image_bytes(
+            ImageDecodeLimits::DEFAULT_MAX_WIDTH as u32 + 1,
+            1,
+            ImageFormat::Png,
+        );
+
+        let error = ImageProcessor::from_bytes(&bytes).err().unwrap();
+        assert!(error.to_string().contains("configured decode limits"));
+
+        let trusted = ImageProcessor::from_bytes_unbounded(&bytes).unwrap();
+        assert_eq!(trusted.width(), 12_001);
+    }
+
+    #[test]
+    fn file_constructors_share_bounded_and_explicit_unbounded_semantics() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wide.png");
+        std::fs::write(
+            &path,
+            test_image_bytes(
+                ImageDecodeLimits::DEFAULT_MAX_WIDTH as u32 + 1,
+                1,
+                ImageFormat::Png,
+            ),
+        )
+        .unwrap();
+
+        let error = ImageProcessor::open(&path).err().unwrap();
+        assert!(error.to_string().contains("configured decode limits"));
+
+        let trusted = ImageProcessor::open_unbounded(&path).unwrap();
+        assert_eq!(trusted.width(), 12_001);
+    }
+
+    #[tokio::test]
+    async fn process_file_runs_the_full_callback_on_the_blocking_pool() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.png");
+        std::fs::write(&path, test_image_bytes(40, 20, ImageFormat::Png)).unwrap();
+
+        let output = ImageProcessor::process_file(path, |image| {
+            image.resize(10, 5).to_bytes(ImageFormat::Jpeg)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(&output[..2], &[0xFF, 0xD8]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_bytes_keeps_the_async_runtime_responsive() {
+        let bytes = test_image_bytes(40, 20, ImageFormat::Png);
+        let started = Instant::now();
+        let task = tokio::spawn(ImageProcessor::process_bytes(bytes, |image| {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(image.width())
+        }));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(task.await.unwrap().unwrap(), 40);
     }
 
     #[test]

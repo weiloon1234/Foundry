@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::uri::Authority;
 use axum::http::{HeaderMap, StatusCode};
@@ -14,12 +14,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::auth::{
     token::{actor_has_mfa_pending, mfa_pending_auth_error},
-    validate_actor_guard, Actor, AuthError, AuthErrorCode,
+    Actor, AuthError, AuthErrorCode,
 };
 use crate::config::WebSocketConfig;
 use crate::foundation::{AppContext, Error, Result};
@@ -31,10 +31,13 @@ use crate::support::runtime::RuntimeBackend;
 use crate::support::sync::lock_unpoisoned;
 use crate::support::{ChannelEventId, ChannelId, GuardId};
 use crate::websocket::{
-    presence_key, presence_member_value, ClientAction, ClientMessage, RegisteredChannel,
-    ServerMessage, WebSocketContext, ACK_EVENT, ERROR_EVENT, PRESENCE_JOIN_EVENT,
-    PRESENCE_LEAVE_EVENT, SUBSCRIBED_EVENT, SYSTEM_CHANNEL, UNSUBSCRIBED_EVENT,
+    presence_key, presence_member_value, ClientAction, ClientMessage, DisconnectActorCommand,
+    RegisteredChannel, ServerMessage, WebSocketContext, ACK_EVENT, DISCONNECT_ACTOR_TOPIC,
+    ERROR_EVENT, PRESENCE_JOIN_EVENT, PRESENCE_LEAVE_EVENT, SUBSCRIBED_EVENT, SYSTEM_CHANNEL,
+    UNSUBSCRIBED_EVENT,
 };
+
+const SERVER_SHUTDOWN_CLOSE_REASON: &str = "server shutdown";
 
 pub struct WebSocketKernel {
     app: AppContext,
@@ -55,12 +58,13 @@ impl WebSocketKernel {
             .await
             .map_err(Error::other)?;
         let local_addr = listener.local_addr().map_err(Error::other)?;
-        let (router, pubsub_task) = self.build_router().await?;
+        let (router, state, pubsub_task) = self.build_router().await?;
 
         Ok(BoundWebSocketServer {
             listener,
             router,
             local_addr,
+            state,
             pubsub_task,
         })
     }
@@ -69,7 +73,13 @@ impl WebSocketKernel {
         self.bind().await?.serve().await
     }
 
-    async fn build_router(&self) -> Result<(axum::Router, Option<WebSocketPubSubTask>)> {
+    async fn build_router(
+        &self,
+    ) -> Result<(
+        axum::Router,
+        WebSocketServerState,
+        Option<WebSocketPubSubTask>,
+    )> {
         let ws_config = self.app.config().websocket()?;
         validate_query_token_config(&ws_config)?;
         let registry = self
@@ -84,8 +94,8 @@ impl WebSocketKernel {
 
         let router = axum::Router::new()
             .route(&state.ws_config.path, get(websocket_handler))
-            .with_state(state);
-        Ok((router, pubsub_task))
+            .with_state(state.clone());
+        Ok((router, state, pubsub_task))
     }
 }
 
@@ -93,6 +103,7 @@ pub struct BoundWebSocketServer {
     listener: TcpListener,
     router: axum::Router,
     local_addr: SocketAddr,
+    state: WebSocketServerState,
     pubsub_task: Option<WebSocketPubSubTask>,
 }
 
@@ -112,16 +123,46 @@ impl BoundWebSocketServer {
         let Self {
             listener,
             router,
+            state,
             pubsub_task,
             ..
         } = self;
-        let result = axum::serve(
+        let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+        let server = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown)
-        .await
-        .map_err(Error::other);
+        .with_graceful_shutdown(async move {
+            let _ = server_shutdown_rx.await;
+        })
+        .into_future();
+        tokio::pin!(server);
+        tokio::pin!(shutdown);
+
+        let result = tokio::select! {
+            result = &mut server => result.map_err(Error::other),
+            _ = &mut shutdown => {
+                state.begin_shutdown();
+                let _ = server_shutdown_tx.send(());
+                let timeout = state.shutdown_timeout;
+                let drain = async {
+                    state.shutdown_connections().await;
+                    (&mut server).await.map_err(Error::other)
+                };
+
+                match tokio::time::timeout(timeout, drain).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "foundry.websocket",
+                            timeout_ms = timeout.as_millis() as u64,
+                            "websocket shutdown timeout elapsed; forcing remaining transports closed"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+        };
         drop(pubsub_task);
         result
     }
@@ -170,6 +211,8 @@ struct WebSocketServerState {
     hub: ConnectionHub,
     backend: RuntimeBackend,
     ws_config: WebSocketConfig,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_timeout: Duration,
 }
 
 impl WebSocketServerState {
@@ -185,13 +228,34 @@ impl WebSocketServerState {
             .collect::<HashMap<_, _>>();
         let diagnostics = app.diagnostics().ok();
         let outbound_buffer_size = ws_config.outbound_buffer_size;
+        let shutdown_timeout = app
+            .config()
+            .app()
+            .map(|config| Duration::from_millis(config.background_shutdown_timeout_ms))
+            .unwrap_or_else(|_| Duration::from_secs(30));
+        let (shutdown_tx, _) = watch::channel(false);
         Self {
             app,
             channels: Arc::new(map),
             hub: ConnectionHub::new(diagnostics, outbound_buffer_size),
             backend,
             ws_config,
+            shutdown_tx,
+            shutdown_timeout,
         }
+    }
+
+    fn begin_shutdown(&self) {
+        self.shutdown_tx.send_replace(true);
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        *self.shutdown_tx.borrow()
+    }
+
+    async fn shutdown_connections(&self) {
+        let closed = self.hub.drain().await;
+        self.cleanup_closed_connections(closed).await;
     }
 
     async fn start_pubsub(&self) -> Result<Option<WebSocketPubSubTask>> {
@@ -207,7 +271,7 @@ impl WebSocketServerState {
             .collect::<Vec<_>>();
 
         // Subscribe to the system disconnect topic for force-disconnect support.
-        topics.push("__system:disconnect".to_string());
+        topics.push(DISCONNECT_ACTOR_TOPIC.to_string());
 
         let server_state = self.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
@@ -257,16 +321,14 @@ impl WebSocketServerState {
                         };
 
                         // Handle force-disconnect commands on the system topic.
-                        if message.topic == "__system:disconnect" {
-                            #[derive(serde::Deserialize)]
-                            struct DisconnectCommand {
-                                actor_id: String,
-                            }
+                        if message.topic == DISCONNECT_ACTOR_TOPIC {
                             if let Ok(cmd) =
-                                serde_json::from_str::<DisconnectCommand>(&message.payload)
+                                serde_json::from_str::<DisconnectActorCommand>(&message.payload)
                             {
-                                let closed =
-                                    server_state.hub.disconnect_by_actor(&cmd.actor_id).await;
+                                let closed = server_state
+                                    .hub
+                                    .disconnect_actor(&cmd.guard, &cmd.actor_id)
+                                    .await;
                                 server_state.cleanup_closed_connections(closed).await;
                             } else {
                                 tracing::error!(
@@ -359,18 +421,13 @@ impl WebSocketServerState {
         }
 
         let actor_and_kind = if let Some(session_id) = identity.session_id.as_deref() {
-            let sessions = self
+            let auth = self
                 .app
-                .sessions()
+                .auth()
                 .map_err(|error| AuthError::internal(error.to_string()))?;
-            let actor = if extend_session {
-                sessions.validate(session_id).await
-            } else {
-                sessions.validate_without_touch(session_id).await
-            }
-            .map_err(|error| AuthError::internal(error.to_string()))?
-            .ok_or_else(|| AuthError::unauthorized_code(AuthErrorCode::InvalidSession))?;
-            let actor = validate_actor_guard(actor, guard_id, AuthErrorCode::InvalidSession)?;
+            let actor = auth
+                .authenticate_session_id(session_id, guard_id, extend_session)
+                .await?;
             (actor, ConnectionCredentialKind::Session)
         } else if let Some(token) = identity.bearer_token.as_deref() {
             let auth = self
@@ -740,17 +797,24 @@ async fn websocket_handler(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     State(state): State<WebSocketServerState>,
 ) -> Response {
-    let production_like = state
+    if state.is_shutting_down() {
+        return websocket_rejection(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "websocket server is shutting down",
+        );
+    }
+
+    let strict_security = state
         .app
         .config()
         .app()
-        .map(|config| config.environment.is_production_like())
-        .unwrap_or(false);
+        .map(|config| config.resolved_security_tier().is_strict())
+        .unwrap_or(true);
     match origin_allowed(
         &state.app,
         &headers,
         &state.ws_config.allowed_origins,
-        production_like,
+        strict_security,
         peer_addr,
     ) {
         Ok(true) => {}
@@ -919,7 +983,7 @@ fn origin_allowed(
     app: &AppContext,
     headers: &HeaderMap,
     allowed_origins: &[String],
-    production_like: bool,
+    strict_security: bool,
     peer_addr: SocketAddr,
 ) -> Result<bool> {
     if allowed_origins.iter().any(|origin| origin == "*") {
@@ -935,7 +999,7 @@ fn origin_allowed(
 
     if allowed_origins.is_empty() {
         return Ok(
-            !production_like || origin_matches_request_endpoint(app, headers, origin, peer_addr)?
+            !strict_security || origin_matches_request_endpoint(app, headers, origin, peer_addr)?
         );
     }
 
@@ -1126,33 +1190,58 @@ async fn handle_socket(
         .register_reserved(identity, connection_permit)
         .await;
     let (mut sender, mut receiver) = socket.split();
+    let mut writer_shutdown = state.shutdown_tx.subscribe();
+    let mut connection_shutdown = state.shutdown_tx.subscribe();
 
     // Writer task: serializes WriterCommands into WebSocket frames.
     let writer = tokio::spawn(async move {
-        while let Some(command) = outbound.recv().await {
-            match command {
-                WriterCommand::Json(message) => {
-                    let payload = match serde_json::to_string(&message) {
-                        Ok(p) => p,
-                        Err(_) => continue,
+        loop {
+            if *writer_shutdown.borrow() {
+                let _ = sender
+                    .send(Message::Close(Some(server_shutdown_close_frame())))
+                    .await;
+                break;
+            }
+
+            tokio::select! {
+                biased;
+                changed = writer_shutdown.changed() => {
+                    if changed.is_err() || *writer_shutdown.borrow() {
+                        let _ = sender
+                            .send(Message::Close(Some(server_shutdown_close_frame())))
+                            .await;
+                        break;
+                    }
+                }
+                command = outbound.recv() => {
+                    let Some(command) = command else {
+                        break;
                     };
-                    if sender.send(Message::Text(payload.into())).await.is_err() {
-                        break;
+                    match command {
+                        WriterCommand::Json(message) => {
+                            let payload = match serde_json::to_string(&message) {
+                                Ok(payload) => payload,
+                                Err(_) => continue,
+                            };
+                            if sender.send(Message::Text(payload.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        WriterCommand::Ping => {
+                            if sender.send(Message::Ping(vec![].into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        WriterCommand::Pong(payload) => {
+                            if sender.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        WriterCommand::Close => {
+                            let _ = sender.send(Message::Close(None)).await;
+                            break;
+                        }
                     }
-                }
-                WriterCommand::Ping => {
-                    if sender.send(Message::Ping(vec![].into())).await.is_err() {
-                        break;
-                    }
-                }
-                WriterCommand::Pong(payload) => {
-                    if sender.send(Message::Pong(payload)).await.is_err() {
-                        break;
-                    }
-                }
-                WriterCommand::Close => {
-                    let _ = sender.send(Message::Close(None)).await;
-                    break;
                 }
             }
         }
@@ -1203,10 +1292,23 @@ async fn handle_socket(
         }
     });
 
-    while let Some(result) = receiver.next().await {
-        let message = match result {
-            Ok(message) => message,
-            Err(_) => break,
+    let mut shutdown_requested = *connection_shutdown.borrow();
+    while !shutdown_requested {
+        let result = tokio::select! {
+            biased;
+            changed = connection_shutdown.changed() => {
+                if changed.is_err() || *connection_shutdown.borrow() {
+                    shutdown_requested = true;
+                }
+                continue;
+            }
+            result = receiver.next() => result,
+        };
+        let Some(result) = result else {
+            break;
+        };
+        let Ok(message) = result else {
+            break;
         };
 
         match message {
@@ -1232,14 +1334,53 @@ async fn handle_socket(
         }
     }
 
+    let shutdown_timeout = state.shutdown_timeout;
     state.close_connection(connection_id).await;
-    abort_websocket_connection_task("writer", writer).await;
+    if shutdown_requested {
+        drain_websocket_connection_task("writer", writer, shutdown_timeout).await;
+    } else {
+        abort_websocket_connection_task("writer", writer).await;
+    }
     abort_websocket_connection_task("heartbeat", heartbeat).await;
+}
+
+fn server_shutdown_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: close_code::AWAY,
+        reason: SERVER_SHUTDOWN_CLOSE_REASON.into(),
+    }
+}
+
+async fn drain_websocket_connection_task(
+    name: &'static str,
+    mut handle: JoinHandle<()>,
+    timeout: Duration,
+) {
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(result) => report_websocket_connection_task_result(name, result),
+        Err(_) => {
+            tracing::warn!(
+                target: "foundry.websocket",
+                task = name,
+                timeout_ms = timeout.as_millis() as u64,
+                "websocket connection task did not drain before shutdown timeout; aborting"
+            );
+            handle.abort();
+            report_websocket_connection_task_result(name, handle.await);
+        }
+    }
 }
 
 async fn abort_websocket_connection_task(name: &'static str, handle: JoinHandle<()>) {
     handle.abort();
-    match handle.await {
+    report_websocket_connection_task_result(name, handle.await);
+}
+
+fn report_websocket_connection_task_result(
+    name: &'static str,
+    result: std::result::Result<(), tokio::task::JoinError>,
+) {
+    match result {
         Ok(()) => {}
         Err(error) if error.is_cancelled() => {}
         Err(error) if error.is_panic() => {
@@ -1843,6 +1984,15 @@ impl ConnectionHub {
         Some(self.close_state(&mut hub, connection_id, state))
     }
 
+    async fn drain(&self) -> Vec<ClosedConnection> {
+        let mut hub = self.state.write().await;
+        let connections = std::mem::take(&mut hub.connections);
+        connections
+            .into_iter()
+            .map(|(connection_id, state)| self.close_state(&mut hub, connection_id, state))
+            .collect()
+    }
+
     async fn subscribe(
         &self,
         connection_id: u64,
@@ -2175,8 +2325,8 @@ impl ConnectionHub {
         state.message_count <= max_per_second
     }
 
-    /// Force-disconnect all connections belonging to a given actor.
-    async fn disconnect_by_actor(&self, actor_id: &str) -> Vec<ClosedConnection> {
+    /// Force-disconnect connections belonging to an actor under one guard.
+    async fn disconnect_actor(&self, guard: &GuardId, actor_id: &str) -> Vec<ClosedConnection> {
         let mut hub = self.state.write().await;
         let to_remove: Vec<u64> = hub
             .connections
@@ -2184,8 +2334,8 @@ impl ConnectionHub {
             .filter(|(_, state)| {
                 state
                     .actors
-                    .values()
-                    .any(|cached| cached.actor.id == actor_id)
+                    .get(guard)
+                    .is_some_and(|cached| cached.actor.id == actor_id)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -2414,12 +2564,13 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use axum::body::to_bytes;
+    use tokio_tungstenite::tungstenite;
 
     use crate::config::ConfigRepository;
     use crate::foundation::{AppContext, Container};
     use crate::support::runtime::RuntimeBackend;
     use crate::validation::RuleRegistry;
-    use crate::websocket::WebSocketRegistrar;
+    use crate::websocket::{WebSocketChannelOptions, WebSocketRegistrar};
 
     #[test]
     fn message_routing_matches_room_contract() {
@@ -2572,6 +2723,55 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn force_disconnect_is_scoped_by_guard_when_actor_ids_match() {
+        let hub = ConnectionHub::new(None, 1);
+        let (user_connection, mut user_rx, _user_pong) =
+            hub.register(ConnectionIdentity::default()).await;
+        let (admin_connection, mut admin_rx, _admin_pong) =
+            hub.register(ConnectionIdentity::default()).await;
+
+        hub.cache_actor(
+            user_connection,
+            Actor::new("42", GuardId::new("user")),
+            ConnectionCredentialKind::Bearer,
+            0,
+        )
+        .await
+        .unwrap();
+        hub.cache_actor(
+            admin_connection,
+            Actor::new("42", GuardId::new("admin")),
+            ConnectionCredentialKind::Bearer,
+            0,
+        )
+        .await
+        .unwrap();
+
+        let closed = hub.disconnect_actor(&GuardId::new("user"), "42").await;
+
+        assert_eq!(closed.len(), 1);
+        assert!(matches!(user_rx.recv().await, Some(WriterCommand::Close)));
+        assert!(hub
+            .cached_actor(user_connection, &GuardId::new("user"))
+            .await
+            .is_err());
+        assert_eq!(
+            hub.cached_actor(admin_connection, &GuardId::new("admin"))
+                .await
+                .unwrap()
+                .unwrap()
+                .actor
+                .id,
+            "42"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), admin_rx.recv())
+                .await
+                .is_err()
+        );
+    }
+
     fn test_app() -> AppContext {
         AppContext::new(
             Container::new(),
@@ -2599,6 +2799,72 @@ mod tests {
             RuntimeBackend::memory(namespace),
             ws_config,
         )
+    }
+
+    async fn bound_test_server(state: WebSocketServerState) -> BoundWebSocketServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route(&state.ws_config.path, get(websocket_handler))
+            .with_state(state.clone());
+        BoundWebSocketServer {
+            listener,
+            router,
+            local_addr,
+            state,
+            pubsub_task: None,
+        }
+    }
+
+    async fn subscribe_test_socket(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        channel: &ChannelId,
+        room: Option<&str>,
+    ) {
+        socket
+            .send(tungstenite::Message::Text(
+                serde_json::to_string(&ClientMessage {
+                    action: ClientAction::Subscribe,
+                    channel: channel.clone(),
+                    room: room.map(ToOwned::to_owned),
+                    payload: None,
+                    event: None,
+                    ack_id: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("timed out waiting for subscription acknowledgement")
+            .expect("websocket closed before subscription acknowledgement")
+            .unwrap();
+        let message: ServerMessage = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(message.event, SUBSCRIBED_EVENT);
+    }
+
+    async fn assert_server_shutdown_close(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        let frame = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("timed out waiting for server shutdown close frame")
+            .expect("websocket ended without a server shutdown close frame")
+            .unwrap();
+        let tungstenite::Message::Close(Some(frame)) = frame else {
+            panic!("expected server shutdown close frame, got {frame:?}");
+        };
+        assert_eq!(
+            frame.code,
+            tungstenite::protocol::frame::coding::CloseCode::Away
+        );
+        assert_eq!(frame.reason, SERVER_SHUTDOWN_CLOSE_REASON);
     }
 
     #[tokio::test]
@@ -3448,13 +3714,109 @@ mod tests {
     async fn bound_server_exits_when_shutdown_future_completes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
+        let state = websocket_state(Vec::new(), "ws-bound-server-shutdown");
         let server = BoundWebSocketServer {
             listener,
             router: axum::Router::new(),
             local_addr,
+            state,
             pubsub_task: None,
         };
 
         server.serve_until(async {}).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_server_shutdown_closes_live_socket_and_cleans_subscription_lifecycle() {
+        let leave_called = Arc::new(AtomicBool::new(false));
+        let mut registrar = WebSocketRegistrar::new();
+        let channel = ChannelId::new("shutdown_presence");
+        registrar
+            .channel_with_options(
+                channel.clone(),
+                |_context: WebSocketContext, _payload: serde_json::Value| async { Ok(()) },
+                WebSocketChannelOptions::new().presence(true).on_leave({
+                    let leave_called = leave_called.clone();
+                    move |_context| {
+                        let leave_called = leave_called.clone();
+                        async move {
+                            leave_called.store(true, Ordering::Release);
+                            Ok(())
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+        let state = websocket_state(registrar.into_channels(), "ws-bound-server-live-shutdown");
+        let server = bound_test_server(state.clone()).await;
+        let local_addr = server.local_addr();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{local_addr}/ws"))
+            .await
+            .unwrap();
+        subscribe_test_socket(&mut socket, &channel, Some("team")).await;
+        let presence_key = crate::websocket::presence_scope_key(&channel, Some("team"));
+        assert_eq!(state.backend.scard(&presence_key).await.unwrap(), 1);
+
+        shutdown_tx.send(()).unwrap();
+        assert_server_shutdown_close(&mut socket).await;
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("websocket server did not finish bounded shutdown")
+            .unwrap()
+            .unwrap();
+
+        assert!(state.hub.state.read().await.connections.is_empty());
+        assert_eq!(state.backend.scard(&presence_key).await.unwrap(), 0);
+        assert!(leave_called.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn bound_server_shutdown_timeout_caps_stalled_lifecycle_cleanup() {
+        let mut registrar = WebSocketRegistrar::new();
+        let channel = ChannelId::new("shutdown_stall");
+        registrar
+            .channel_with_options(
+                channel.clone(),
+                |_context: WebSocketContext, _payload: serde_json::Value| async { Ok(()) },
+                WebSocketChannelOptions::new()
+                    .on_leave(|_context| async { std::future::pending::<Result<()>>().await }),
+            )
+            .unwrap();
+        let mut state = websocket_state(
+            registrar.into_channels(),
+            "ws-bound-server-stalled-shutdown",
+        );
+        state.shutdown_timeout = Duration::from_millis(25);
+        let server = bound_test_server(state.clone()).await;
+        let local_addr = server.local_addr();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_until(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{local_addr}/ws"))
+            .await
+            .unwrap();
+        subscribe_test_socket(&mut socket, &channel, None).await;
+
+        shutdown_tx.send(()).unwrap();
+        assert_server_shutdown_close(&mut socket).await;
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("stalled lifecycle cleanup exceeded the shutdown bound")
+            .unwrap()
+            .unwrap();
+        assert!(state.hub.state.read().await.connections.is_empty());
     }
 }

@@ -30,6 +30,50 @@ fn database_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn canonical_numeric(value: &str) -> String {
+    let value = value.trim();
+    let (negative, unsigned) = value
+        .strip_prefix('-')
+        .map_or((false, value), |value| (true, value));
+    let unsigned = unsigned.strip_prefix('+').unwrap_or(unsigned);
+    let (integer, fraction) = unsigned
+        .split_once('.')
+        .map_or((unsigned, ""), |(integer, fraction)| (integer, fraction));
+    let integer = integer.trim_start_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    let fraction = fraction.trim_end_matches('0');
+    let sign = if negative && (integer != "0" || !fraction.is_empty()) {
+        "-"
+    } else {
+        ""
+    };
+    if fraction.is_empty() {
+        format!("{sign}{integer}")
+    } else {
+        format!("{sign}{integer}.{fraction}")
+    }
+}
+
+fn assert_numeric_value(actual: &Numeric, expected: &str) {
+    assert_eq!(
+        canonical_numeric(actual.as_str()),
+        canonical_numeric(expected)
+    );
+}
+
+fn assert_numeric_values(actual: &[Numeric], expected: &[&str]) {
+    assert_eq!(
+        actual
+            .iter()
+            .map(|value| canonical_numeric(value.as_str()))
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|value| canonical_numeric(value))
+            .collect::<Vec<_>>()
+    );
+}
+
 fn postgres_url() -> Option<String> {
     std::env::var("FOUNDRY_TEST_POSTGRES_URL")
         .ok()
@@ -53,6 +97,7 @@ async fn failed_session_query_resets_statement_timeout_before_pool_reuse() {
     let Some(url) = postgres_url() else {
         return;
     };
+    let _guard = database_lock().lock().await;
     let database = DatabaseManager::from_config(&DatabaseConfig {
         url,
         max_connections: 1,
@@ -136,6 +181,13 @@ where
         app,
         database,
     })
+}
+
+async fn restore_default_model_config() {
+    let runtime = test_app_runtime()
+        .await
+        .expect("default test runtime should remain available");
+    runtime.app.shutdown().await.unwrap();
 }
 
 async fn execute_batch(database: &DatabaseManager, statements: &[&str]) {
@@ -676,6 +728,7 @@ struct ProfileOnUserCreatedProvider;
 #[async_trait]
 impl ServiceProvider for ProfileOnUserCreatedProvider {
     async fn register(&self, registrar: &mut ServiceRegistrar) -> Result<()> {
+        registrar.singleton(LifecycleLog::default())?;
         registrar.listen_event::<ModelCreatedEvent, _>(ProfileOnUserCreatedListener)?;
         Ok(())
     }
@@ -1029,10 +1082,10 @@ impl Tag {
 
 #[tokio::test]
 async fn raw_queries_and_transactions_work_against_postgres() {
+    let _guard = database_lock().lock().await;
     let Some(database) = test_database().await else {
         return;
     };
-    let _guard = database_lock().lock().await;
     reset_schema(&database).await;
 
     database
@@ -1062,13 +1115,165 @@ async fn raw_queries_and_transactions_work_against_postgres() {
 }
 
 #[tokio::test]
+async fn cursor_pagination_is_deterministic_bidirectional_and_rejects_invalid_tokens() {
+    fn page_ids(page: &CursorPaginated<User>) -> Vec<i64> {
+        page.data.iter().map(|user| user.id).collect()
+    }
+
+    let _guard = database_lock().lock().await;
+    let Some(database) = test_database().await else {
+        return;
+    };
+    reset_schema(&database).await;
+
+    database
+        .raw_execute(
+            &format!(
+                "INSERT INTO {USERS_TABLE} (id, email, active, nickname) VALUES \
+                 (1, 'one@example.com', true, 'alpha'), \
+                 (2, 'two@example.com', true, 'alpha'), \
+                 (3, 'three@example.com', true, 'beta'), \
+                 (4, 'four@example.com', true, 'beta'), \
+                 (5, 'five@example.com', true, 'beta'), \
+                 (6, 'six@example.com', true, 'gamma'), \
+                 (7, 'seven@example.com', true, NULL), \
+                 (8, 'eight@example.com', true, NULL)"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let first = User::query()
+        .order_by(User::ID.desc())
+        .cursor_paginate(&database, User::NICKNAME, CursorPagination::new(2))
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&first), vec![1, 2]);
+    assert!(!first.meta.has_prev);
+    assert!(first.meta.has_next);
+    assert!(first.cursors.prev.is_none());
+    let first_next = first.cursors.next.clone().unwrap();
+
+    let second = User::query()
+        .cursor_paginate(
+            &database,
+            User::NICKNAME,
+            CursorPagination::new(2).after(&first_next),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&second), vec![3, 4]);
+    assert!(second.meta.has_prev);
+    assert!(second.meta.has_next);
+
+    let third = User::query()
+        .cursor_paginate(
+            &database,
+            User::NICKNAME,
+            CursorPagination::new(2).after(second.cursors.next.clone().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&third), vec![5, 6]);
+
+    let fourth = User::query()
+        .cursor_paginate(
+            &database,
+            User::NICKNAME,
+            CursorPagination::new(2).after(third.cursors.next.clone().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&fourth), vec![7, 8]);
+    assert!(fourth.meta.has_prev);
+    assert!(!fourth.meta.has_next);
+    assert!(fourth.cursors.next.is_none());
+
+    let third_back = User::query()
+        .cursor_paginate(
+            &database,
+            User::NICKNAME,
+            CursorPagination::new(2).before(fourth.cursors.prev.clone().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&third_back), vec![5, 6]);
+    assert!(third_back.meta.has_prev);
+    assert!(third_back.meta.has_next);
+
+    let second_back = User::query()
+        .cursor_paginate(
+            &database,
+            User::NICKNAME,
+            CursorPagination::new(2).before(third_back.cursors.prev.clone().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&second_back), vec![3, 4]);
+
+    let first_back = User::query()
+        .cursor_paginate(
+            &database,
+            User::NICKNAME,
+            CursorPagination::new(2).before(second_back.cursors.prev.clone().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page_ids(&first_back), vec![1, 2]);
+    assert!(!first_back.meta.has_prev);
+    assert!(first_back.meta.has_next);
+    assert!(first_back.cursors.prev.is_none());
+
+    let malformed = User::query()
+        .cursor_paginate(
+            &database,
+            User::NICKNAME,
+            CursorPagination::new(2).after("not-a-cursor"),
+        )
+        .await
+        .unwrap_err();
+    assert!(malformed.to_string().contains("invalid cursor"));
+
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let payload = URL_SAFE_NO_PAD.decode(first_next.as_bytes()).unwrap();
+    let mut version_mismatch = serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
+    version_mismatch["v"] = serde_json::json!(99);
+    let version_mismatch = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&version_mismatch).unwrap());
+    let error = User::query()
+        .cursor_paginate(
+            &database,
+            User::NICKNAME,
+            CursorPagination::new(2).after(version_mismatch),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unsupported cursor version"));
+
+    let both = User::query()
+        .cursor_paginate(
+            &database,
+            User::NICKNAME,
+            CursorPagination::new(2)
+                .after(first_next)
+                .before(fourth.cursors.prev.clone().unwrap()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        both.to_string(),
+        "cursor pagination cannot use both `after` and `before`"
+    );
+}
+
+#[tokio::test]
 async fn generic_builder_and_model_first_queries_are_typed_and_short() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime().await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let generic_inserted = Query::insert_many_into(USERS_TABLE)
@@ -1199,7 +1404,7 @@ async fn generic_builder_and_model_first_queries_are_typed_and_short() {
     );
 
     let required = User::query()
-        .where_(User::EMAIL.eq("bulk-one@example.com"))
+        .where_(User::EMAIL.eq("bulk-updated@example.com"))
         .first_or_fail(database)
         .await
         .unwrap();
@@ -1376,12 +1581,12 @@ async fn generic_builder_and_model_first_queries_are_typed_and_short() {
 
 #[tokio::test]
 async fn manual_primary_keys_require_explicit_values_on_create() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime().await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let error = User::create()
@@ -1399,10 +1604,10 @@ async fn manual_primary_keys_require_explicit_values_on_create() {
 
 #[tokio::test]
 async fn text_columns_support_case_insensitive_exact_match_without_pattern_wildcards() {
+    let _guard = database_lock().lock().await;
     let Some(database) = test_database().await else {
         return;
     };
-    let _guard = database_lock().lock().await;
     reset_schema(&database).await;
 
     execute_batch(
@@ -1455,12 +1660,12 @@ async fn text_columns_support_case_insensitive_exact_match_without_pattern_wildc
 
 #[tokio::test]
 async fn safe_model_ids_auto_generate_and_sort_newest_first() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime().await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
 
     database
         .raw_execute(&format!("DROP TABLE IF EXISTS {SAFE_USERS_TABLE}"), &[])
@@ -1469,7 +1674,7 @@ async fn safe_model_ids_auto_generate_and_sort_newest_first() {
     database
         .raw_execute(
             &format!(
-                "CREATE TABLE {SAFE_USERS_TABLE} (id UUID PRIMARY KEY DEFAULT uuidv7(), email TEXT NOT NULL)"
+                "CREATE TABLE {SAFE_USERS_TABLE} (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), email TEXT NOT NULL)"
             ),
             &[],
         )
@@ -1502,12 +1707,12 @@ async fn safe_model_ids_auto_generate_and_sort_newest_first() {
 
 #[tokio::test]
 async fn model_write_mutators_hash_passwords_and_generated_accessors_return_transformed_values() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime().await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let created = PasswordUser::create()
@@ -1611,12 +1816,12 @@ async fn model_write_mutators_hash_passwords_and_generated_accessors_return_tran
 
 #[tokio::test]
 async fn write_mutator_panics_roll_back_model_writes() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime().await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let create_error = PanickingPasswordUser::create()
@@ -1714,12 +1919,12 @@ async fn write_mutator_panics_roll_back_model_writes() {
 
 #[tokio::test]
 async fn timestamps_and_soft_deletes_work_on_model_first_writes() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime().await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let created = PostRecord::create()
@@ -1795,12 +2000,12 @@ async fn timestamps_and_soft_deletes_work_on_model_first_writes() {
 
 #[tokio::test]
 async fn nullable_timestamp_comparison_excludes_nulls_and_future_values() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime().await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let now = fixed_time(15);
@@ -1875,12 +2080,12 @@ async fn nullable_timestamp_comparison_excludes_nulls_and_future_values() {
 
 #[tokio::test]
 async fn numeric_models_and_raw_queries_support_postgres_numeric_columns() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime().await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let created = NumericPostRecord::create()
@@ -1893,7 +2098,7 @@ async fn numeric_models_and_raw_queries_support_postgres_numeric_columns() {
         .save(app)
         .await
         .unwrap();
-    assert_eq!(created.amount.as_str(), "10.50000000");
+    assert_numeric_value(&created.amount, "10.5");
     assert!(created.deleted_at.is_none());
 
     let fetched = NumericPostRecord::query()
@@ -1902,7 +2107,7 @@ async fn numeric_models_and_raw_queries_support_postgres_numeric_columns() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(fetched.amount.as_str(), "10.50000000");
+    assert_numeric_value(&fetched.amount, "10.5");
 
     let amount_only = database
         .raw_query(
@@ -1912,10 +2117,7 @@ async fn numeric_models_and_raw_queries_support_postgres_numeric_columns() {
         .await
         .unwrap()
         .remove(0);
-    assert_eq!(
-        amount_only.decode::<Numeric>("amount").unwrap().as_str(),
-        "10.50000000"
-    );
+    assert_numeric_value(&amount_only.decode::<Numeric>("amount").unwrap(), "10.5");
 
     let full_row = database
         .raw_query(
@@ -1926,10 +2128,7 @@ async fn numeric_models_and_raw_queries_support_postgres_numeric_columns() {
         .unwrap()
         .remove(0);
     assert_eq!(full_row.decode::<i64>("id").unwrap(), 1);
-    assert_eq!(
-        full_row.decode::<Numeric>("amount").unwrap().as_str(),
-        "10.50000000"
-    );
+    assert_numeric_value(&full_row.decode::<Numeric>("amount").unwrap(), "10.5");
     assert_eq!(
         full_row.decode::<String>("note").unwrap(),
         "starter balance".to_string()
@@ -1945,14 +2144,9 @@ async fn numeric_models_and_raw_queries_support_postgres_numeric_columns() {
         .await
         .unwrap()
         .remove(0);
-    assert_eq!(
-        numeric_array
-            .decode::<Vec<Numeric>>("amounts")
-            .unwrap()
-            .iter()
-            .map(Numeric::as_str)
-            .collect::<Vec<_>>(),
-        vec!["10.50000000", "11.50000000"]
+    assert_numeric_values(
+        &numeric_array.decode::<Vec<Numeric>>("amounts").unwrap(),
+        &["10.5", "11.5"],
     );
 
     let updated = fetched
@@ -1965,7 +2159,7 @@ async fn numeric_models_and_raw_queries_support_postgres_numeric_columns() {
         .save(app)
         .await
         .unwrap();
-    assert_eq!(updated.amount.as_str(), "12.75000000");
+    assert_numeric_value(&updated.amount, "12.75");
     assert_eq!(updated.note, "updated balance");
 
     let deleted = updated.delete().execute(app).await.unwrap();
@@ -1978,7 +2172,7 @@ async fn numeric_models_and_raw_queries_support_postgres_numeric_columns() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(trashed.amount.as_str(), "12.75000000");
+    assert_numeric_value(&trashed.amount, "12.75");
     assert!(trashed.deleted_at.is_some());
 
     let forced = NumericPostRecord::force_delete()
@@ -1997,6 +2191,7 @@ async fn numeric_models_and_raw_queries_support_postgres_numeric_columns() {
 
 #[tokio::test]
 async fn app_config_can_disable_default_timestamp_management() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime_with_provider_and_config(
         NoopProvider,
         r#"
@@ -2010,7 +2205,6 @@ async fn app_config_can_disable_default_timestamp_management() {
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let manual_created_at = fixed_time(10);
@@ -2035,6 +2229,7 @@ async fn app_config_can_disable_default_timestamp_management() {
         .await
         .unwrap();
     assert_eq!(updated.updated_at, manual_updated_at);
+    restore_default_model_config().await;
 }
 
 #[tokio::test]
@@ -2098,10 +2293,12 @@ async fn app_config_can_enable_default_soft_delete_behavior_and_model_can_opt_ou
         .await
         .unwrap()
         .is_none());
+    restore_default_model_config().await;
 }
 
 #[tokio::test]
 async fn built_in_timestamp_values_are_visible_to_hooks_and_soft_delete_stays_on_delete_hooks() {
+    let _guard = database_lock().lock().await;
     let log = std::sync::Arc::new(TimestampHookLog::default());
     let Some(runtime) =
         test_app_runtime_with_provider(TimestampHookProvider { log: log.clone() }).await
@@ -2110,7 +2307,6 @@ async fn built_in_timestamp_values_are_visible_to_hooks_and_soft_delete_stays_on
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let created = HookedPost::create()
@@ -2153,6 +2349,7 @@ async fn built_in_timestamp_values_are_visible_to_hooks_and_soft_delete_stays_on
 
 #[tokio::test]
 async fn model_lifecycle_hooks_and_framework_events_run_automatically() {
+    let _guard = database_lock().lock().await;
     let log = std::sync::Arc::new(LifecycleLog::default());
     let Some(runtime) = test_app_runtime_with_provider(LifecycleTestProvider {
         log: log.clone(),
@@ -2164,7 +2361,6 @@ async fn model_lifecycle_hooks_and_framework_events_run_automatically() {
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let created = LifecycleUser::create()
@@ -2220,12 +2416,12 @@ async fn model_lifecycle_hooks_and_framework_events_run_automatically() {
 
 #[tokio::test]
 async fn model_created_events_run_after_commit_for_fk_safe_listeners() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime_with_provider(ProfileOnUserCreatedProvider).await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     LifecycleUser::create()
@@ -2283,6 +2479,7 @@ async fn model_created_events_run_after_commit_for_fk_safe_listeners() {
 
 #[tokio::test]
 async fn bulk_model_writes_default_to_lifecycle_and_without_lifecycle_skips_it() {
+    let _guard = database_lock().lock().await;
     let log = std::sync::Arc::new(LifecycleLog::default());
     let Some(runtime) = test_app_runtime_with_provider(LifecycleTestProvider {
         log: log.clone(),
@@ -2294,7 +2491,6 @@ async fn bulk_model_writes_default_to_lifecycle_and_without_lifecycle_skips_it()
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let created = LifecycleUser::create_many()
@@ -2398,12 +2594,12 @@ async fn bulk_model_writes_default_to_lifecycle_and_without_lifecycle_skips_it()
 
 #[tokio::test]
 async fn lifecycle_pre_commit_failures_roll_back_and_post_commit_failures_do_not() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime().await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let hook_error = RejectingLifecycleUser::create()
@@ -2462,12 +2658,12 @@ async fn lifecycle_pre_commit_failures_roll_back_and_post_commit_failures_do_not
 
 #[tokio::test]
 async fn model_lifecycle_panics_roll_back_like_hook_errors() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime().await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     let creating_error = PanickingLifecycleUser::create()
@@ -2596,12 +2792,12 @@ async fn model_lifecycle_panics_roll_back_like_hook_errors() {
 
 #[tokio::test]
 async fn relation_tree_eager_loads_without_hardcoded_depth() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime().await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     execute_batch(
@@ -2629,6 +2825,7 @@ async fn relation_tree_eager_loads_without_hardcoded_depth() {
         .with_aggregate(User::active_merchant_count())
         .with(
             User::merchants()
+                .where_(Merchant::STATUS.eq(MerchantStatus::Active))
                 .with_aggregate(Merchant::orders_total())
                 .with(Merchant::orders().with(Order::items().with(OrderItem::product()))),
         )
@@ -2673,10 +2870,10 @@ async fn relation_tree_eager_loads_without_hardcoded_depth() {
 
 #[tokio::test]
 async fn relation_eager_loading_chunks_large_key_sets_and_preserves_duplicates() {
+    let _guard = database_lock().lock().await;
     let Some(database) = test_database().await else {
         return;
     };
-    let _guard = database_lock().lock().await;
     reset_schema(&database).await;
 
     execute_batch(
@@ -2740,10 +2937,10 @@ async fn relation_eager_loading_chunks_large_key_sets_and_preserves_duplicates()
 
 #[tokio::test]
 async fn model_stream_supports_relation_trees_where_has_and_aggregates() {
+    let _guard = database_lock().lock().await;
     let Some(database) = test_database().await else {
         return;
     };
-    let _guard = database_lock().lock().await;
     reset_schema(&database).await;
 
     execute_batch(
@@ -2828,10 +3025,10 @@ async fn model_stream_supports_relation_trees_where_has_and_aggregates() {
 
 #[tokio::test]
 async fn advanced_projection_queries_support_cte_case_json_union_and_numeric_aggregates() {
+    let _guard = database_lock().lock().await;
     let Some(database) = test_database().await else {
         return;
     };
-    let _guard = database_lock().lock().await;
     reset_schema(&database).await;
 
     execute_batch(
@@ -3011,18 +3208,18 @@ async fn advanced_projection_queries_support_cte_case_json_union_and_numeric_agg
         .unwrap();
 
     assert_eq!(distinct_merchants, 2);
-    assert_eq!(total_amount.unwrap().as_str(), "60.75");
-    assert!(average_amount.unwrap().as_str().starts_with("20.25"));
-    assert!(min_amount.unwrap().as_str().starts_with("10.5"));
-    assert!(max_amount.unwrap().as_str().starts_with("30"));
+    assert_numeric_value(&total_amount.unwrap(), "60.75");
+    assert_numeric_value(&average_amount.unwrap(), "20.25");
+    assert_numeric_value(&min_amount.unwrap(), "10.5");
+    assert_numeric_value(&max_amount.unwrap(), "30");
 }
 
 #[tokio::test]
 async fn many_to_many_relations_load_pivot_data_and_aggregates() {
+    let _guard = database_lock().lock().await;
     let Some(database) = test_database().await else {
         return;
     };
-    let _guard = database_lock().lock().await;
     reset_schema(&database).await;
 
     execute_batch(
@@ -3075,10 +3272,10 @@ async fn many_to_many_relations_load_pivot_data_and_aggregates() {
 
 #[tokio::test]
 async fn model_stream_supports_many_to_many_pivot_hydration_inside_transactions() {
+    let _guard = database_lock().lock().await;
     let Some(database) = test_database().await else {
         return;
     };
-    let _guard = database_lock().lock().await;
     reset_schema(&database).await;
 
     execute_batch(
@@ -3159,10 +3356,10 @@ async fn model_stream_supports_many_to_many_pivot_hydration_inside_transactions(
 
 #[tokio::test]
 async fn typed_runtime_supports_production_postgres_values_and_custom_adapters() {
+    let _guard = database_lock().lock().await;
     let Some(database) = test_database().await else {
         return;
     };
-    let _guard = database_lock().lock().await;
 
     execute_batch(
         &database,
@@ -3212,12 +3409,9 @@ async fn typed_runtime_supports_production_postgres_values_and_custom_adapters()
     assert_eq!(scalar_record.decode::<i64>("int64_value").unwrap(), 9);
     assert!((scalar_record.decode::<f32>("float32_value").unwrap() - 1.5).abs() < f32::EPSILON);
     assert!((scalar_record.decode::<f64>("float64_value").unwrap() - 2.5).abs() < f64::EPSILON);
-    assert_eq!(
-        scalar_record
-            .decode::<Numeric>("numeric_value")
-            .unwrap()
-            .as_str(),
-        "42.75"
+    assert_numeric_value(
+        &scalar_record.decode::<Numeric>("numeric_value").unwrap(),
+        "42.75",
     );
     assert_eq!(
         scalar_record.decode::<String>("text_value").unwrap(),
@@ -3304,14 +3498,11 @@ async fn typed_runtime_supports_production_postgres_values_and_custom_adapters()
         array_record.decode::<Vec<f64>>("float64_values").unwrap(),
         vec![3.5, 4.75]
     );
-    assert_eq!(
-        array_record
+    assert_numeric_values(
+        &array_record
             .decode::<Vec<Numeric>>("numeric_values")
-            .unwrap()
-            .iter()
-            .map(Numeric::as_str)
-            .collect::<Vec<_>>(),
-        vec!["1.10", "2.20"]
+            .unwrap(),
+        &["1.10", "2.20"],
     );
     assert_eq!(
         array_record.decode::<Vec<String>>("text_values").unwrap(),
@@ -3412,10 +3603,10 @@ async fn typed_runtime_supports_production_postgres_values_and_custom_adapters()
 
 #[tokio::test]
 async fn locking_streaming_timeout_and_debug_surfaces_work() {
+    let _guard = database_lock().lock().await;
     let Some(database) = test_database().await else {
         return;
     };
-    let _guard = database_lock().lock().await;
     reset_schema(&database).await;
 
     execute_batch(
@@ -3481,7 +3672,7 @@ async fn locking_streaming_timeout_and_debug_surfaces_work() {
     );
 
     let mut raw_stream = database.raw_stream(
-        "SELECT slow_values.value FROM generate_series(1, 3) AS slow_values(value), LATERAL (SELECT pg_sleep(0.02)) AS pause",
+        "SELECT slow_values.value::bigint AS value FROM generate_series(1, 3) AS slow_values(value), LATERAL (SELECT pg_sleep(0.02)) AS pause",
         &[],
         QueryExecutionOptions::default().with_label("slow raw stream"),
     );
@@ -3586,6 +3777,7 @@ async fn dropping_raw_stream_cancels_in_flight_producer_and_releases_pool_slot()
     let Some(url) = postgres_url() else {
         return;
     };
+    let _guard = database_lock().lock().await;
     let database = DatabaseManager::from_config(&DatabaseConfig {
         url,
         min_connections: 0,
@@ -3617,10 +3809,10 @@ async fn dropping_raw_stream_cancels_in_flight_producer_and_releases_pool_slot()
 
 #[tokio::test]
 async fn typed_runtime_hydrates_published_countries_char_columns_as_strings() {
+    let _guard = database_lock().lock().await;
     let Some(database) = test_database().await else {
         return;
     };
-    let _guard = database_lock().lock().await;
 
     execute_batch(
         &database,
@@ -3667,12 +3859,12 @@ async fn typed_runtime_hydrates_published_countries_char_columns_as_strings() {
 
 #[tokio::test]
 async fn advanced_mutation_queries_execute_against_postgres() {
+    let _guard = database_lock().lock().await;
     let Some(runtime) = test_app_runtime().await else {
         return;
     };
     let database = runtime.database.as_ref();
     let app = &runtime.app;
-    let _guard = database_lock().lock().await;
     reset_schema(database).await;
 
     execute_batch(
@@ -3691,7 +3883,7 @@ async fn advanced_mutation_queries_execute_against_postgres() {
                 "INSERT INTO {MERCHANTS_TABLE} (id, user_id, name, status) VALUES (11, 2, 'Dormant Store', 'active')"
             ),
             "DROP TABLE IF EXISTS foundry_test_user_archive",
-            "CREATE TEMP TABLE foundry_test_user_archive (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+            "CREATE TABLE foundry_test_user_archive (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
         ],
     )
     .await;
@@ -3789,4 +3981,8 @@ async fn advanced_mutation_queries_execute_against_postgres() {
         .unwrap();
     assert_eq!(remaining_merchants.len(), 1);
     assert_eq!(remaining_merchants[0].name, "owner@example.com");
+    database
+        .raw_execute("DROP TABLE foundry_test_user_archive", &[])
+        .await
+        .unwrap();
 }

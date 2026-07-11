@@ -69,6 +69,7 @@ pub mod email;
 pub mod events;
 pub mod foundation;
 pub mod http;
+pub mod http_client;
 pub mod i18n;
 pub mod imaging;
 pub mod jobs;

@@ -637,6 +637,52 @@ r.route_with_options("/admin/reports", get(admin_reports),
 
 If the Actor lacks the required permission, the framework returns **403 Forbidden** automatically — no handler code needed.
 
+### Refresh current actor authorization on every credential check
+
+Credential rows and JWT claims can outlive role, permission, disabled-account,
+or deletion changes. Register one `ActorHydrator` per guard when authorization
+must be refreshed from the authoritative application store:
+
+```rust
+struct UserActorHydrator;
+
+#[async_trait]
+impl ActorHydrator for UserActorHydrator {
+    async fn hydrate(&self, credential: &Actor, app: &AppContext) -> Result<Option<Actor>> {
+        let Some(current) = load_current_user_authorization(app, &credential.id).await? else {
+            return Ok(None); // deleted or disabled: reject the credential
+        };
+
+        Ok(Some(
+            Actor::new(credential.id.clone(), credential.guard.clone())
+                .with_roles(current.roles)
+                .with_permissions(current.permissions),
+        ))
+    }
+}
+
+#[async_trait]
+impl ServiceProvider for AuthServiceProvider {
+    async fn register(&self, registrar: &mut ServiceRegistrar) -> Result<()> {
+        registrar.register_actor_hydrator(Guard::User, UserActorHydrator)?;
+        Ok(())
+    }
+}
+```
+
+The returned actor is authoritative but must preserve the credential actor's
+exact ID and guard; identity drift is rejected. `None` rejects a deleted or
+disabled identity. Hydrator errors and panics become authentication failures,
+and duplicate ownership of one guard fails bootstrap.
+
+The same frozen registry is used for token, session, and custom bearer guards
+across HTTP and WebSocket initial/revalidation paths. Full-scope tokens receive
+the actor's current permissions; an explicitly scoped token receives the
+intersection of its abilities and current permissions, so hydration cannot
+widen a token. MFA-pending actors remain restricted and intentionally bypass
+hydration until the challenge succeeds. If no hydrator is registered, existing
+credential actor behavior remains unchanged.
+
 ---
 
 ## Policies (Business-Logic)

@@ -21,6 +21,9 @@ pub(crate) fn module_description(stem: &str) -> &'static str {
         "events" => "Domain event bus with typed listeners",
         "foundation" => "Core: App, AppBuilder, AppContext, AppTransaction, Error, ServiceProvider",
         "http" => "HTTP: routes, middleware (CORS, CSRF, rate limit, etc.), cookies, resources",
+        "http_client" => {
+            "Outbound HTTP: pooled transport, timeouts, safe retries, typed responses, and fakes"
+        }
         "i18n" => "Internationalization: locale extraction, translation catalogs",
         "imaging" => "Image processing pipeline (resize, crop, rotate, format conversion)",
         "jobs" => "Background job queue with leased at-least-once delivery",
@@ -30,12 +33,15 @@ pub(crate) fn module_description(stem: &str) -> &'static str {
         "notifications" => "Multi-channel notifications: email, database, broadcast",
         "openapi" => "OpenAPI 3.1.0 spec generation (ApiSchema, RouteDoc)",
         "plugin" => "Compile-time plugin system with dependency validation",
+        "public" => "Stable convenience re-exports for consumer applications",
         "redis" => "Namespaced Redis wrapper (RedisManager, RedisConnection)",
         "scheduler" => "Cron + interval scheduling with Redis-safe leadership",
+        "settings" => "Typed persistent application settings with cache integration",
         "storage" => "File storage: local + S3, multipart uploads, file validation",
         "support" => "Utilities: typed IDs, datetime/clock, Collection<T>, crypto, hashing, locks",
-        "testing" => "Test infrastructure: TestApp, TestClient, Factory",
+        "testing" => "Test infrastructure: TestApp, clients/fakes, assertions, and model factories",
         "translations" => "Model field translations across locales (HasTranslations)",
+        "typescript" => "TypeScript contracts, route helpers, validation metadata, and SDK export",
         "validation" => "Validation: 38+ rules, custom rules, request validation extractor",
         "websocket" => "Channel-based WebSocket with presence and typed messages",
         _ => "",
@@ -82,7 +88,7 @@ fn module_notes(group_key: &str) -> &'static [&'static str] {
         ],
         "support" => &[
             "`run_blocking(label, work)` isolates CPU-heavy or blocking synchronous work on Tokio's blocking pool and maps task panics into Foundry errors.",
-            "`HashManager::hash()` and `HashManager::check()` remain synchronous; wrap password hashing or checking in `run_blocking` inside async handlers or model mutators.",
+            "`HashManager::hash()`, `HashManager::check()`, and `HashManager::needs_rehash()` remain synchronous; wrap password hashing or checking in `run_blocking` inside async handlers or model mutators.",
         ],
         "cache" => &[
             "Cache keys are validated before backend access; Redis nil/missing keys are distinct from backend failures.",
@@ -112,6 +118,11 @@ fn module_notes(group_key: &str) -> &'static [&'static str] {
             "Config-derived body-limit, request-timeout, and rate-limit rejections return JSON `ErrorResponse` bodies with HTTP 413, 408, and 429.",
             "Actor-only rate limits require an authenticated actor; use `actor_or_ip` when a global rate limit needs an IP fallback.",
             "IP rate limits use `TrustedProxy` real IP when available and otherwise fall back to TCP peer connect info on the real server path.",
+        ],
+        "http_client" => &[
+            "The default client has no base URL, a 10-second connect timeout, a 30-second per-attempt request timeout, concurrency 64, and conservative retries for read-only methods.",
+            "Mutation methods are not retried unless explicitly selected. `raw()` bypasses Foundry retry, timeout, concurrency, tracing, and fake behavior.",
+            "Framework traces redact URL credentials and query values and never record header values or bodies.",
         ],
         "jobs" => &[
             "`JobsConfig.shutdown_timeout_ms` defaults to `30000`; `0` aborts active jobs immediately on shutdown.",
@@ -163,6 +174,22 @@ mod tests {
             module_description("contract"),
             "Normalized contract manifest for generated SDKs, OpenAPI, validation, and realtime"
         );
+        assert_eq!(
+            module_description("http_client"),
+            "Outbound HTTP: pooled transport, timeouts, safe retries, typed responses, and fakes"
+        );
+        assert_eq!(
+            module_description("public"),
+            "Stable convenience re-exports for consumer applications"
+        );
+        assert_eq!(
+            module_description("settings"),
+            "Typed persistent application settings with cache integration"
+        );
+        assert_eq!(
+            module_description("typescript"),
+            "TypeScript contracts, route helpers, validation metadata, and SDK export"
+        );
     }
 
     #[test]
@@ -185,6 +212,7 @@ mod tests {
         append_module_notes("support", &mut support);
         assert!(support.contains("run_blocking"));
         assert!(support.contains("HashManager::hash()"));
+        assert!(support.contains("HashManager::needs_rehash()"));
 
         let mut jobs = String::new();
         append_module_notes("jobs", &mut jobs);

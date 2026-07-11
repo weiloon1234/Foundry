@@ -43,7 +43,13 @@ impl HttpKernel {
         if let Some(options) = &self.observability {
             let obs_config = self.app.config().observability()?;
             if obs_config.enabled {
-                if options.is_public() && self.app.config().app()?.environment.is_production_like()
+                if options.is_public()
+                    && self
+                        .app
+                        .config()
+                        .app()?
+                        .resolved_security_tier()
+                        .is_strict()
                 {
                     tracing::warn!(
                         base_path = %obs_config.base_path,

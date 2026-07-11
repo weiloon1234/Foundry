@@ -412,6 +412,54 @@ Each datatable gets three output modes with identical scoping/filtering:
 - `Datatable::download(...)`
 - `Datatable::queue_email(...)`
 
+Queued export delivery is explicit. Register one application delivery service;
+if it is absent, the job fails and follows normal retry/dead-letter behavior
+instead of reporting a successful no-op:
+
+```rust
+registrar.singleton(
+    Box::new(AppDatatableExportDelivery) as Box<dyn DatatableExportDelivery>
+)?;
+```
+
+New delivery implementations should consume the file-backed artifact without
+loading the complete XLSX into memory. Its temporary path remains valid only
+until `deliver_file` returns:
+
+```rust
+#[async_trait]
+impl DatatableExportDelivery for AppDatatableExportDelivery {
+    async fn deliver_file(
+        &self,
+        export: GeneratedDatatableExportFile,
+        recipient: &str,
+    ) -> Result<()> {
+        let stored = self.storage
+            .disk("exports")?
+            .put_file(
+                &format!("reports/{}", export.filename()),
+                export.path(),
+                Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            )
+            .await?;
+        self.notify_recipient(recipient, stored).await
+    }
+}
+```
+
+Existing implementations of `deliver(GeneratedDatatableExport, ...)` remain
+source compatible. The default `deliver_file` adapter checks the artifact's
+file metadata before allocation and buffers only files at or below
+`LEGACY_DATATABLE_EXPORT_MAX_BYTES` (25 MiB). Larger legacy deliveries fail
+with an explicit instruction to override `deliver_file`; there is no unbounded
+byte fallback.
+
+The dispatch-time actor, locale, and timezone are serialized into the job.
+Worker-side query callbacks, labels, mappings, translations, and cell formatting
+therefore observe the same presentation context as the request that queued the
+export. `DatatableContext.locale` is owned (`Option<String>`); use
+`ctx.locale.as_deref()` when a borrowed locale is convenient.
+
 Foundry caps expensive datatable outputs by default:
 
 ```toml
@@ -420,9 +468,17 @@ max_per_page = 500       # 0 = no JSON page-size cap
 max_export_rows = 50000  # 0 = no XLSX export row cap
 ```
 
-`max_per_page` clamps client-provided `DatatableRequest.per_page`. `max_export_rows`
-is applied before XLSX downloads and queued export jobs load rows into memory; if
-the filtered result is larger, Foundry returns a clear error and the operator can
-narrow filters or raise the cap.
+`max_per_page` clamps client-provided `DatatableRequest.per_page`.
+`max_export_rows` is enforced while rows stream from PostgreSQL through a
+bounded 256-row channel into `rust_xlsxwriter` constant-memory mode. A result
+above the cap fails clearly; `0` supports an unbounded row count without
+materializing the full result or worksheet cell set in memory. Queued workers
+write the completed ZIP directly to a temporary file and pass that artifact to
+`deliver_file`; it is removed after delivery on success, error, or panic
+unwinding. HTTP
+downloads still materialize their final response bytes once. With
+`max_export_rows = 0`, queued memory remains bounded but the temporary artifact
+can grow with the result, so deployments must provision appropriate temp-disk
+capacity.
 
 That keeps model tables and grouped report tables on the same framework path end-to-end.

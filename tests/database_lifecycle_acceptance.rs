@@ -9,13 +9,42 @@ use foundry::prelude::*;
 use tempfile::TempDir;
 use tokio::sync::{Mutex, MutexGuard};
 
-const CREATE_USERS_MIGRATION_ID: &str = "202604101530_create_users";
-const CREATE_PROFILES_MIGRATION_ID: &str = "202604101531_create_profiles";
-const USERS_SEED_ID: &str = "users_seed";
-const USERS_TABLE: &str = "users";
-const PROFILES_TABLE: &str = "profiles";
+const FIRST_GENERATED_MIGRATION_ID: &str = "000000000000_create_database_primitives";
+const COUNTRIES_SEED_ID: &str = "000000000001_countries_seeder";
+const GENERATED_MIGRATION_IDS: &[&str] = &[
+    "000000000000_create_database_primitives",
+    "000000000001_create_personal_access_tokens",
+    "000000000002_create_password_reset_tokens",
+    "000000000003_create_notifications",
+    "000000000004_create_job_history",
+    "000000000005_create_attachments",
+    "000000000006_create_metadata",
+    "000000000007_create_model_translations",
+    "000000000008_create_countries",
+    "000000000009_create_settings",
+    "000000000010_create_audit_logs",
+    "000000000011_create_auth_mfa_totp_factors",
+    "000000000012_index_job_history_created_at",
+    "000000000013_alter_model_translation_ids_to_text",
+    "000000000014_add_notification_notifiable_type",
+];
+const GENERATED_TABLES: &[&str] = &[
+    "personal_access_tokens",
+    "password_reset_tokens",
+    "notifications",
+    "job_history",
+    "attachments",
+    "metadata",
+    "model_translations",
+    "countries",
+    "settings",
+    "audit_logs",
+    "auth_mfa_totp_factors",
+];
 const ATOMIC_MIGRATION_ID: &str = "202607101200_create_atomic_migration_widgets";
 const ATOMIC_MIGRATION_TABLE: &str = "foundry_atomic_migration_widgets";
+const LATEST_BATCH_MIGRATION_ID: &str = "202607101201_create_latest_batch_widgets";
+const LATEST_BATCH_MIGRATION_TABLE: &str = "foundry_latest_batch_widgets";
 
 fn postgres_url() -> Option<String> {
     std::env::var("FOUNDRY_TEST_POSTGRES_URL")
@@ -70,6 +99,23 @@ impl ServiceProvider for AtomicMigrationProvider {
     }
 }
 
+#[derive(Clone)]
+struct AtomicAndLatestMigrationProvider;
+
+#[async_trait]
+impl ServiceProvider for AtomicAndLatestMigrationProvider {
+    async fn register(&self, registrar: &mut ServiceRegistrar) -> Result<()> {
+        foundry::__private::register_generated_migration_file::<AtomicLedgerMigration>(
+            registrar,
+            MigrationId::new(ATOMIC_MIGRATION_ID),
+        )?;
+        foundry::__private::register_generated_migration_file::<LatestBatchMigration>(
+            registrar,
+            MigrationId::new(LATEST_BATCH_MIGRATION_ID),
+        )
+    }
+}
+
 struct AtomicLedgerMigration;
 
 #[async_trait]
@@ -89,6 +135,35 @@ impl MigrationFile for AtomicLedgerMigration {
     async fn down(ctx: &MigrationContext<'_>) -> Result<()> {
         ctx.raw_execute(
             &format!("DROP TABLE {}", quote_identifier(ATOMIC_MIGRATION_TABLE)),
+            &[],
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+struct LatestBatchMigration;
+
+#[async_trait]
+impl MigrationFile for LatestBatchMigration {
+    async fn up(ctx: &MigrationContext<'_>) -> Result<()> {
+        ctx.raw_execute(
+            &format!(
+                "CREATE TABLE {} (id BIGINT PRIMARY KEY)",
+                quote_identifier(LATEST_BATCH_MIGRATION_TABLE)
+            ),
+            &[],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn down(ctx: &MigrationContext<'_>) -> Result<()> {
+        ctx.raw_execute(
+            &format!(
+                "DROP TABLE {}",
+                quote_identifier(LATEST_BATCH_MIGRATION_TABLE)
+            ),
             &[],
         )
         .await?;
@@ -139,17 +214,22 @@ impl TestRuntime {
     async fn cleanup(&self) {
         foundry::testing::assert_safe_to_wipe(&self.database_url)
             .expect("test database URL must be explicitly safe to wipe");
+        for table in GENERATED_TABLES {
+            let _ = self
+                .database
+                .raw_execute(
+                    &format!("DROP TABLE IF EXISTS {} CASCADE", quote_identifier(table)),
+                    &[],
+                )
+                .await;
+        }
         let _ = self
             .database
             .raw_execute(
-                &format!("DROP TABLE IF EXISTS {}", quote_identifier(PROFILES_TABLE)),
-                &[],
-            )
-            .await;
-        let _ = self
-            .database
-            .raw_execute(
-                &format!("DROP TABLE IF EXISTS {}", quote_identifier(USERS_TABLE)),
+                &format!(
+                    "DROP TABLE IF EXISTS {}",
+                    quote_identifier(ATOMIC_MIGRATION_TABLE)
+                ),
                 &[],
             )
             .await;
@@ -158,7 +238,7 @@ impl TestRuntime {
             .raw_execute(
                 &format!(
                     "DROP TABLE IF EXISTS {}",
-                    quote_identifier(ATOMIC_MIGRATION_TABLE)
+                    quote_identifier(LATEST_BATCH_MIGRATION_TABLE)
                 ),
                 &[],
             )
@@ -224,7 +304,7 @@ impl TestRuntime {
             .collect()
     }
 
-    async fn seed_first_batch_manually(&self) {
+    async fn seed_first_generated_migration_manually(&self) {
         self.database
             .raw_execute(
                 &format!(
@@ -249,21 +329,11 @@ impl TestRuntime {
         self.database
             .raw_execute(
                 &format!(
-                    "CREATE TABLE IF NOT EXISTS {} (id UUID PRIMARY KEY DEFAULT uuidv7(), email TEXT NOT NULL UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
-                    quote_identifier(USERS_TABLE)
-                ),
-                &[],
-            )
-            .await
-            .unwrap();
-        self.database
-            .raw_execute(
-                &format!(
                     "INSERT INTO {}.{} (id, batch, applied_at) VALUES ($1, 1, NOW())",
                     quote_identifier(&self.schema),
                     quote_identifier(&self.migration_table)
                 ),
-                &[CREATE_USERS_MIGRATION_ID.into()],
+                &[FIRST_GENERATED_MIGRATION_ID.into()],
             )
             .await
             .unwrap();
@@ -392,14 +462,14 @@ async fn db_migrate_applies_discovered_rust_migrations_and_records_the_ledger() 
     .await
     .unwrap();
 
-    assert!(runtime.table_exists(USERS_TABLE).await);
-    assert!(runtime.table_exists(PROFILES_TABLE).await);
+    assert!(runtime.table_exists("personal_access_tokens").await);
+    assert!(runtime.table_exists("countries").await);
     assert_eq!(
         runtime.applied_migrations().await,
-        vec![
-            (CREATE_USERS_MIGRATION_ID.to_string(), 1),
-            (CREATE_PROFILES_MIGRATION_ID.to_string(), 1),
-        ]
+        GENERATED_MIGRATION_IDS
+            .iter()
+            .map(|id| ((*id).to_string(), 1))
+            .collect::<Vec<_>>()
     );
 
     runtime.cleanup().await;
@@ -435,18 +505,30 @@ async fn transactional_migration_rolls_back_ddl_when_ledger_insert_fails() {
 }
 
 #[tokio::test]
-async fn db_rollback_reverts_only_the_latest_generated_batch() {
+async fn db_rollback_reverts_only_the_latest_batch() {
     let _guard = lifecycle_lock().await;
     let Some(runtime) = TestRuntime::new().await else {
         return;
     };
 
-    runtime.seed_first_batch_manually().await;
+    run_cli(
+        App::builder()
+            .load_config_dir(runtime.config_dir())
+            .register_provider(AtomicMigrationProvider),
+        vec!["foundry".into(), "db:migrate".into()],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        runtime.applied_migrations().await,
+        vec![(ATOMIC_MIGRATION_ID.to_string(), 1)]
+    );
 
     run_cli(
         App::builder()
             .load_config_dir(runtime.config_dir())
-            .register_provider(migration_provider()),
+            .register_provider(AtomicAndLatestMigrationProvider),
         vec!["foundry".into(), "db:migrate".into()],
     )
     .await
@@ -455,25 +537,25 @@ async fn db_rollback_reverts_only_the_latest_generated_batch() {
     assert_eq!(
         runtime.applied_migrations().await,
         vec![
-            (CREATE_USERS_MIGRATION_ID.to_string(), 1),
-            (CREATE_PROFILES_MIGRATION_ID.to_string(), 2),
+            (ATOMIC_MIGRATION_ID.to_string(), 1),
+            (LATEST_BATCH_MIGRATION_ID.to_string(), 2),
         ]
     );
 
     run_cli(
         App::builder()
             .load_config_dir(runtime.config_dir())
-            .register_provider(migration_provider()),
+            .register_provider(AtomicAndLatestMigrationProvider),
         vec!["foundry".into(), "db:rollback".into()],
     )
     .await
     .unwrap();
 
-    assert!(runtime.table_exists(USERS_TABLE).await);
-    assert!(!runtime.table_exists(PROFILES_TABLE).await);
+    assert!(runtime.table_exists(ATOMIC_MIGRATION_TABLE).await);
+    assert!(!runtime.table_exists(LATEST_BATCH_MIGRATION_TABLE).await);
     assert_eq!(
         runtime.applied_migrations().await,
-        vec![(CREATE_USERS_MIGRATION_ID.to_string(), 1)]
+        vec![(ATOMIC_MIGRATION_ID.to_string(), 1)]
     );
 
     runtime.cleanup().await;
@@ -526,7 +608,7 @@ async fn db_migrate_status_reports_missing_applied_migrations_without_failing() 
         return;
     };
 
-    runtime.seed_first_batch_manually().await;
+    runtime.seed_first_generated_migration_manually().await;
     runtime
         .insert_missing_applied_migration("202604101529_removed_migration")
         .await;
@@ -554,7 +636,7 @@ async fn db_migrate_fails_clearly_when_applied_migration_is_missing() {
         return;
     };
 
-    runtime.seed_first_batch_manually().await;
+    runtime.seed_first_generated_migration_manually().await;
     runtime
         .insert_missing_applied_migration("202604101529_removed_migration")
         .await;
@@ -598,12 +680,13 @@ async fn db_seed_runs_discovered_seeders_and_honors_id_filtering() {
             "foundry".into(),
             "db:seed".into(),
             "--id".into(),
-            USERS_SEED_ID.into(),
+            COUNTRIES_SEED_ID.into(),
         ],
     )
     .await
     .unwrap();
-    assert_eq!(runtime.row_count(USERS_TABLE).await, 1);
+    let seeded_countries = runtime.row_count("countries").await;
+    assert!(seeded_countries > 200);
 
     run_cli(
         App::builder()
@@ -613,13 +696,14 @@ async fn db_seed_runs_discovered_seeders_and_honors_id_filtering() {
     )
     .await
     .unwrap();
-    assert_eq!(runtime.row_count(USERS_TABLE).await, 2);
+    assert_eq!(runtime.row_count("countries").await, seeded_countries);
 
     runtime.cleanup().await;
 }
 
 #[tokio::test]
 async fn make_migration_generates_a_rust_file_and_refuses_overwrite_without_force() {
+    let _guard = lifecycle_lock().await;
     let dir = tempfile::tempdir().unwrap();
     let migrations_dir = dir.path().join("migrations");
     let seeders_dir = dir.path().join("seeders");
@@ -667,6 +751,7 @@ async fn make_migration_generates_a_rust_file_and_refuses_overwrite_without_forc
 
 #[tokio::test]
 async fn make_seeder_generates_a_rust_file_and_refuses_overwrite_without_force() {
+    let _guard = lifecycle_lock().await;
     let dir = tempfile::tempdir().unwrap();
     let migrations_dir = dir.path().join("migrations");
     let seeders_dir = dir.path().join("seeders");
@@ -714,6 +799,7 @@ async fn make_seeder_generates_a_rust_file_and_refuses_overwrite_without_force()
 
 #[tokio::test]
 async fn make_app_scaffolds_can_target_custom_output_paths() {
+    let _guard = lifecycle_lock().await;
     let dir = tempfile::tempdir().unwrap();
     let model_dir = dir.path().join("src/domain/models");
     let job_dir = dir.path().join("src/domain/jobs");
@@ -726,6 +812,8 @@ async fn make_app_scaffolds_can_target_custom_output_paths() {
             "make:model".into(),
             "--name".into(),
             "AuditEvent".into(),
+            "--table".into(),
+            "recorded_audits".into(),
             "--path".into(),
             model_dir.display().to_string(),
         ],
@@ -761,6 +849,7 @@ async fn make_app_scaffolds_can_target_custom_output_paths() {
 
     let model = fs::read_to_string(model_dir.join("audit_event.rs")).unwrap();
     assert!(model.contains("pub struct AuditEvent"));
+    assert!(model.contains("#[foundry(table = \"recorded_audits\")]"));
 
     let job = fs::read_to_string(job_dir.join("send_welcome_email.rs")).unwrap();
     assert!(job.contains("pub struct SendWelcomeEmail;"));
@@ -772,7 +861,93 @@ async fn make_app_scaffolds_can_target_custom_output_paths() {
 }
 
 #[tokio::test]
+async fn make_component_scaffolds_cover_repeated_application_artifacts() {
+    let _guard = lifecycle_lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("components");
+    let cases = [
+        ("make:request", "CreateUserRequest", None, None),
+        ("make:dto", "UserResponse", None, None),
+        ("make:policy", "CanEditUser", None, None),
+        ("make:event", "UserCreated", None, None),
+        (
+            "make:listener",
+            "SendWelcomeEmail",
+            Some("--event"),
+            Some("UserCreated"),
+        ),
+        ("make:notification", "AccountActivated", None, None),
+        ("make:mail", "WelcomeMail", None, None),
+        (
+            "make:datatable",
+            "UsersDatatable",
+            Some("--model"),
+            Some("User"),
+        ),
+        ("make:plugin", "AuditToolsPlugin", None, None),
+        ("make:test", "UserRegistrationTest", None, None),
+    ];
+
+    for (command, name, related_flag, related_value) in cases {
+        let mut args = vec![
+            "foundry".to_string(),
+            command.to_string(),
+            "--name".to_string(),
+            name.to_string(),
+            "--path".to_string(),
+            output.display().to_string(),
+        ];
+        if let (Some(flag), Some(value)) = (related_flag, related_value) {
+            args.push(flag.to_string());
+            args.push(value.to_string());
+        }
+        run_cli(App::builder(), args).await.unwrap();
+    }
+
+    for filename in [
+        "create_user_request.rs",
+        "user_response.rs",
+        "can_edit_user.rs",
+        "user_created.rs",
+        "send_welcome_email.rs",
+        "account_activated.rs",
+        "welcome_mail.rs",
+        "users_datatable.rs",
+        "audit_tools_plugin.rs",
+        "user_registration_test.rs",
+    ] {
+        let path = output.join(filename);
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.ends_with('\n'), "{filename}");
+        assert!(!contents.contains("TODO"), "{filename}");
+        let status = std::process::Command::new("rustfmt")
+            .arg("--check")
+            .args(["--edition", "2024"])
+            .arg(&path)
+            .status()
+            .expect("rustfmt should parse generated component");
+        assert!(
+            status.success(),
+            "generated component is invalid: {filename}"
+        );
+    }
+    assert!(fs::read_to_string(output.join("create_user_request.rs"))
+        .unwrap()
+        .contains("foundry::Validate"));
+    assert!(fs::read_to_string(output.join("send_welcome_email.rs"))
+        .unwrap()
+        .contains("EventListener<UserCreated>"));
+    assert!(fs::read_to_string(output.join("users_datatable.rs"))
+        .unwrap()
+        .contains("ModelQuery<User>"));
+    assert!(fs::read_to_string(output.join("audit_tools_plugin.rs"))
+        .unwrap()
+        .contains("impl Plugin for AuditToolsPlugin"));
+}
+
+#[tokio::test]
 async fn migrate_publish_generates_framework_migrations_without_stale_audit_follow_up() {
+    let _guard = lifecycle_lock().await;
     let dir = tempfile::tempdir().unwrap();
     let migrations_dir = dir.path().join("migrations");
     let seeders_dir = dir.path().join("seeders");
@@ -781,6 +956,10 @@ async fn migrate_publish_generates_framework_migrations_without_stale_audit_foll
     let audit_migration_path = migrations_dir.join("000000000010_create_audit_logs.rs");
     let job_history_index_path =
         migrations_dir.join("000000000012_index_job_history_created_at.rs");
+    let translation_ids_path =
+        migrations_dir.join("000000000013_alter_model_translation_ids_to_text.rs");
+    let notification_type_path =
+        migrations_dir.join("000000000014_add_notification_notifiable_type.rs");
     let stale_follow_up_path = migrations_dir.join("000000000012_add_area_to_audit_logs.rs");
 
     write_generator_config(dir.path(), &migrations_dir, &seeders_dir);
@@ -800,6 +979,8 @@ async fn migrate_publish_generates_framework_migrations_without_stale_audit_foll
     assert!(primitives_migration_path.exists());
     assert!(audit_migration_path.exists());
     assert!(job_history_index_path.exists());
+    assert!(translation_ids_path.exists());
+    assert!(notification_type_path.exists());
     assert!(!stale_follow_up_path.exists());
 
     let published_primitives = fs::read_to_string(&primitives_migration_path).unwrap();
@@ -813,10 +994,18 @@ async fn migrate_publish_generates_framework_migrations_without_stale_audit_foll
 
     let published = fs::read_to_string(&job_history_index_path).unwrap();
     assert!(published.contains("idx_job_history_created_at"));
+
+    let published = fs::read_to_string(&translation_ids_path).unwrap();
+    assert!(published.contains("ALTER COLUMN translatable_id TYPE TEXT"));
+
+    let published = fs::read_to_string(&notification_type_path).unwrap();
+    assert!(published.contains("ADD COLUMN IF NOT EXISTS notifiable_type"));
+    assert!(published.contains("idx_notifications_unread"));
 }
 
 #[tokio::test]
 async fn seed_publish_generates_framework_seeders_and_honors_force() {
+    let _guard = lifecycle_lock().await;
     let dir = tempfile::tempdir().unwrap();
     let seeders_dir = dir.path().join("seeders");
     let published_path = seeders_dir.join("000000000001_countries_seeder.rs");

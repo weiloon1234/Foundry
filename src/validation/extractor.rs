@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
 
 use async_trait::async_trait;
@@ -108,7 +109,7 @@ where
             let is_multipart = content_type.starts_with("multipart/form-data");
             let locale = resolve_request_locale(&app, req.headers(), req.extensions());
 
-            let value = if is_multipart {
+            let (value, present_fields) = if is_multipart {
                 let mut multipart = axum::extract::Multipart::from_request(req, state)
                     .await
                     .map_err(|rejection| {
@@ -123,7 +124,7 @@ where
                 let upload_limits = crate::storage::UploadLimits::from_app(&app);
 
                 crate::storage::scope_upload_limits(upload_limits, async {
-                    T::from_multipart(&mut multipart).await
+                    T::from_multipart_with_presence(&mut multipart).await
                 })
                 .await
                 .map_err(|error| match error {
@@ -132,13 +133,10 @@ where
                         .into_response(),
                 })?
             } else {
-                let Json(v) = Json::<T>::from_request(req, state).await.map_err(|error| {
-                    json_rejection_response::<T>(&app, locale.as_deref(), error)
-                })?;
-                v
+                extract_json_with_presence::<T, S>(req, state, &app, locale.as_deref()).await?
             };
 
-            match validate_value_ref(&value, app, locale).await {
+            match validate_value_ref(&value, app, locale, present_fields).await {
                 Ok(()) => Ok(Self(value)),
                 Err(response) => {
                     if is_multipart {
@@ -182,13 +180,43 @@ where
                 ));
             }
 
-            let Json(value) = Json::<T>::from_request(req, state)
-                .await
-                .map_err(|error| json_rejection_response::<T>(&app, locale.as_deref(), error))?;
+            let (value, present_fields) =
+                extract_json_with_presence::<T, S>(req, state, &app, locale.as_deref()).await?;
 
-            validate_value(value, app, locale).await.map(Self)
+            validate_value(value, app, locale, present_fields)
+                .await
+                .map(Self)
         }
     }
+}
+
+async fn extract_json_with_presence<T, S>(
+    req: Request,
+    state: &S,
+    app: &AppContext,
+    locale: Option<&str>,
+) -> std::result::Result<(T, Option<HashSet<String>>), Response>
+where
+    T: DeserializeOwned + RequestValidator,
+    S: Send + Sync,
+{
+    let Json(raw) = Json::<serde_json::Value>::from_request(req, state)
+        .await
+        .map_err(|error| json_rejection_response::<T>(app, locale, error))?;
+    let present_fields = raw
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default();
+    let value = serde_json::from_value(raw).map_err(|_| {
+        request_error_response::<T>(
+            app,
+            locale,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_request_body",
+        )
+    })?;
+
+    Ok((value, Some(present_fields)))
 }
 
 fn json_rejection_response<T>(
@@ -238,11 +266,12 @@ async fn validate_value<T>(
     value: T,
     app: AppContext,
     locale: Option<String>,
+    present_fields: Option<HashSet<String>>,
 ) -> std::result::Result<T, Response>
 where
     T: RequestValidator + Send + Sync,
 {
-    validate_value_ref(&value, app, locale).await?;
+    validate_value_ref(&value, app, locale, present_fields).await?;
     Ok(value)
 }
 
@@ -250,11 +279,13 @@ async fn validate_value_ref<T>(
     value: &T,
     app: AppContext,
     locale: Option<String>,
+    present_fields: Option<HashSet<String>>,
 ) -> std::result::Result<(), Response>
 where
     T: RequestValidator + Send + Sync,
 {
     let mut validator = Validator::new(app);
+    validator.set_present_fields(present_fields);
     if let Some(locale) = locale {
         validator.set_locale(locale);
     }
@@ -323,12 +354,28 @@ mod tests {
         upload: UploadedFile,
     }
 
+    #[derive(Debug, Deserialize)]
+    struct PresenceAwareJson {
+        value: Option<String>,
+    }
+
     #[async_trait]
     impl RequestValidator for RejectingMultipartUpload {
         async fn validate(&self, validator: &mut Validator) -> Result<()> {
             let _ = self.upload.size;
             validator.field("name", "").required().apply().await?;
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl RequestValidator for PresenceAwareJson {
+        async fn validate(&self, validator: &mut Validator) -> Result<()> {
+            validator
+                .optional_field("value", self.value.clone())
+                .present()
+                .apply()
+                .await
         }
     }
 
@@ -412,5 +459,30 @@ mod tests {
             .clone()
             .expect("multipart upload should have been written");
         assert!(!upload_path.exists());
+    }
+
+    #[tokio::test]
+    async fn json_presence_distinguishes_explicit_null_from_a_missing_key() {
+        let app = test_app();
+        let present_request = Request::builder()
+            .method(Method::POST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"value":null}"#))
+            .unwrap();
+        let missing_request = Request::builder()
+            .method(Method::POST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let present = JsonValidated::<PresenceAwareJson>::from_request(present_request, &app).await;
+        assert!(present.is_ok());
+
+        let missing = JsonValidated::<PresenceAwareJson>::from_request(missing_request, &app).await;
+        let response = match missing {
+            Ok(_) => panic!("missing field should fail present validation"),
+            Err(response) => response,
+        };
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

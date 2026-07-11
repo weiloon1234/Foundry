@@ -66,6 +66,8 @@ mod tests {
 
     struct FactoryPanickingRule;
 
+    struct PlaceholderRule;
+
     #[async_trait]
     impl ValidationRule for MobileRule {
         async fn validate(
@@ -78,6 +80,20 @@ mod tests {
             } else {
                 Err(ValidationError::new("mobile", "invalid mobile number"))
             }
+        }
+    }
+
+    #[async_trait]
+    impl ValidationRule for PlaceholderRule {
+        async fn validate(
+            &self,
+            _context: &RuleContext,
+            _value: &str,
+        ) -> std::result::Result<(), ValidationError> {
+            Err(ValidationError::new(
+                "placeholder",
+                "The {{attribute}} failed its custom rule.",
+            ))
         }
     }
 
@@ -971,6 +987,7 @@ mod tests {
                     "required": "The {{attribute}} field is required.",
                     "email": "The {{attribute}} must be a valid email address.",
                     "min": "The {{attribute}} must be at least {{min}} characters.",
+                    "mobile": "The translated {{attribute}} is invalid.",
                     "attributes": {
                         "email": "email address"
                     }
@@ -1177,7 +1194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn named_rule_without_with_message_uses_resolved_message() {
+    async fn named_rule_without_override_preserves_returned_message() {
         let rules = RuleRegistry::new();
         rules
             .register(ValidationRuleId::new("mobile"), MobileRule)
@@ -1191,9 +1208,46 @@ mod tests {
             .unwrap();
         let errors = v.finish().unwrap_err();
         assert_eq!(errors.errors[0].code, "mobile");
-        // Without i18n configured, resolve_message falls back to generic message.
-        // With i18n, it would resolve validation.mobile from the locale file.
-        assert_eq!(errors.errors[0].message, "The phone is invalid.");
+        assert_eq!(errors.errors[0].message, "invalid mobile number");
+    }
+
+    #[tokio::test]
+    async fn named_rule_i18n_message_precedes_returned_message() {
+        let (app, _dir) = test_app_with_i18n();
+        app.rules()
+            .register(ValidationRuleId::new("mobile"), MobileRule)
+            .unwrap();
+        let mut v = Validator::new(app);
+        v.field("phone", "123")
+            .rule(ValidationRuleId::new("mobile"))
+            .apply()
+            .await
+            .unwrap();
+
+        let errors = v.finish().unwrap_err();
+        assert_eq!(errors.errors[0].message, "The translated phone is invalid.");
+    }
+
+    #[tokio::test]
+    async fn named_rule_returned_message_interpolates_attribute() {
+        let rules = RuleRegistry::new();
+        rules
+            .register(ValidationRuleId::new("placeholder"), PlaceholderRule)
+            .unwrap();
+        let app = AppContext::new(Container::new(), ConfigRepository::empty(), rules).unwrap();
+        let mut v = Validator::new(app);
+        v.custom_attribute("account_code", "account code");
+        v.field("account_code", "bad")
+            .rule(ValidationRuleId::new("placeholder"))
+            .apply()
+            .await
+            .unwrap();
+
+        let errors = v.finish().unwrap_err();
+        assert_eq!(
+            errors.errors[0].message,
+            "The account code failed its custom rule."
+        );
     }
 
     // --- EachValidator tests ---
@@ -1272,5 +1326,138 @@ mod tests {
         let errors = v.finish().unwrap_err();
         assert_eq!(errors.errors.len(), 1);
         assert_eq!(errors.errors[0].code, "required");
+    }
+
+    #[tokio::test]
+    async fn conditional_required_rules_only_require_values_when_the_condition_matches() {
+        let app = test_app();
+        let mut validator = Validator::new(app);
+
+        validator
+            .optional_field("publishedAt", Option::<String>::None)
+            .required_if("status", "scheduled", ["published", "scheduled"])
+            .apply()
+            .await
+            .unwrap();
+        validator
+            .optional_field("reviewNote", Option::<String>::None)
+            .required_unless("status", "draft", ["draft"])
+            .apply()
+            .await
+            .unwrap();
+        validator
+            .optional_field("phone", Option::<String>::None)
+            .required_with([("email", "person@example.com")])
+            .apply()
+            .await
+            .unwrap();
+
+        let errors = validator.finish().unwrap_err();
+        assert_eq!(
+            errors
+                .errors
+                .iter()
+                .map(|error| error.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["required_if", "required_with"]
+        );
+    }
+
+    #[tokio::test]
+    async fn presence_rules_distinguish_absent_present_and_empty_values() {
+        let app = test_app();
+        let mut validator = Validator::new(app);
+
+        validator
+            .optional_field("presentField", Option::<String>::None)
+            .present()
+            .apply()
+            .await
+            .unwrap();
+        validator
+            .optional_field("skippedEmail", Option::<String>::None)
+            .sometimes()
+            .email()
+            .apply()
+            .await
+            .unwrap();
+        validator
+            .optional_field("invalidEmail", Some("not-an-email"))
+            .sometimes()
+            .email()
+            .apply()
+            .await
+            .unwrap();
+        validator
+            .optional_field("forbidden", Some("supplied"))
+            .prohibited()
+            .apply()
+            .await
+            .unwrap();
+        validator
+            .optional_field("emptyForbidden", Some(""))
+            .prohibited()
+            .apply()
+            .await
+            .unwrap();
+
+        let errors = validator.finish().unwrap_err();
+        assert_eq!(
+            errors
+                .errors
+                .iter()
+                .map(|error| error.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["present", "email", "prohibited"]
+        );
+    }
+
+    #[tokio::test]
+    async fn boolean_rule_accepts_boolean_lexemes_and_rejects_other_values() {
+        for value in ["true", "false", "1", "0"] {
+            let mut validator = Validator::new(test_app());
+            validator
+                .field("enabled", value)
+                .boolean()
+                .apply()
+                .await
+                .unwrap();
+            assert!(validator.finish().is_ok(), "value: {value}");
+        }
+
+        let mut validator = Validator::new(test_app());
+        validator
+            .field("enabled", "yes")
+            .boolean()
+            .apply()
+            .await
+            .unwrap();
+        assert_eq!(validator.finish().unwrap_err().errors[0].code, "boolean");
+    }
+
+    #[tokio::test]
+    async fn distinct_rule_validates_the_collection_as_a_whole() {
+        let unique = vec!["rust", "foundry"];
+        let mut validator = Validator::new(test_app());
+        validator
+            .each("tags", &unique)
+            .distinct()
+            .apply()
+            .await
+            .unwrap();
+        assert!(validator.finish().is_ok());
+
+        let duplicate = vec!["rust", "foundry", "rust"];
+        let mut validator = Validator::new(test_app());
+        validator
+            .each("tags", &duplicate)
+            .distinct()
+            .apply()
+            .await
+            .unwrap();
+        let errors = validator.finish().unwrap_err();
+        assert_eq!(errors.errors.len(), 1);
+        assert_eq!(errors.errors[0].field, "tags");
+        assert_eq!(errors.errors[0].code, "distinct");
     }
 }

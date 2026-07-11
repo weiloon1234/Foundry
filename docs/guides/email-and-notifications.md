@@ -42,16 +42,34 @@ Store templates as HTML/text files with `{{variable}}` placeholders:
 ```
 
 ```rust
-let msg = EmailMessage::new("Your order shipped")
-    .to("customer@example.com")
-    .template("order_shipped", "templates/emails", json!({
+let email = app.email()?;
+let msg = email
+    .render_template(
+        EmailMessage::new("Your order shipped").to("customer@example.com"),
+        "order_shipped",
+        json!({
         "order_id": "ORD-123",
         "tracking": { "number": "TRK-456" }
-    }))
+        }),
+    )
     .await?;
 ```
 
+`EmailManager::render_template` resolves templates under
+`[email].template_path`. `EmailMessage::template(name, path, variables)` remains
+available when a call site deliberately needs a different explicit root.
+
 Dot-notation works for nested values: `{{tracking.number}}`.
+HTML templates escape substituted values by default. Use triple braces only for
+markup that the application has already trusted or sanitized:
+
+```html
+<p>{{customer_name}}</p>
+<div>{{{trusted_summary_html}}}</div>
+```
+
+Text templates remain unescaped. Substituted values are never interpreted as
+new placeholders, so user-controlled text cannot trigger recursive expansion.
 Template names are safe relative names under the configured template directory.
 Nested names such as `auth/welcome` are allowed, while absolute paths,
 traversal segments, backslashes, and control characters are rejected.
@@ -102,6 +120,11 @@ email_manager.queue(msg).await?;
 let send_at = DateTime::now().add_days(1).timestamp_millis();
 email_manager.queue_later(msg, send_at).await?;
 ```
+
+Both queued methods dispatch `SendQueuedEmailJob` on `[email].queue`; worker
+kernels automatically poll that queue even when it differs from the global
+`jobs.queue`. Configure its priority under `jobs.queue_priorities` when it must
+be ordered relative to other queues.
 
 ### Multiple Mailers
 
@@ -171,6 +194,10 @@ timeout_secs = 30
 [email.mailers.log]
 target = "email.outbound"
 ```
+
+`encryption = "none"` creates a genuinely plaintext SMTP connection. Use it
+only for a trusted local relay; credentials and message contents are otherwise
+visible on the network.
 
 Built-in HTTP mailers (`postmark`, `resend`, `mailgun`, and `ses`) apply
 `timeout_secs = 30` by default. Set it to `0` only for local debugging where you
@@ -242,6 +269,10 @@ impl Notification for OrderShipped {
 
 ```rust
 impl Notifiable for User {
+    fn notifiable_type(&self) -> &str {
+        "user"
+    }
+
     fn notification_id(&self) -> String {
         self.id.to_string()
     }
@@ -272,10 +303,18 @@ app.notify_queued(&user, &OrderShipped {
 }).await?;
 ```
 
+Every selected built-in channel must have its required output. Selecting
+`NOTIFY_EMAIL` requires a non-empty email route and `to_email()` message;
+`NOTIFY_DATABASE` and `NOTIFY_BROADCAST` require their corresponding payloads.
+Missing data is a delivery/preparation error rather than a silent no-op. A
+renderer for a channel not returned by `via()` is not called.
+
 Immediate delivery attempts every selected channel, then returns an error containing every failed
-or unregistered channel. Queued notifications pre-render before dispatch; worker delivery errors
-are returned from the job so the normal retry and dead-letter policy applies. Keep queued channel
-adapters idempotent because retrying a multi-channel job can replay channels that already succeeded.
+or unregistered channel. Queued notifications pre-render into one job per selected channel, so
+each channel has independent retry, history, metrics, and dead-letter state; a successful channel
+is not replayed when another fails. Enqueue attempts continue after an individual enqueue failure
+and return an aggregate error, which means partial enqueue is possible. Channel adapters should
+still be idempotent because any individual job can retry.
 
 ### Within Transactions
 
@@ -296,7 +335,8 @@ tx.commit().await?;
 ```
 
 `notify_after_commit` renders the queued payload immediately and returns an error if a renderer or
-routing callback fails. No after-commit job is registered in that case.
+routing callback fails. It registers one after-commit dispatch per selected channel; no callback is
+registered when preparation fails.
 
 ### Built-in Channels
 
@@ -305,6 +345,28 @@ routing callback fails. No after-commit job is registered in that case.
 | Email | `NOTIFY_EMAIL` | Sends via `to_email()` using the email system |
 | Database | `NOTIFY_DATABASE` | Stores `to_database()` JSON in `notifications` table |
 | Broadcast | `NOTIFY_BROADCAST` | Publishes `to_broadcast()` JSON via WebSocket |
+
+The database channel is queryable through an ownership-scoped repository. Every
+operation includes both `notifiable_type` and `notifiable_id` and orders newest
+first by `(created_at, id)`:
+
+```rust
+let notifications = DatabaseNotificationRepository::for_actor(&actor)?;
+let unread = notifications.unread(&app).await?;
+let count = notifications.unread_count(&app).await?;
+notifications.mark_read(&app, unread[0].id).await?;
+notifications.mark_all_read(&app).await?;
+```
+
+Use `for_actor_as(&actor, "user")` when the stored morph type differs from the
+guard ID, or `for_notifiable(&user)` to use the model's declared type. The
+repository also provides list/paginate/read/delete methods and `*_with`
+variants for an existing database transaction or executor.
+
+Existing deployments must publish and apply
+`000000000014_add_notification_notifiable_type` before running the new insert
+and repository paths. Existing rows receive `default`; backfill them before
+switching a model to a custom `notifiable_type()`.
 
 Register the broadcast WebSocket channel with the guarded helper:
 
@@ -371,3 +433,6 @@ fn to_channel(&self, channel: &str, _notifiable: &dyn Notifiable) -> Option<Valu
 For queued custom channels, Foundry serializes the routing value returned by
 `route_notification_for()` under its typed `NotificationChannelId`, alongside the rendered custom
 payload. The worker-side adapter therefore receives the same routing value as immediate delivery.
+During a rolling upgrade, install custom channel adapters on every worker before
+producers select them, and keep `notifiable_type()` at its default until old
+workers have drained.

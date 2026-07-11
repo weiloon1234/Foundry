@@ -14,6 +14,18 @@ pub(crate) fn normalize_prefix(prefix: &str) -> Result<String> {
     normalize_storage_path(prefix, StoragePathKind::Prefix)
 }
 
+pub(crate) fn join_url_prefix(prefix: &str, path: &str) -> Option<String> {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return None;
+    }
+    if prefix == "/" {
+        return Some(format!("/{path}"));
+    }
+
+    Some(format!("{}/{path}", prefix.trim_end_matches('/')))
+}
+
 fn normalize_storage_path(value: &str, kind: StoragePathKind) -> Result<String> {
     let label = match kind {
         StoragePathKind::Object => "path",
@@ -125,5 +137,22 @@ mod tests {
         assert!(normalize_prefix("attachments/").is_ok());
         assert!(normalize_prefix("attachments//").is_err());
         assert!(normalize_prefix("/").is_err());
+    }
+
+    #[test]
+    fn joins_absolute_and_relative_url_prefixes_without_duplicate_slashes() {
+        assert_eq!(
+            join_url_prefix("https://cdn.example.com/assets/", "images/a.jpg").as_deref(),
+            Some("https://cdn.example.com/assets/images/a.jpg")
+        );
+        assert_eq!(
+            join_url_prefix("/storage", "images/a.jpg").as_deref(),
+            Some("/storage/images/a.jpg")
+        );
+        assert_eq!(
+            join_url_prefix("/", "images/a.jpg").as_deref(),
+            Some("/images/a.jpg")
+        );
+        assert!(join_url_prefix(" ", "images/a.jpg").is_none());
     }
 }

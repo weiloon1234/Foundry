@@ -13,6 +13,7 @@ use tempfile::tempdir;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 
 mod app {
     use super::*;
@@ -212,6 +213,10 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn unique_namespace(prefix: &str) -> String {
+    format!("{prefix}:{}", Uuid::now_v7())
 }
 
 fn database_lock() -> &'static Mutex<()> {
@@ -471,6 +476,7 @@ fn build_scheduler_app(config_dir: &Path) -> AppBuilder {
 
 #[tokio::test]
 async fn sql_observability_endpoint_exposes_typed_stats_contract() {
+    let _guard = database_lock().lock().await;
     let app = TestApp::builder()
         .enable_public_observability()
         .build()
@@ -489,10 +495,12 @@ async fn sql_observability_endpoint_exposes_typed_stats_contract() {
         body.n_plus_one_suspects.len()
     );
     assert_eq!(body.top_slowest.len(), body.slow_queries.len());
+    app.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn observability_enabled_false_skips_foundry_routes() {
+    let _guard = database_lock().lock().await;
     let config_dir = tempdir().unwrap();
     fs::write(
         config_dir.path().join("00-observability.toml"),
@@ -512,10 +520,12 @@ async fn observability_enabled_false_skips_foundry_routes() {
 
     let response = app.client().get("/_foundry/health").send().await.unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    app.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn observability_capture_disabled_keeps_routes_with_empty_counters() {
+    let _guard = database_lock().lock().await;
     let config_dir = tempdir().unwrap();
     fs::write(
         config_dir.path().join("00-observability.toml"),
@@ -538,15 +548,17 @@ async fn observability_capture_disabled_keeps_routes_with_empty_counters() {
     let body: RuntimeSnapshot = response.json().unwrap();
     assert_eq!(body.http.requests_total, 0);
     assert_eq!(body.jobs.enqueued_total, 0);
+    app.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn enable_observability_requires_auth_by_default() {
+    let _guard = database_lock().lock().await;
     let config_dir = tempdir().unwrap();
     write_http_config(
         config_dir.path(),
         free_port(),
-        &format!("observability-guarded-{}", free_port()),
+        &unique_namespace("observability-guarded"),
     );
 
     let app = TestApp::builder()
@@ -570,6 +582,7 @@ async fn enable_observability_requires_auth_by_default() {
         .await
         .unwrap();
     assert_eq!(authenticated.status(), reqwest::StatusCode::OK);
+    app.shutdown().await.unwrap();
 }
 
 async fn wait_for_http_ready(base_url: &str) {
@@ -613,12 +626,13 @@ async fn wait_for_scheduler_executions(app: &AppContext, expected: u64) {
 
 #[tokio::test]
 async fn observability_endpoints_expose_liveness_readiness_and_runtime_snapshot() {
+    let _guard = database_lock().lock().await;
     let config_dir = tempdir().unwrap();
     let server_port = free_port();
     write_http_config(
         config_dir.path(),
         server_port,
-        &format!("observability-http-{server_port}"),
+        &unique_namespace("observability-http"),
     );
 
     let server = tokio::spawn({
@@ -763,6 +777,7 @@ async fn observability_endpoints_expose_liveness_readiness_and_runtime_snapshot(
     assert!(metrics_body.contains("foundry_jobs_total{outcome=\"expired_lease_requeued\"}"));
 
     server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]
@@ -875,6 +890,79 @@ async fn jobs_observability_json_endpoints_have_typed_stable_contracts() {
         assert_eq!(slow_queries.stats.avg_duration_ms, None);
         assert_eq!(slow_queries.stats.latest_recorded_at, None);
     }
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_records_job_history_when_diagnostic_capture_is_disabled() {
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let _guard = database_lock().lock().await;
+    let config_dir = tempdir().unwrap();
+    let namespace = unique_namespace("observability-history-capture");
+    fs::write(
+        config_dir.path().join("00-runtime.toml"),
+        format!(
+            r#"
+            [database]
+            url = "{url}"
+
+            [redis]
+            namespace = "{namespace}"
+
+            [jobs]
+            track_history = true
+            max_retries = 1
+            poll_interval_ms = 1
+
+            [observability]
+            capture_enabled = false
+            "#
+        ),
+    )
+    .unwrap();
+
+    let kernel = App::builder()
+        .load_config_dir(config_dir.path())
+        .register_provider(app::providers::WorkerServiceProvider)
+        .build_worker_kernel()
+        .await
+        .unwrap();
+    let app = kernel.app().clone();
+    let db = app.database().unwrap();
+    recreate_job_history_table(db.as_ref()).await;
+    db.raw_execute(
+        "ALTER TABLE job_history ALTER COLUMN id SET DEFAULT gen_random_uuid()",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    app.jobs()
+        .unwrap()
+        .dispatch(app::domain::AuditJob {
+            marker: "capture-disabled".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(Worker::from_app(app.clone())
+        .unwrap()
+        .run_once()
+        .await
+        .unwrap());
+
+    let rows = db
+        .raw_query(
+            "SELECT job_id, status FROM job_history ORDER BY created_at",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].text("job_id"), app::ids::AUDIT_JOB.to_string());
+    assert_eq!(rows[0].text("status"), "succeeded");
+    app.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -884,12 +972,16 @@ async fn worker_prunes_job_history_with_retention_and_distributed_lock() {
     };
     let _guard = database_lock().lock().await;
     let config_dir = tempdir().unwrap();
+    let namespace = unique_namespace("observability-history-prune");
     fs::write(
         config_dir.path().join("00-runtime.toml"),
         format!(
             r#"
             [database]
             url = "{url}"
+
+            [redis]
+            namespace = "{namespace}"
 
             [jobs]
             history_retention_days = 30
@@ -954,6 +1046,7 @@ async fn worker_prunes_job_history_with_retention_and_distributed_lock() {
             .collect::<Vec<_>>(),
         vec!["new-job".to_string()]
     );
+    app.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -963,12 +1056,16 @@ async fn worker_keeps_job_history_forever_when_retention_is_zero() {
     };
     let _guard = database_lock().lock().await;
     let config_dir = tempdir().unwrap();
+    let namespace = unique_namespace("observability-history-retain");
     fs::write(
         config_dir.path().join("00-runtime.toml"),
         format!(
             r#"
             [database]
             url = "{url}"
+
+            [redis]
+            namespace = "{namespace}"
 
             [jobs]
             history_retention_days = 0
@@ -1009,16 +1106,18 @@ async fn worker_keeps_job_history_forever_when_retention_is_zero() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 2);
+    app.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn readiness_endpoint_returns_503_when_provider_probe_fails() {
+    let _guard = database_lock().lock().await;
     let config_dir = tempdir().unwrap();
     let server_port = free_port();
     write_http_config(
         config_dir.path(),
         server_port,
-        &format!("observability-ready-{server_port}"),
+        &unique_namespace("observability-ready"),
     );
 
     let server = tokio::spawn({
@@ -1046,16 +1145,18 @@ async fn readiness_endpoint_returns_503_when_provider_probe_fails() {
     assert_eq!(database_probe.state, ProbeState::Unhealthy);
 
     server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]
 async fn readiness_endpoint_returns_503_when_provider_probe_panics() {
+    let _guard = database_lock().lock().await;
     let config_dir = tempdir().unwrap();
     let server_port = free_port();
     write_http_config(
         config_dir.path(),
         server_port,
-        &format!("observability-ready-panic-{server_port}"),
+        &unique_namespace("observability-ready-panic"),
     );
 
     let server = tokio::spawn({
@@ -1087,16 +1188,18 @@ async fn readiness_endpoint_returns_503_when_provider_probe_panics() {
     );
 
     server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]
 async fn diagnostics_track_websocket_job_and_scheduler_activity() {
+    let _guard = database_lock().lock().await;
     let websocket_dir = tempdir().unwrap();
     let websocket_port = free_port();
     write_websocket_config(
         websocket_dir.path(),
         websocket_port,
-        &format!("observability-ws-{websocket_port}"),
+        &unique_namespace("observability-ws"),
     );
 
     let websocket_kernel = build_websocket_app(websocket_dir.path())
@@ -1169,11 +1272,12 @@ async fn diagnostics_track_websocket_job_and_scheduler_activity() {
     assert!(websocket_snapshot.websocket.outbound_messages_total >= 2);
 
     websocket_server.abort();
+    let _ = websocket_server.await;
 
     let scheduler_dir = tempdir().unwrap();
     write_scheduler_config(
         scheduler_dir.path(),
-        &format!("observability-jobs-{}", free_port()),
+        &unique_namespace("observability-jobs"),
     );
     let scheduler = build_scheduler_app(scheduler_dir.path())
         .build_scheduler_kernel()
@@ -1210,4 +1314,5 @@ async fn diagnostics_track_websocket_job_and_scheduler_activity() {
     assert_eq!(snapshot.jobs.dead_lettered_total, 0);
     assert_eq!(snapshot.scheduler.ticks_total, 1);
     assert_eq!(snapshot.scheduler.executed_schedules_total, 1);
+    scheduler_app.shutdown().await.unwrap();
 }

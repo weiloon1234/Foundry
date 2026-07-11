@@ -92,7 +92,11 @@ impl ServiceProvider for AuditAuthProvider {
 }
 
 #[derive(Debug, PartialEq, foundry::Model)]
-#[foundry(table = AUDIT_ENTRIES_TABLE, primary_key_strategy = "manual")]
+#[foundry(
+    table = AUDIT_ENTRIES_TABLE,
+    primary_key_strategy = "manual",
+    soft_deletes = true
+)]
 struct AuditEntry {
     id: i64,
     title: String,
@@ -338,7 +342,7 @@ async fn reset_schema(database: &DatabaseManager) {
             &format!("DROP TABLE IF EXISTS {AUDIT_LOGS_TABLE}"),
             &format!(
                 "CREATE TABLE {AUDIT_LOGS_TABLE} (
-                    id UUID PRIMARY KEY DEFAULT uuidv7(),
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     event_type TEXT NOT NULL,
                     subject_model TEXT NOT NULL,
                     subject_table TEXT NOT NULL,
@@ -574,6 +578,109 @@ async fn direct_non_http_writes_do_not_audit_by_default() {
         audit_logs_for_subject(&runtime.app, AUDIT_ENTRIES_TABLE, 11)
             .await
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn scoped_non_http_model_writes_and_manual_entries_keep_attribution() {
+    let _guard = audit_lock().await;
+    let Some(runtime) = AuditRuntime::new().await else {
+        return;
+    };
+
+    reset_schema(runtime.database.as_ref()).await;
+    let context = AuditContext::new("jobs")
+        .with_actor(Actor::new("worker-actor", GuardId::new("system")))
+        .with_request_id(RequestId::new("job-audit-1"));
+
+    scope_audit(context, async {
+        AuditEntry::create()
+            .set(AuditEntry::ID, 12_i64)
+            .set(AuditEntry::TITLE, "Scoped write")
+            .set(AuditEntry::SECRET, "scoped-secret")
+            .save(&runtime.app)
+            .await
+            .unwrap();
+
+        runtime
+            .app
+            .audit()
+            .unwrap()
+            .record(
+                runtime.database.as_ref(),
+                foundry::audit::AuditEntry::new("exported", "reports", "monthly-1")
+                    .subject_model("MonthlyReport")
+                    .after(serde_json::json!({
+                        "status": "ready",
+                        "nested": {"access_token": "must-redact"}
+                    }))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    })
+    .await;
+
+    let lifecycle = latest_audit_log(&runtime.app, AUDIT_ENTRIES_TABLE, 12).await;
+    assert_eq!(lifecycle.area.as_deref(), Some("jobs"));
+    assert_eq!(lifecycle.actor_guard.as_deref(), Some("system"));
+    assert_eq!(lifecycle.actor_id.as_deref(), Some("worker-actor"));
+    assert_eq!(lifecycle.request_id.as_deref(), Some("job-audit-1"));
+
+    let manual = latest_audit_log(&runtime.app, "reports", "monthly-1").await;
+    assert_eq!(manual.event_type, "exported");
+    assert_eq!(manual.subject_model, "MonthlyReport");
+    assert_eq!(manual.area.as_deref(), Some("jobs"));
+    assert_eq!(
+        manual.after_data.unwrap()["nested"]["access_token"],
+        "[redacted]"
+    );
+}
+
+#[tokio::test]
+async fn audit_retention_prunes_only_rows_before_the_cutoff() {
+    let _guard = audit_lock().await;
+    let Some(runtime) = AuditRuntime::new().await else {
+        return;
+    };
+
+    reset_schema(runtime.database.as_ref()).await;
+    let old = DateTime::parse("2025-01-01T00:00:00Z").unwrap();
+    let recent = DateTime::parse("2026-01-01T00:00:00Z").unwrap();
+    for (subject_id, created_at) in [("old", old), ("recent", recent)] {
+        AuditLog::create()
+            .set(AuditLog::EVENT_TYPE, "manual")
+            .set(AuditLog::SUBJECT_MODEL, "Retention")
+            .set(AuditLog::SUBJECT_TABLE, "retention_subjects")
+            .set(AuditLog::SUBJECT_ID, subject_id)
+            .set(AuditLog::CREATED_AT, created_at)
+            .save(&runtime.app)
+            .await
+            .unwrap();
+    }
+
+    let deleted = runtime
+        .app
+        .audit()
+        .unwrap()
+        .prune_before(
+            runtime.database.as_ref(),
+            DateTime::parse("2025-06-01T00:00:00Z").unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(deleted, 1);
+    assert!(
+        audit_logs_for_subject(&runtime.app, "retention_subjects", "old")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        audit_logs_for_subject(&runtime.app, "retention_subjects", "recent")
+            .await
+            .len(),
+        1
     );
 }
 

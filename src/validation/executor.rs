@@ -90,6 +90,25 @@ pub(crate) fn fallback_message(field: &str, code: &str, params: &[(&str, &str)])
     };
     match code {
         "required" => format!("The {} field is required.", field),
+        "required_if" => format!(
+            "The {} field is required when {} is {}.",
+            field,
+            get_param("other"),
+            get_param("values")
+        ),
+        "required_unless" => format!(
+            "The {} field is required unless {} is {}.",
+            field,
+            get_param("other"),
+            get_param("values")
+        ),
+        "required_with" => format!(
+            "The {} field is required when {} is present.",
+            field,
+            get_param("other")
+        ),
+        "present" => format!("The {} field must be present.", field),
+        "prohibited" => format!("The {} field is prohibited.", field),
         "email" => format!("The {} must be a valid email address.", field),
         "min" => format!(
             "The {} must be at least {} characters.",
@@ -102,6 +121,7 @@ pub(crate) fn fallback_message(field: &str, code: &str, params: &[(&str, &str)])
             get_param("max")
         ),
         "numeric" => format!("The {} must be a number.", field),
+        "boolean" => format!("The {} field must be true or false.", field),
         "integer" => format!("The {} must be an integer.", field),
         "alpha" => format!("The {} must contain only letters.", field),
         "alpha_numeric" => format!("The {} must contain only letters and numbers.", field),
@@ -156,6 +176,7 @@ pub(crate) fn fallback_message(field: &str, code: &str, params: &[(&str, &str)])
         "unique" => format!("The {} has already been taken.", field),
         "exists" => format!("The selected {} is invalid.", field),
         "app_enum" => format!("The selected {} is invalid.", field),
+        "distinct" => format!("The {} field has a duplicate value.", field),
         "image" => format!("The {} must be an image.", field),
         "max_file_size" => format!("The {} must not exceed {}KB.", field, get_param("max")),
         "max_dimensions" => format!(
@@ -184,21 +205,116 @@ pub(crate) async fn execute_steps(
     validator: &mut Validator,
     field: &str,
     value: &str,
+    present: bool,
     steps: Vec<FieldStep>,
+    nullable: bool,
     bail: bool,
 ) -> Result<()> {
     for step in steps {
+        if nullable && value.trim().is_empty() && !rule_runs_when_empty(&step.rule) {
+            continue;
+        }
         let errors_before = validator.errors.len();
         match step {
             FieldStep {
                 rule: FieldRule::Required,
                 message,
             } => {
-                if value.trim().is_empty() {
+                if !present || value.trim().is_empty() {
                     let msg = validator.resolve_message(field, "required", &[], message.as_deref());
                     validator.push_error(field.to_string(), ValidationError::new("required", msg));
                     // Required failing on empty value implies no further rules can meaningfully run
                     break;
+                }
+            }
+            FieldStep {
+                rule:
+                    FieldRule::RequiredIf {
+                        other_field,
+                        other_value,
+                        expected_values,
+                    },
+                message,
+            } => {
+                if expected_values.contains(&other_value) && (!present || value.trim().is_empty()) {
+                    let values = expected_values.join(", ");
+                    let msg = validator.resolve_message(
+                        field,
+                        "required_if",
+                        &[("other", &other_field), ("values", &values)],
+                        message.as_deref(),
+                    );
+                    validator
+                        .push_error(field.to_string(), ValidationError::new("required_if", msg));
+                    break;
+                }
+            }
+            FieldStep {
+                rule:
+                    FieldRule::RequiredUnless {
+                        other_field,
+                        other_value,
+                        expected_values,
+                    },
+                message,
+            } => {
+                if !expected_values.contains(&other_value) && (!present || value.trim().is_empty())
+                {
+                    let values = expected_values.join(", ");
+                    let msg = validator.resolve_message(
+                        field,
+                        "required_unless",
+                        &[("other", &other_field), ("values", &values)],
+                        message.as_deref(),
+                    );
+                    validator.push_error(
+                        field.to_string(),
+                        ValidationError::new("required_unless", msg),
+                    );
+                    break;
+                }
+            }
+            FieldStep {
+                rule: FieldRule::RequiredWith { other_fields },
+                message,
+            } => {
+                let active_fields = other_fields
+                    .iter()
+                    .filter_map(|(name, value)| (!value.trim().is_empty()).then_some(name.as_str()))
+                    .collect::<Vec<_>>();
+                if !active_fields.is_empty() && (!present || value.trim().is_empty()) {
+                    let other = active_fields.join(", ");
+                    let msg = validator.resolve_message(
+                        field,
+                        "required_with",
+                        &[("other", &other)],
+                        message.as_deref(),
+                    );
+                    validator.push_error(
+                        field.to_string(),
+                        ValidationError::new("required_with", msg),
+                    );
+                    break;
+                }
+            }
+            FieldStep {
+                rule: FieldRule::Present,
+                message,
+            } => {
+                if !present {
+                    let msg = validator.resolve_message(field, "present", &[], message.as_deref());
+                    validator.push_error(field.to_string(), ValidationError::new("present", msg));
+                }
+            }
+            FieldStep {
+                rule: FieldRule::Prohibited,
+                message,
+            } => {
+                if present && !value.trim().is_empty() {
+                    let msg =
+                        validator.resolve_message(field, "prohibited", &[], message.as_deref());
+                    validator
+                        .push_error(field.to_string(), ValidationError::new("prohibited", msg));
                 }
             }
             FieldStep {
@@ -249,10 +365,12 @@ pub(crate) async fn execute_steps(
                 };
                 let context = RuleContext::new(validator.app.clone(), field.to_string());
                 if let Err(error) = run_named_rule(&id, rule.as_ref(), &context, value).await? {
-                    let msg = match message.as_deref() {
-                        Some(custom) => custom.to_string(),
-                        None => validator.resolve_message(field, &error.code, &[], None),
-                    };
+                    let msg = validator.resolve_named_rule_message(
+                        field,
+                        &error.code,
+                        &error.message,
+                        message.as_deref(),
+                    );
                     validator.errors.push(FieldError {
                         field: field.to_string(),
                         code: error.code,
@@ -296,6 +414,15 @@ pub(crate) async fn execute_steps(
                 if parse_finite_number(value).is_none() {
                     let msg = validator.resolve_message(field, "numeric", &[], message.as_deref());
                     validator.push_error(field.to_string(), ValidationError::new("numeric", msg));
+                }
+            }
+            FieldStep {
+                rule: FieldRule::Boolean,
+                message,
+            } => {
+                if !matches!(value, "true" | "false" | "1" | "0") {
+                    let msg = validator.resolve_message(field, "boolean", &[], message.as_deref());
+                    validator.push_error(field.to_string(), ValidationError::new("boolean", msg));
                 }
             }
             FieldStep {
@@ -679,12 +806,32 @@ pub(crate) async fn execute_steps(
                     validator.push_error(field.to_string(), ValidationError::new("app_enum", msg));
                 }
             }
+            FieldStep {
+                rule: FieldRule::Distinct,
+                ..
+            } => {
+                return Err(Error::message(
+                    "distinct validation requires Validator::each",
+                ));
+            }
         }
         if bail && validator.errors.len() > errors_before {
             break;
         }
     }
     Ok(())
+}
+
+fn rule_runs_when_empty(rule: &FieldRule) -> bool {
+    matches!(
+        rule,
+        FieldRule::RequiredIf { .. }
+            | FieldRule::RequiredUnless { .. }
+            | FieldRule::RequiredWith { .. }
+            | FieldRule::Present
+            | FieldRule::Prohibited
+            | FieldRule::Distinct
+    )
 }
 
 async fn run_named_rule(

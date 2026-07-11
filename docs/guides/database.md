@@ -259,13 +259,33 @@ page.pagination;   // { page: 1, per_page: 20 }
 
 ```rust
 let result = User::model_query()
-    .order_by(User::ID.asc())
-    .cursor_paginate(&*db, User::ID, CursorPagination::new(20))
+    .cursor_paginate(&*db, User::CREATED_AT, CursorPagination::new(20))
     .await?;
 
 result.data;           // Vec<User>
 result.meta.has_next;  // bool
 result.cursors.next;   // Option<String> — pass as .after() for next page
+result.cursors.prev;   // Option<String> — pass as .before() for previous page
+```
+
+The selected column defines ascending natural order and the model primary key
+is an automatic deterministic tiebreaker. `cursor_paginate` owns ordering and
+ignores an earlier `order_by`/offset on the query. Nullable sort columns follow
+PostgreSQL `ASC NULLS LAST` semantics in both directions.
+
+Cursor strings are opaque, versioned positions containing both typed values.
+Pass returned tokens through unchanged; do not decode or persist assumptions
+about their representation. `after` and `before` are mutually exclusive and
+using both is an error:
+
+```rust
+let next = User::model_query()
+    .cursor_paginate(
+        &*db,
+        User::CREATED_AT,
+        CursorPagination::new(20).after(next_cursor),
+    )
+    .await?;
 ```
 
 ### Chunking
@@ -706,8 +726,9 @@ ctx.dispatch(event).await?  // dispatch a domain event
 ## Built-in Audit Logging
 
 Foundry can write one audit row per create, update, soft delete, restore, and hard delete. Audit
-rows are written inside the same database transaction as the model change, but only for HTTP
-requests that resolve to an explicit audit area.
+rows are written inside the same database transaction as the model change. HTTP
+requests opt in through a route audit area; jobs, scheduler tasks, CLI commands,
+and domain services can opt in through an async audit scope.
 
 Mark the route tree that should produce audit rows:
 
@@ -752,6 +773,7 @@ Common credential-like column names are redacted by default in audit JSON:
 [audit]
 redact_sensitive_fields = true
 sensitive_fields = ["password", "password_hash", "secret", "api_key", "token", "refresh_token"]
+retention_days = 0 # keep forever; set a positive window for audit:prune
 ```
 
 Redacted fields remain present as `"[redacted]"` so reviewers can see that a value exists or
@@ -779,8 +801,48 @@ Payload shape is stable:
 - `after_data`: full row snapshot after create/update/restore/soft delete
 - `changes`: dirty-only JSON payload for updates, soft deletes, and restores
 
-Unmarked routes, routes under `audit_disabled()`, and non-HTTP writes from jobs, scheduler tasks,
-or CLI commands do not produce audit rows by default.
+Unmarked routes and routes under `audit_disabled()` do not produce lifecycle
+audit rows. Non-HTTP writes remain off by default, but can carry the same model
+lifecycle capture and attribution through `scope_audit`:
+
+```rust
+let audit = AuditContext::new("billing.jobs")
+    .with_actor(actor.clone())
+    .with_request_id(RequestId::new(job_id.to_string()));
+
+scope_audit(audit, async {
+    Invoice::update()
+        .where_(Invoice::ID.eq(invoice_id))
+        .set(Invoice::STATUS, InvoiceStatus::Paid)
+        .save(&app)
+        .await
+}).await?;
+```
+
+For domain actions that do not correspond to one model write, use the manual
+writer with any database executor or application transaction. Manual JSON is
+subject to the same recursive sensitive-field redaction policy:
+
+```rust
+app.audit()?.record(
+    transaction.executor(),
+    AuditEntry::new("invoice_exported", "invoices", invoice_id.to_string())
+        .subject_model("Invoice")
+        .after(serde_json::json!({"format": "pdf", "destination": "archive"}))?,
+).await?;
+```
+
+Prune explicitly before a cutoff with `AuditManager::prune_before`, apply
+`audit.retention_days` with `prune_retention`, or run the built-in command:
+
+```bash
+cargo run -- audit:prune
+cargo run -- audit:prune --days 90
+```
+
+The default retention is `0` (keep forever), so upgrading never deletes
+existing audit history automatically. Schedule the manager call or command at
+the cadence appropriate for the application.
 
 The framework `AuditLog` model is excluded from auditing automatically to avoid recursion.
 
@@ -851,6 +913,7 @@ let mut tx = app.begin_transaction().await?;
 // ... create order ...
 
 tx.dispatch_after_commit(SendOrderConfirmation { order_id: order.id.to_string() });
+tx.dispatch_event_after_commit(OrderPlaced { order_id: order.id.to_string() });
 tx.notify_after_commit(&user, &OrderPlacedNotification { /* ... */ })?;
 tx.after_commit(|app| async move {
     // custom cleanup

@@ -134,10 +134,9 @@ impl Plugin for AuditReviewPlugin {
         r.register_schedule(|s| {
             s.daily(AUDIT_CLEANUP, |inv| async move {
                 let db = inv.app().database()?;
-                db.raw_execute(
-                    "DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '90 days'",
-                    &[],
-                ).await?;
+                inv.app().audit()?
+                    .prune_before(&*db, inv.app().clock().now().sub_days(90))
+                    .await?;
                 Ok(())
             })
         });
@@ -248,7 +247,7 @@ bucket = "my-uploads"
 // Usage is identical to any other storage driver:
 let storage = app.storage()?;
 storage.put("avatars/user-1.jpg", &image_bytes).await?;
-let url = storage.url("avatars/user-1.jpg")?;
+let url = storage.url("avatars/user-1.jpg").await?;
 ```
 
 ---
@@ -463,7 +462,7 @@ impl<E: Event> EventListener<E> for WebhookForwarder {
                 event_type: E::ID.to_string(),
                 payload: payload.clone(),
                 attempt: 0,
-            })?;
+            }).await?;
         }
 
         Ok(())
@@ -540,7 +539,7 @@ impl Plugin for WebhookPlugin {
                             event_type: "webhook.test".into(),
                             payload: json!({"test": true}),
                             attempt: 0,
-                        })?;
+                        }).await?;
                         println!("  queued → {url}");
                     }
                     Ok(())
@@ -595,6 +594,42 @@ Schedule: hourly                   → retries stuck deliveries
 Job: webhook.deliver               → async delivery with 5 retries + exponential backoff
 Shutdown: flushes pending webhooks
 ```
+
+---
+
+## Testing a Plugin
+
+`PluginTestHarness` boots the plugin through the real Foundry application
+bootstrap while keeping the test focused on one primary plugin. It exposes the
+resolved manifest, contribution counts, dependency-ordered registry, services,
+and in-process HTTP client:
+
+```rust
+#[tokio::test]
+async fn plugin_contract_is_available() -> Result<()> {
+    let app = PluginTestHarness::new(MY_PLUGIN_ID, MyPlugin)
+        .register_plugin(MyDependencyPlugin)
+        .build()
+        .await?;
+
+    assert_eq!(app.manifest().id(), &MY_PLUGIN_ID);
+    assert_eq!(app.contributions().route_count, 1);
+    app.client()
+        .get("/my-plugin/health")
+        .send()
+        .await?
+        .assert_ok();
+
+    app.shutdown().await
+}
+```
+
+Use `load_config_dir` to verify that host config overrides plugin defaults, and
+`configure` when the host side needs providers, routes, or test service
+replacement. Always call `shutdown()` so plugin lifecycle hooks and managed
+tasks finish. See the [testing guide](testing.md#test-a-plugin-in-isolation) for
+the full test boundary. The harness is additive and requires no plugin config
+or migration.
 
 ---
 

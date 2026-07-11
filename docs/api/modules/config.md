@@ -20,7 +20,12 @@ enum Environment { Development, Production, Staging, Testing, Custom }
   fn is_testing(&self) -> bool
 enum GuardDriver { Token, Session, Custom }
 enum HttpRateLimitByConfig { Ip, Actor, ActorOrIp }
+enum SecurityTier { Relaxed, Strict }
+  const fn as_str(self) -> &'static str
+  const fn is_strict(self) -> bool
 struct AppConfig
+  fn resolved_security_tier(&self) -> SecurityTier
+  fn custom_security_tier_requires_confirmation(&self) -> bool
   fn signing_key_bytes(&self) -> Result<Vec<u8>>
 struct AuditConfig
 struct AuthConfig
@@ -78,6 +83,8 @@ struct MfaConfig
 struct ObservabilityConfig
 struct PasswordResetConfig
 struct RedisConfig
+  fn connect_timeout(&self) -> Duration
+  fn command_timeout(&self) -> Duration
 struct ResolvedDatabasePoolConfig
 struct RuntimeConfig
 struct SchedulerConfig

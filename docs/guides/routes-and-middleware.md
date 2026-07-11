@@ -336,11 +336,11 @@ r.resource_with_options(
     "posts",
     "/posts",
     HttpResourceRoutes::new()
-        .index(get(list_posts))
-        .store(post(create_post))
-        .show(get(show_post))
-        .update(put(update_post))
-        .destroy(delete(delete_post)),
+        .index_with_action(get(list_posts), "ListPosts")
+        .store_with_action(post(create_post), "CreatePost")
+        .show_with_action(get(show_post), "GetPost")
+        .update_with_action(put(update_post), "UpdatePost")
+        .destroy_with_action(delete(delete_post), "DeletePost"),
     HttpRouteOptions::new()
         .guard(Guard::User)
         .middleware_group(API_MIDDLEWARE)
@@ -349,6 +349,52 @@ r.resource_with_options(
 ```
 
 This registers conventional named routes such as `posts.index`, `posts.store`, `posts.show`, `posts.update`, and `posts.destroy`.
+
+Named routes used by contract/OpenAPI/TypeScript export must also declare an
+explicit business action name. The action is intentionally independent from
+the route ID so internal URL naming can change without renaming generated SDK
+methods:
+
+```rust
+scope.get("/{id}", "show", show_post, |route| {
+    route
+        .action_name("GetPost")
+        .path_parameter::<ModelId<Post>>("id")
+        .query_parameter::<bool>("include_comments", false)
+        .response::<PostResponse>(200)
+        .error::<ApiError>(404, "post_not_found");
+});
+```
+
+Path parameters not explicitly documented still receive a required string
+fallback. Declare them with `path_parameter::<T>` for the real schema. Query,
+header, and cookie parameters record location, schema, and requiredness.
+Action-specific errors accept an optional typed response schema.
+
+Request schemas default to `application/json` (or `multipart/form-data` when
+file validation requires it). Override the OpenAPI media type explicitly for a
+form, XML, text, or other documented body:
+
+```rust
+scope.post("/sessions", "store", create_session, |route| {
+    route
+        .action_name("CreateSession")
+        .request::<CreateSession>()
+        .request_content_type("application/x-www-form-urlencoded")
+        .response::<SessionResponse>(201);
+});
+```
+
+`request_content_type(...)` requires a request schema and is contract/OpenAPI
+metadata; the handler remains responsible for using an extractor compatible
+with that media type.
+
+Generated OpenAPI operations use the explicit action name as `operationId`.
+Guarded routes emit the standard `bearerAuth` security requirement and retain
+`x-foundry-guard` / `x-foundry-permissions` for Foundry-specific policy
+metadata. Success responses receive the canonical HTTP description, and every
+operation includes the manifest's standard errors plus its action-specific
+errors. Multiple error schemas for one status are rendered with `oneOf`.
 
 ### Generating URLs
 
@@ -881,12 +927,7 @@ async fn list_users(State(app): State<AppContext>) -> impl IntoResponse {
     Json(UserResource::collection(&users))
 }
 
-async fn show_user(State(app): State<AppContext>, Path(id): Path<String>) -> impl IntoResponse {
-    let db = app.database()?;
-    let user = User::model_query()
-        .where_col(User::ID, &id)
-        .first(&*db).await?
-        .ok_or_else(|| Error::not_found("user not found"))?;
+async fn show_user(ModelPath(user): ModelPath<User>) -> impl IntoResponse {
     Json(UserResource::make(&user))
 }
 
@@ -898,6 +939,11 @@ async fn paginated_users(State(app): State<AppContext>, Query(page): Query<Pagin
     Json(UserResource::paginated(&paginated, "/api/v1/users"))
 }
 ```
+
+`ModelPath<M>` decodes the path segment as `M::PrimaryKey`, loads the model,
+returns `400 Bad Request` for a malformed typed key, and returns `404 Not Found`
+when the key is valid but absent. It supports generated UUID IDs and declared
+manual primary-key types.
 
 ---
 

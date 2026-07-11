@@ -1584,9 +1584,15 @@ fn spawn_native_stream(
         )
         .await;
 
-        let reset_result = reset_statement_timeout(connection.as_mut(), TimeoutMode::Session).await;
-        stream_result?;
-        reset_result
+        match stream_result? {
+            StreamCompletion::Finished => {
+                reset_statement_timeout(connection.as_mut(), TimeoutMode::Session).await
+            }
+            StreamCompletion::Cancelled => {
+                connection.close_on_drop();
+                Ok(())
+            }
+        }
     });
 
     receiver_stream(receiver, cancel_tx, handle)
@@ -1641,6 +1647,11 @@ fn spawn_session_stream(
             &mut cancel_rx,
         )
         .await;
+
+        if matches!(&stream_result, Ok(StreamCompletion::Cancelled)) {
+            connection.close_on_drop();
+            return Ok(());
+        }
 
         let reset_result = reset_statement_timeout(connection.as_mut(), TimeoutMode::Session).await;
         {
@@ -1798,6 +1809,12 @@ fn log_sql_complete(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamCompletion {
+    Finished,
+    Cancelled,
+}
+
 async fn stream_rows_from_connection(
     connection: &mut sqlx::postgres::PgConnection,
     adapters: &BTreeMap<String, DbType>,
@@ -1805,21 +1822,21 @@ async fn stream_rows_from_connection(
     options: &QueryExecutionOptions,
     sender: &mpsc::Sender<Result<DbRecord>>,
     cancel_rx: &mut oneshot::Receiver<()>,
-) -> Result<()> {
+) -> Result<StreamCompletion> {
     let query = bind_query(&compiled.sql, &compiled.bindings)?;
     let mut rows = query.fetch(connection);
 
     loop {
         let next_row = if let Some(timeout_duration) = options.timeout {
             tokio::select! {
-                _ = &mut *cancel_rx => return Ok(()),
+                _ = &mut *cancel_rx => return Ok(StreamCompletion::Cancelled),
                 row = timeout(safety_timeout(timeout_duration), rows.next()) => {
                     row.map_err(|_| outer_timeout_error(options, "stream", &compiled.sql))?
                 }
             }
         } else {
             tokio::select! {
-                _ = &mut *cancel_rx => return Ok(()),
+                _ = &mut *cancel_rx => return Ok(StreamCompletion::Cancelled),
                 row = rows.next() => row,
             }
         };
@@ -1828,7 +1845,7 @@ async fn stream_rows_from_connection(
             Some(Ok(row)) => {
                 let record = decode_row(&row, &compiled.sql, options.label.as_deref(), adapters)?;
                 if sender.send(Ok(record)).await.is_err() {
-                    break;
+                    return Ok(StreamCompletion::Cancelled);
                 }
             }
             Some(Err(error)) => {
@@ -1840,7 +1857,7 @@ async fn stream_rows_from_connection(
         }
     }
 
-    Ok(())
+    Ok(StreamCompletion::Finished)
 }
 
 async fn configure_statement_timeout(
@@ -2203,7 +2220,7 @@ fn decode_column(
     adapters: &BTreeMap<String, DbType>,
 ) -> Result<DbValue> {
     let normalized = normalize_type_name(type_name);
-    let mapped = match normalized.as_str() {
+    let built_in = match normalized.as_str() {
         "int2" => Some(DbType::Int16),
         "int4" => Some(DbType::Int32),
         "int8" => Some(DbType::Int64),
@@ -2234,11 +2251,20 @@ fn decode_column(
         "_date" => Some(DbType::DateArray),
         "_time" | "_timetz" => Some(DbType::TimeArray),
         "_bytea" => Some(DbType::ByteaArray),
-        _ => adapters.get(&normalized).copied(),
-    }
-    .ok_or_else(|| unsupported_type_error(name, type_name, &normalized, sql, label))?;
+        _ => None,
+    };
+    let (mapped, unchecked) = match built_in {
+        Some(db_type) => (db_type, false),
+        None => (
+            adapters
+                .get(&normalized)
+                .copied()
+                .ok_or_else(|| unsupported_type_error(name, type_name, &normalized, sql, label))?,
+            true,
+        ),
+    };
 
-    decode_column_as(row, name, mapped).map_err(|error| {
+    decode_column_as(row, name, mapped, unchecked).map_err(|error| {
         Error::message(format!(
             "failed to decode column `{name}` with postgres type `{type_name}`{}: {error}",
             format_query_context(sql, label)
@@ -2246,90 +2272,89 @@ fn decode_column(
     })
 }
 
-fn decode_column_as(row: &PgRow, name: &str, db_type: DbType) -> Result<DbValue> {
+fn decode_column_as(row: &PgRow, name: &str, db_type: DbType, unchecked: bool) -> Result<DbValue> {
+    macro_rules! get_optional {
+        ($value:ty) => {
+            if unchecked {
+                row.try_get_unchecked::<Option<$value>, _>(name)
+            } else {
+                row.try_get::<Option<$value>, _>(name)
+            }
+        };
+    }
+
     match db_type {
-        DbType::Int16 => row
-            .try_get::<Option<i16>, _>(name)
+        DbType::Int16 => get_optional!(i16)
             .map(|value| {
                 value
                     .map(DbValue::Int16)
                     .unwrap_or(DbValue::Null(DbType::Int16))
             })
             .map_err(Error::other),
-        DbType::Int32 => row
-            .try_get::<Option<i32>, _>(name)
+        DbType::Int32 => get_optional!(i32)
             .map(|value| {
                 value
                     .map(DbValue::Int32)
                     .unwrap_or(DbValue::Null(DbType::Int32))
             })
             .map_err(Error::other),
-        DbType::Int64 => row
-            .try_get::<Option<i64>, _>(name)
+        DbType::Int64 => get_optional!(i64)
             .map(|value| {
                 value
                     .map(DbValue::Int64)
                     .unwrap_or(DbValue::Null(DbType::Int64))
             })
             .map_err(Error::other),
-        DbType::Bool => row
-            .try_get::<Option<bool>, _>(name)
+        DbType::Bool => get_optional!(bool)
             .map(|value| {
                 value
                     .map(DbValue::Bool)
                     .unwrap_or(DbValue::Null(DbType::Bool))
             })
             .map_err(Error::other),
-        DbType::Float32 => row
-            .try_get::<Option<f32>, _>(name)
+        DbType::Float32 => get_optional!(f32)
             .map(|value| {
                 value
                     .map(DbValue::Float32)
                     .unwrap_or(DbValue::Null(DbType::Float32))
             })
             .map_err(Error::other),
-        DbType::Float64 => row
-            .try_get::<Option<f64>, _>(name)
+        DbType::Float64 => get_optional!(f64)
             .map(|value| {
                 value
                     .map(DbValue::Float64)
                     .unwrap_or(DbValue::Null(DbType::Float64))
             })
             .map_err(Error::other),
-        DbType::Numeric => row
-            .try_get::<Option<BigDecimal>, _>(name)
+        DbType::Numeric => get_optional!(BigDecimal)
             .map(|value| match value {
                 Some(value) => decode_numeric_value(value).map(DbValue::Numeric),
                 None => Ok(DbValue::Null(DbType::Numeric)),
             })
             .map_err(Error::other)?
             .map_err(Error::other),
-        DbType::Text => row
-            .try_get::<Option<String>, _>(name)
+        DbType::Text => get_optional!(String)
             .map(|value| {
                 value
                     .map(DbValue::Text)
                     .unwrap_or(DbValue::Null(DbType::Text))
             })
             .map_err(Error::other),
-        DbType::Json => row
-            .try_get::<Option<sqlx::types::Json<serde_json::Value>>, _>(name)
+        DbType::Json => get_optional!(sqlx::types::Json<serde_json::Value>)
             .map(|value| {
                 value
                     .map(|value| DbValue::Json(value.0))
                     .unwrap_or(DbValue::Null(DbType::Json))
             })
             .map_err(Error::other),
-        DbType::Uuid => row
-            .try_get::<Option<Uuid>, _>(name)
+        DbType::Uuid => get_optional!(Uuid)
             .map(|value| {
                 value
                     .map(DbValue::Uuid)
                     .unwrap_or(DbValue::Null(DbType::Uuid))
             })
             .map_err(Error::other),
-        DbType::TimestampTz => row
-            .try_get::<Option<ChronoDateTime<ChronoUtc>>, _>(name)
+        DbType::TimestampTz => get_optional!(ChronoDateTime<ChronoUtc>)
             .map(|value| {
                 value
                     .map(DateTime::from_chrono)
@@ -2337,8 +2362,7 @@ fn decode_column_as(row: &PgRow, name: &str, db_type: DbType) -> Result<DbValue>
                     .unwrap_or(DbValue::Null(DbType::TimestampTz))
             })
             .map_err(Error::other),
-        DbType::Timestamp => row
-            .try_get::<Option<ChronoNaiveDateTime>, _>(name)
+        DbType::Timestamp => get_optional!(ChronoNaiveDateTime)
             .map(|value| {
                 value
                     .map(LocalDateTime::from_chrono)
@@ -2346,8 +2370,7 @@ fn decode_column_as(row: &PgRow, name: &str, db_type: DbType) -> Result<DbValue>
                     .unwrap_or(DbValue::Null(DbType::Timestamp))
             })
             .map_err(Error::other),
-        DbType::Date => row
-            .try_get::<Option<ChronoDate>, _>(name)
+        DbType::Date => get_optional!(ChronoDate)
             .map(|value| {
                 value
                     .map(Date::from_chrono)
@@ -2355,8 +2378,7 @@ fn decode_column_as(row: &PgRow, name: &str, db_type: DbType) -> Result<DbValue>
                     .unwrap_or(DbValue::Null(DbType::Date))
             })
             .map_err(Error::other),
-        DbType::Time => row
-            .try_get::<Option<ChronoTime>, _>(name)
+        DbType::Time => get_optional!(ChronoTime)
             .map(|value| {
                 value
                     .map(Time::from_chrono)
@@ -2364,80 +2386,70 @@ fn decode_column_as(row: &PgRow, name: &str, db_type: DbType) -> Result<DbValue>
                     .unwrap_or(DbValue::Null(DbType::Time))
             })
             .map_err(Error::other),
-        DbType::Bytea => row
-            .try_get::<Option<Vec<u8>>, _>(name)
+        DbType::Bytea => get_optional!(Vec<u8>)
             .map(|value| {
                 value
                     .map(DbValue::Bytea)
                     .unwrap_or(DbValue::Null(DbType::Bytea))
             })
             .map_err(Error::other),
-        DbType::Int16Array => row
-            .try_get::<Option<Vec<i16>>, _>(name)
+        DbType::Int16Array => get_optional!(Vec<i16>)
             .map(|value| {
                 value
                     .map(DbValue::Int16Array)
                     .unwrap_or(DbValue::Null(DbType::Int16Array))
             })
             .map_err(Error::other),
-        DbType::Int32Array => row
-            .try_get::<Option<Vec<i32>>, _>(name)
+        DbType::Int32Array => get_optional!(Vec<i32>)
             .map(|value| {
                 value
                     .map(DbValue::Int32Array)
                     .unwrap_or(DbValue::Null(DbType::Int32Array))
             })
             .map_err(Error::other),
-        DbType::Int64Array => row
-            .try_get::<Option<Vec<i64>>, _>(name)
+        DbType::Int64Array => get_optional!(Vec<i64>)
             .map(|value| {
                 value
                     .map(DbValue::Int64Array)
                     .unwrap_or(DbValue::Null(DbType::Int64Array))
             })
             .map_err(Error::other),
-        DbType::BoolArray => row
-            .try_get::<Option<Vec<bool>>, _>(name)
+        DbType::BoolArray => get_optional!(Vec<bool>)
             .map(|value| {
                 value
                     .map(DbValue::BoolArray)
                     .unwrap_or(DbValue::Null(DbType::BoolArray))
             })
             .map_err(Error::other),
-        DbType::Float32Array => row
-            .try_get::<Option<Vec<f32>>, _>(name)
+        DbType::Float32Array => get_optional!(Vec<f32>)
             .map(|value| {
                 value
                     .map(DbValue::Float32Array)
                     .unwrap_or(DbValue::Null(DbType::Float32Array))
             })
             .map_err(Error::other),
-        DbType::Float64Array => row
-            .try_get::<Option<Vec<f64>>, _>(name)
+        DbType::Float64Array => get_optional!(Vec<f64>)
             .map(|value| {
                 value
                     .map(DbValue::Float64Array)
                     .unwrap_or(DbValue::Null(DbType::Float64Array))
             })
             .map_err(Error::other),
-        DbType::NumericArray => row
-            .try_get::<Option<Vec<BigDecimal>>, _>(name)
+        DbType::NumericArray => get_optional!(Vec<BigDecimal>)
             .map(|value| match value {
                 Some(values) => decode_numeric_values(values).map(DbValue::NumericArray),
                 None => Ok(DbValue::Null(DbType::NumericArray)),
             })
             .map_err(Error::other)?
             .map_err(Error::other),
-        DbType::TextArray => row
-            .try_get::<Option<Vec<String>>, _>(name)
+        DbType::TextArray => get_optional!(Vec<String>)
             .map(|value| {
                 value
                     .map(DbValue::TextArray)
                     .unwrap_or(DbValue::Null(DbType::TextArray))
             })
             .map_err(Error::other),
-        DbType::JsonArray => row
-            .try_get::<Option<Vec<sqlx::types::Json<serde_json::Value>>>, _>(name)
+        DbType::JsonArray => get_optional!(Vec<sqlx::types::Json<serde_json::Value>>)
             .map(|value| match value {
                 Some(values) => {
                     DbValue::JsonArray(values.into_iter().map(|value| value.0).collect())
@@ -2445,16 +2457,14 @@ fn decode_column_as(row: &PgRow, name: &str, db_type: DbType) -> Result<DbValue>
                 None => DbValue::Null(DbType::JsonArray),
             })
             .map_err(Error::other),
-        DbType::UuidArray => row
-            .try_get::<Option<Vec<Uuid>>, _>(name)
+        DbType::UuidArray => get_optional!(Vec<Uuid>)
             .map(|value| {
                 value
                     .map(DbValue::UuidArray)
                     .unwrap_or(DbValue::Null(DbType::UuidArray))
             })
             .map_err(Error::other),
-        DbType::TimestampTzArray => row
-            .try_get::<Option<Vec<ChronoDateTime<ChronoUtc>>>, _>(name)
+        DbType::TimestampTzArray => get_optional!(Vec<ChronoDateTime<ChronoUtc>>)
             .map(|value| {
                 value
                     .map(|values| {
@@ -2465,8 +2475,7 @@ fn decode_column_as(row: &PgRow, name: &str, db_type: DbType) -> Result<DbValue>
                     .unwrap_or(DbValue::Null(DbType::TimestampTzArray))
             })
             .map_err(Error::other),
-        DbType::TimestampArray => row
-            .try_get::<Option<Vec<ChronoNaiveDateTime>>, _>(name)
+        DbType::TimestampArray => get_optional!(Vec<ChronoNaiveDateTime>)
             .map(|value| {
                 value
                     .map(|values| {
@@ -2477,8 +2486,7 @@ fn decode_column_as(row: &PgRow, name: &str, db_type: DbType) -> Result<DbValue>
                     .unwrap_or(DbValue::Null(DbType::TimestampArray))
             })
             .map_err(Error::other),
-        DbType::DateArray => row
-            .try_get::<Option<Vec<ChronoDate>>, _>(name)
+        DbType::DateArray => get_optional!(Vec<ChronoDate>)
             .map(|value| {
                 value
                     .map(|values| {
@@ -2487,8 +2495,7 @@ fn decode_column_as(row: &PgRow, name: &str, db_type: DbType) -> Result<DbValue>
                     .unwrap_or(DbValue::Null(DbType::DateArray))
             })
             .map_err(Error::other),
-        DbType::TimeArray => row
-            .try_get::<Option<Vec<ChronoTime>>, _>(name)
+        DbType::TimeArray => get_optional!(Vec<ChronoTime>)
             .map(|value| {
                 value
                     .map(|values| {
@@ -2497,8 +2504,7 @@ fn decode_column_as(row: &PgRow, name: &str, db_type: DbType) -> Result<DbValue>
                     .unwrap_or(DbValue::Null(DbType::TimeArray))
             })
             .map_err(Error::other),
-        DbType::ByteaArray => row
-            .try_get::<Option<Vec<Vec<u8>>>, _>(name)
+        DbType::ByteaArray => get_optional!(Vec<Vec<u8>>)
             .map(|value| {
                 value
                     .map(DbValue::ByteaArray)

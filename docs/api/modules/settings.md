@@ -1,5 +1,7 @@
 # settings
 
+Typed persistent application settings with cache integration
+
 [Back to index](../index.md)
 
 ## foundry::settings

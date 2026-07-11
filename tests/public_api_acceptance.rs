@@ -144,6 +144,17 @@ async fn surface_handler(Validated(payload): Validated<SurfaceRequest>) -> impl 
     Json(json!({ "name": payload.name }))
 }
 
+#[test]
+fn database_notification_repository_surface_is_nameable_from_the_prelude() {
+    let scope = DatabaseNotificationScope::new("surface_user", "surface-user").unwrap();
+    let repository = DatabaseNotificationRepository::from_scope(scope.clone());
+    let _id: ModelId<DatabaseNotification> = ModelId::generate();
+
+    assert_eq!(repository.scope(), &scope);
+    assert_eq!(scope.notifiable_type(), "surface_user");
+    assert_eq!(scope.notifiable_id(), "surface-user");
+}
+
 #[tokio::test]
 async fn blessed_public_surface_composes_for_consumer_apps() {
     let kernel = App::builder()
@@ -171,6 +182,18 @@ async fn blessed_public_surface_composes_for_consumer_apps() {
 
     let blocking_result = run_blocking("public surface", || Ok(42)).await.unwrap();
     assert_eq!(blocking_result, 42);
+
+    let currency = CountryCurrency {
+        code: "MYR".to_string(),
+        name: Some("Malaysian ringgit".to_string()),
+        symbol: Some("RM".to_string()),
+        minor_units: Some(2),
+    };
+    assert_eq!(currency.code, "MYR");
+    assert_eq!(
+        CountryStatus::parse("enabled"),
+        Some(CountryStatus::Enabled)
+    );
 
     kernel
         .run_with_args(vec![String::from("foundry"), String::from("surface:ping")])
@@ -208,5 +231,21 @@ async fn testing_builders_are_nameable_and_test_apps_shutdown_gracefully() {
     drop(request);
 
     app.shutdown().await.unwrap();
+    assert!(shutdown.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn custom_kernel_hosts_can_shutdown_the_full_runtime_idempotently() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let kernel = App::builder()
+        .register_plugin(TestShutdownPlugin {
+            shutdown: shutdown.clone(),
+        })
+        .build_cli_kernel()
+        .await
+        .unwrap();
+
+    kernel.app().shutdown().await.unwrap();
+    kernel.app().shutdown().await.unwrap();
     assert!(shutdown.load(Ordering::Acquire));
 }

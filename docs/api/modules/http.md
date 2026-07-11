@@ -39,10 +39,15 @@ struct HttpRegistrar
 struct HttpResourceRoutes
   fn new() -> Self
   fn index(self, route: MethodRouter<AppContext>) -> Self
+  fn index_with_action( self, route: MethodRouter<AppContext>, action_name: impl Into<String>, ) -> Self
   fn store(self, route: MethodRouter<AppContext>) -> Self
+  fn store_with_action( self, route: MethodRouter<AppContext>, action_name: impl Into<String>, ) -> Self
   fn show(self, route: MethodRouter<AppContext>) -> Self
+  fn show_with_action( self, route: MethodRouter<AppContext>, action_name: impl Into<String>, ) -> Self
   fn update(self, route: MethodRouter<AppContext>) -> Self
+  fn update_with_action( self, route: MethodRouter<AppContext>, action_name: impl Into<String>, ) -> Self
   fn destroy(self, route: MethodRouter<AppContext>) -> Self
+  fn destroy_with_action( self, route: MethodRouter<AppContext>, action_name: impl Into<String>, ) -> Self
   fn id_param(self, id_param: impl Into<String>) -> Self
 struct HttpRouteBuilder
   fn public(&mut self) -> &mut Self
@@ -59,9 +64,18 @@ struct HttpRouteBuilder
   fn rate_limit(&mut self, rate_limit: RateLimit) -> &mut Self
   fn tag(&mut self, tag: &str) -> &mut Self
   fn summary(&mut self, summary: &str) -> &mut Self
+  fn action_name(&mut self, action_name: impl Into<String>) -> &mut Self
   fn description(&mut self, description: &str) -> &mut Self
   fn request<T: ApiSchema>(&mut self) -> &mut Self
+  fn request_content_type( &mut self, content_type: impl Into<String>, ) -> &mut Self
+  fn parameter<T: ApiSchema>( &mut self, name: impl Into<String>, location: ContractParameterLocation, required: bool, ) -> &mut Self
+  fn path_parameter<T: ApiSchema>( &mut self, name: impl Into<String>, ) -> &mut Self
+  fn query_parameter<T: ApiSchema>( &mut self, name: impl Into<String>, required: bool, ) -> &mut Self
+  fn header_parameter<T: ApiSchema>( &mut self, name: impl Into<String>, required: bool, ) -> &mut Self
+  fn cookie_parameter<T: ApiSchema>( &mut self, name: impl Into<String>, required: bool, ) -> &mut Self
   fn response<T: ApiSchema>(&mut self, status: u16) -> &mut Self
+  fn error<T: ApiSchema>( &mut self, status: u16, code: impl Into<String>, ) -> &mut Self
+  fn error_without_schema( &mut self, status: u16, code: impl Into<String>, ) -> &mut Self
   fn deprecated(&mut self) -> &mut Self
 struct HttpRouteOptions
   fn new() -> Self
@@ -80,9 +94,18 @@ struct HttpRouteOptions
   fn document(self, doc: RouteDoc) -> Self
   fn tag(self, tag: &str) -> Self
   fn summary(self, summary: &str) -> Self
+  fn action_name(self, action_name: impl Into<String>) -> Self
   fn description(self, description: &str) -> Self
   fn request<T: ApiSchema>(self) -> Self
+  fn request_content_type(self, content_type: impl Into<String>) -> Self
+  fn parameter<T: ApiSchema>( self, name: impl Into<String>, location: ContractParameterLocation, required: bool, ) -> Self
+  fn path_parameter<T: ApiSchema>(self, name: impl Into<String>) -> Self
+  fn query_parameter<T: ApiSchema>( self, name: impl Into<String>, required: bool, ) -> Self
+  fn header_parameter<T: ApiSchema>( self, name: impl Into<String>, required: bool, ) -> Self
+  fn cookie_parameter<T: ApiSchema>( self, name: impl Into<String>, required: bool, ) -> Self
   fn response<T: ApiSchema>(self, status: u16) -> Self
+  fn error<T: ApiSchema>(self, status: u16, code: impl Into<String>) -> Self
+  fn error_without_schema(self, status: u16, code: impl Into<String>) -> Self
   fn deprecated(self) -> Self
 struct HttpScope
   fn scope( &mut self, path: &str, f: impl FnOnce(&mut HttpScope<'_>) -> Result<()>, ) -> Result<&mut Self>
@@ -106,7 +129,12 @@ struct HttpScope
   fn put<H, T>( &mut self, path: &str, name: &str, handler: H, configure: impl FnOnce(&mut HttpRouteBuilder), ) -> &mut Self
   fn patch<H, T>( &mut self, path: &str, name: &str, handler: H, configure: impl FnOnce(&mut HttpRouteBuilder), ) -> &mut Self
   fn delete<H, T>( &mut self, path: &str, name: &str, handler: H, configure: impl FnOnce(&mut HttpRouteBuilder), ) -> &mut Self
+struct ModelPath
+  fn into_inner(self) -> M
 struct RouteManifestEntry
+  fn path_params(&self) -> impl Iterator<Item = &RouteManifestParameter>
+struct RouteManifestError
+struct RouteManifestParameter
 struct RouteManifestResponse
 ```
 

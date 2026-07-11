@@ -8,8 +8,8 @@ use async_trait::async_trait;
 
 use crate::audit::AuditManager;
 use crate::auth::{
-    Actor, AuthManager, AuthenticatableRegistry, AuthenticatableRegistryBuilder, Authorizer,
-    GuardRegistryBuilder, PolicyRegistryBuilder,
+    Actor, ActorHydratorRegistryBuilder, AuthManager, AuthenticatableRegistry,
+    AuthenticatableRegistryBuilder, Authorizer, GuardRegistryBuilder, PolicyRegistryBuilder,
 };
 use crate::cli::CommandRegistrar;
 use crate::config::{ConfigRepository, RuntimeConfig};
@@ -65,11 +65,23 @@ pub struct AppTransaction {
 }
 
 async fn finish_kernel_run(app: AppContext, result: Result<()>) -> Result<()> {
-    let cleanup_result = app.shutdown_runtime().await;
+    let cleanup_result = app.shutdown().await;
 
     match result {
         Ok(()) => cleanup_result,
         Err(error) => Err(error),
+    }
+}
+
+fn load_dotenv_if_present() -> Result<()> {
+    handle_dotenv_result(dotenvy::dotenv())
+}
+
+fn handle_dotenv_result(result: dotenvy::Result<PathBuf>) -> Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if error.not_found() => Ok(()),
+        Err(error) => Err(Error::message(format!("failed to load .env: {error}"))),
     }
 }
 
@@ -101,7 +113,10 @@ impl AppContext {
     }
 
     pub fn clock(&self) -> Clock {
-        Clock::new(self.timezone.clone())
+        self.container
+            .resolve::<Clock>()
+            .map(|clock| clock.as_ref().clone())
+            .unwrap_or_else(|_| Clock::new(self.timezone.clone()))
     }
 
     pub fn rules(&self) -> &RuleRegistry {
@@ -131,7 +146,7 @@ impl AppContext {
         self.resolve::<JobDispatcher>()
     }
 
-    pub(crate) fn audit(&self) -> Result<Arc<AuditManager>> {
+    pub fn audit(&self) -> Result<Arc<AuditManager>> {
         self.resolve::<AuditManager>()
     }
 
@@ -159,6 +174,10 @@ impl AppContext {
         self.resolve::<EmailManager>()
     }
 
+    pub fn http_client(&self) -> Result<Arc<crate::http_client::HttpClient>> {
+        self.resolve::<crate::http_client::HttpClient>()
+    }
+
     pub fn hash(&self) -> Result<Arc<HashManager>> {
         self.resolve::<HashManager>()
     }
@@ -181,8 +200,8 @@ impl AppContext {
     /// Run work inside a model extension cache scope.
     ///
     /// HTTP requests get this automatically. This helper is useful for CLI jobs
-    /// or tests that want attachment/translation eager loading and lazy batch
-    /// safety outside the HTTP middleware stack.
+    /// or tests that want attachment, metadata, or translation eager loading
+    /// and lazy batch safety outside the HTTP middleware stack.
     pub async fn with_model_batching<F, T>(&self, future: F) -> T
     where
         F: Future<Output = T>,
@@ -363,14 +382,40 @@ impl AppContext {
         tasks.shutdown(timeout).await;
     }
 
-    pub(crate) async fn shutdown_runtime(&self) -> Result<()> {
+    /// Gracefully stop framework-managed background tasks and plugins.
+    ///
+    /// Standard `run_*` methods call this automatically. Consumers that use a
+    /// public `build_*_kernel` method to integrate Foundry into a custom host
+    /// must call it when their process shuts down. Repeated calls are safe.
+    pub async fn shutdown(&self) -> Result<()> {
         self.shutdown_background_tasks().await;
-        self.shutdown_plugins().await
+        let plugin_result = self.shutdown_plugins().await;
+        let flush_timeout = self
+            .config()
+            .logging()
+            .map(|config| Duration::from_millis(config.file_flush_timeout_ms))
+            .unwrap_or_else(|_| Duration::from_secs(5));
+        let logging_result = crate::logging::flush_file_writer(flush_timeout).await;
+
+        match plugin_result {
+            Ok(()) => logging_result,
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn job_runtime(&self) -> Result<Arc<JobRuntime>> {
         self.resolve::<JobRuntime>()
     }
+}
+
+fn snapshot_transaction_event_origin(
+    transaction_actor: Option<&Actor>,
+) -> Option<crate::events::EventOrigin> {
+    let actor = transaction_actor
+        .cloned()
+        .or_else(crate::logging::current_actor);
+    let request = crate::logging::current_request();
+    crate::events::EventOrigin::from_request(actor, request.as_ref())
 }
 
 impl AppTransaction {
@@ -412,6 +457,19 @@ impl AppTransaction {
         }));
     }
 
+    /// Buffer an event dispatch that will only execute after a successful `commit()`.
+    ///
+    /// The current actor and request metadata are captured when this method is
+    /// called, before the transaction leaves the request scope. An actor set on
+    /// the transaction takes precedence over the current task-local actor.
+    pub fn dispatch_event_after_commit<E: crate::events::Event>(&self, event: E) {
+        let origin = snapshot_transaction_event_origin(self.actor.as_ref());
+
+        self.defer_after_commit(Box::new(move |app| {
+            Box::pin(async move { app.events()?.dispatch_with_origin(event, origin).await })
+        }));
+    }
+
     /// Buffer a queued notification that will only be dispatched after a successful `commit()`.
     ///
     /// Selected channel payloads are pre-rendered immediately (at call time) so
@@ -422,8 +480,10 @@ impl AppTransaction {
         notifiable: &dyn crate::notifications::Notifiable,
         notification: &dyn crate::notifications::Notification,
     ) -> Result<()> {
-        let job = crate::notifications::build_notification_job(notifiable, notification)?;
-        self.dispatch_after_commit(job);
+        let jobs = crate::notifications::build_notification_jobs(notifiable, notification)?;
+        for job in jobs {
+            self.dispatch_after_commit(job);
+        }
         Ok(())
     }
 
@@ -657,6 +717,7 @@ impl App {
 
 pub struct AppBuilder {
     load_env: bool,
+    initialize_logging: bool,
     config_dir: Option<PathBuf>,
     plugins: Vec<Arc<dyn Plugin>>,
     providers: Vec<Arc<dyn ServiceProvider>>,
@@ -682,6 +743,7 @@ impl AppBuilder {
     pub fn new() -> Self {
         Self {
             load_env: false,
+            initialize_logging: true,
             config_dir: None,
             plugins: Vec::new(),
             providers: Vec::new(),
@@ -714,6 +776,16 @@ impl AppBuilder {
 
     pub fn load_env(mut self) -> Self {
         self.load_env = true;
+        self
+    }
+
+    /// Leave global tracing subscriber installation to the consumer host.
+    ///
+    /// Use this when embedding Foundry in a process that installs its own
+    /// subscriber. Foundry will still emit tracing events, but it will not
+    /// configure stdout, file logging, or OpenTelemetry exporters.
+    pub fn use_external_tracing_subscriber(mut self) -> Self {
+        self.initialize_logging = false;
         self
     }
 
@@ -934,6 +1006,7 @@ impl AppBuilder {
     async fn bootstrap(self, profile: BootProfile) -> Result<BootArtifacts> {
         let AppBuilder {
             load_env,
+            initialize_logging,
             config_dir,
             plugins,
             providers,
@@ -950,13 +1023,15 @@ impl AppBuilder {
         } = self;
 
         if load_env {
-            dotenvy::dotenv().ok();
+            load_dotenv_if_present()?;
         }
 
         let prepared_plugins = crate::plugin::prepare_plugins(&plugins)?;
         let config = load_boot_config(config_dir, prepared_plugins.config_defaults.clone())?;
         set_runtime_model_defaults(config.database()?.models.clone());
-        crate::logging::init(&config)?;
+        if initialize_logging {
+            crate::logging::init(&config)?;
+        }
 
         let container = Container::new();
         let rules = build_rule_registry(&prepared_plugins.validation_rules, validation_rules)?;
@@ -986,6 +1061,10 @@ impl AppBuilder {
         registrar.register_job::<crate::datatable::export_job::DatatableExportJob>()?;
         registrar.register_job::<crate::notifications::SendNotificationJob>()?;
 
+        if !container.contains::<crate::http_client::HttpClient>() {
+            container.singleton(crate::http_client::HttpClient::new()?)?;
+        }
+
         let app = AppContext::new(container, config, rules)?;
         app.container()
             .singleton_arc(Arc::new(ManagedBackgroundTasks::default()))?;
@@ -1013,14 +1092,22 @@ impl AppBuilder {
         ));
         app.container().singleton_arc(distributed_lock.clone())?;
 
+        let actor_hydrators = Arc::new(ActorHydratorRegistryBuilder::freeze_shared(
+            registries.actor_hydrator.clone(),
+        ));
+
         // Auto-register guard authenticators from config before freezing
         let token_manager = Arc::new(crate::auth::token::TokenManager::new(
+            app.clone(),
             database.clone(),
             auth_config.tokens.clone(),
+            actor_hydrators.clone(),
         ));
         let session_manager = Arc::new(crate::auth::session::SessionManager::new(
+            app.clone(),
             redis.clone(),
             auth_config.sessions.clone(),
+            actor_hydrators.clone(),
         ));
         let password_reset_expiry_minutes = auth_config.password_resets.expiry_minutes;
         let email_verification_expiry_minutes = auth_config.email_verification.expiry_minutes;
@@ -1032,11 +1119,9 @@ impl AppBuilder {
                 }
                 match driver_config.driver {
                     crate::config::GuardDriver::Token => {
-                        guards.register_arc(
+                        guards.register_token(
                             GuardId::owned(guard_name.clone()),
-                            Arc::new(crate::auth::token::TokenAuthenticator::new(
-                                token_manager.clone(),
-                            )),
+                            token_manager.clone(),
                         )?;
                     }
                     crate::config::GuardDriver::Session => {
@@ -1051,8 +1136,10 @@ impl AppBuilder {
         }
 
         let auth_manager = Arc::new(AuthManager::new(
+            app.clone(),
             auth_config,
             GuardRegistryBuilder::freeze_shared(registries.guard.clone()),
+            actor_hydrators,
         ));
         let authorizer = Arc::new(Authorizer::new(
             app.clone(),
@@ -1082,11 +1169,10 @@ impl AppBuilder {
             app.clone(),
             EventRegistryBuilder::freeze_shared(registries.event.clone()),
         ));
-        let job_runtime = Arc::new(JobRuntime::new(
-            backend,
-            jobs_config.clone(),
-            JobRegistryBuilder::freeze_shared(registries.job.clone(), &jobs_config),
-        ));
+        let mut job_registry =
+            JobRegistryBuilder::freeze_shared(registries.job.clone(), &jobs_config);
+        job_registry.include_queue(app.config().email()?.queue_id()?, &jobs_config);
+        let job_runtime = Arc::new(JobRuntime::new(backend, jobs_config.clone(), job_registry));
         let job_dispatcher = Arc::new(JobDispatcher::new(job_runtime.clone(), diagnostics.clone()));
         let job_middleware_registry = Arc::new(JobMiddlewareRegistryBuilder::freeze_shared(
             registrar.job_middleware_registry(),
@@ -1146,7 +1232,7 @@ impl AppBuilder {
             cache_config,
             Some(distributed_lock.clone()),
         ));
-        let audit_manager = Arc::new(AuditManager::new());
+        let audit_manager = Arc::new(AuditManager::new(app.config().audit()?));
 
         let password_reset_manager =
             Arc::new(crate::auth::password_reset::PasswordResetManager::new(
@@ -1285,6 +1371,7 @@ impl AppBuilder {
         let mut boot_commands = Vec::new();
         if profile.commands {
             boot_commands.extend([
+                crate::cli::dev::dev_cli_registrar(),
                 crate::config::publish::config_publish_cli_registrar(),
                 crate::config::api_docs::docs_api_cli_registrar(),
                 crate::config::env_publish::env_publish_cli_registrar(),
@@ -1296,6 +1383,7 @@ impl AppBuilder {
                 boot_commands.push(crate::database::builtin_cli_registrar());
                 boot_commands.push(crate::auth::builtin_cli_registrar());
                 boot_commands.push(crate::attachments::builtin_cli_registrar());
+                boot_commands.push(crate::audit::audit_cli_registrar());
             }
             if !prepared_plugins.registry.is_empty() {
                 boot_commands.push(crate::plugin::builtin_cli_registrar());
@@ -1361,7 +1449,7 @@ impl AppBuilder {
 
     fn sync_runtime_config(&self) -> Result<RuntimeConfig> {
         if self.load_env {
-            dotenvy::dotenv().ok();
+            load_dotenv_if_present()?;
         }
 
         load_boot_config(self.config_dir.clone(), Vec::new())?.runtime()
@@ -1573,14 +1661,39 @@ mod tests {
     use tempfile::tempdir;
     use tower::ServiceExt;
 
-    use super::{finish_kernel_run, run_after_commit_callbacks, App};
+    use super::{
+        finish_kernel_run, handle_dotenv_result, run_after_commit_callbacks,
+        snapshot_transaction_event_origin, App,
+    };
     use crate::database::AfterCommitCallback;
     use crate::events::{Event, EventContext, EventListener};
     use crate::foundation::{AppContext, Error, Result, ServiceProvider, ServiceRegistrar};
-    use crate::support::{EventId, MiddlewareGroupId, RouteId};
+    use crate::support::{EventId, GuardId, MiddlewareGroupId, RouteId};
 
     struct TestProvider {
         order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[test]
+    fn external_tracing_subscriber_opt_out_is_explicit_on_builder() {
+        let builder = App::builder().use_external_tracing_subscriber();
+
+        assert!(!builder.initialize_logging);
+    }
+
+    #[test]
+    fn dotenv_loader_ignores_only_missing_files() {
+        let missing = dotenvy::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(handle_dotenv_result(Err(missing)).is_ok());
+
+        let malformed = dotenvy::Error::LineParse("INVALID LINE".to_string(), 7);
+        let error = handle_dotenv_result(Err(malformed)).unwrap_err();
+        assert!(error.to_string().contains("failed to load .env"));
+
+        let unreadable =
+            dotenvy::Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let error = handle_dotenv_result(Err(unreadable)).unwrap_err();
+        assert!(error.to_string().contains("failed to load .env"));
     }
 
     #[derive(Clone)]
@@ -2173,6 +2286,54 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn transactional_event_origin_is_owned_and_prefers_transaction_actor() {
+        let request_actor = crate::auth::Actor::new("request-actor", GuardId::new("request"));
+        let transaction_actor =
+            crate::auth::Actor::new("transaction-actor", GuardId::new("transaction"));
+        let request = crate::logging::CurrentRequest {
+            request_id: Some("req-event-snapshot".to_string()),
+            ip: Some("203.0.113.7".parse().unwrap()),
+            user_agent: Some("FoundrySnapshot/1.0".to_string()),
+            audit_area: None,
+        };
+
+        let (transaction_origin, request_origin) = crate::logging::scope_current_request(
+            request,
+            crate::logging::scope_current_actor(request_actor, async {
+                (
+                    snapshot_transaction_event_origin(Some(&transaction_actor)).unwrap(),
+                    snapshot_transaction_event_origin(None).unwrap(),
+                )
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            transaction_origin
+                .actor
+                .as_ref()
+                .map(|actor| actor.id.as_str()),
+            Some("transaction-actor")
+        );
+        assert_eq!(
+            transaction_origin
+                .actor
+                .as_ref()
+                .map(|actor| actor.guard.clone()),
+            Some(GuardId::new("transaction"))
+        );
+        assert_eq!(
+            request_origin.actor.as_ref().map(|actor| actor.id.as_str()),
+            Some("request-actor")
+        );
+        for origin in [&transaction_origin, &request_origin] {
+            assert_eq!(origin.request_id.as_deref(), Some("req-event-snapshot"));
+            assert_eq!(origin.ip, Some("203.0.113.7".parse().unwrap()));
+            assert_eq!(origin.user_agent.as_deref(), Some("FoundrySnapshot/1.0"));
+        }
     }
 
     #[tokio::test]

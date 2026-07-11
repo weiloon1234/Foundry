@@ -1,16 +1,18 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::time::Duration;
 
-use ::redis::aio::MultiplexedConnection;
 use ::redis::AsyncCommands;
 use futures_util::StreamExt;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, OnceCell};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::config::ConfigRepository;
+#[cfg(test)]
+use crate::config::RedisConfig;
 use crate::foundation::{Error, Result};
 use crate::logging::RuntimeBackendKind;
-use crate::redis::namespaced_value;
+use crate::redis::{namespaced_value, ManagedRedisConnection, RedisConnectionProvider};
 use crate::support::sync::lock_unpoisoned;
 use crate::support::QueueId;
 
@@ -84,9 +86,13 @@ impl RuntimeBackend {
             return Ok(Self::Memory(shared_memory_runtime(&redis.namespace)));
         }
 
-        Ok(Self::Redis(RedisRuntime::new(
+        let connect_timeout = redis.connect_timeout();
+        let command_timeout = redis.command_timeout();
+        Ok(Self::Redis(RedisRuntime::with_timeouts(
             ::redis::Client::open(redis.url.as_str()).map_err(Error::other)?,
             redis.namespace,
+            connect_timeout,
+            command_timeout,
         )))
     }
 
@@ -593,15 +599,36 @@ return 0
 pub(crate) struct RedisRuntime {
     pub(crate) client: Arc<::redis::Client>,
     pub(crate) namespace: String,
-    cached_connection: Arc<OnceCell<MultiplexedConnection>>,
+    connection_provider: RedisConnectionProvider,
 }
 
 impl RedisRuntime {
+    #[cfg(test)]
     pub(crate) fn new(client: ::redis::Client, namespace: String) -> Self {
-        Self {
-            client: Arc::new(client),
+        let config = RedisConfig::default();
+        Self::with_timeouts(
+            client,
             namespace,
-            cached_connection: Arc::new(OnceCell::new()),
+            config.connect_timeout(),
+            config.command_timeout(),
+        )
+    }
+
+    pub(crate) fn with_timeouts(
+        client: ::redis::Client,
+        namespace: String,
+        connect_timeout: Duration,
+        command_timeout: Duration,
+    ) -> Self {
+        let client = Arc::new(client);
+        Self {
+            connection_provider: RedisConnectionProvider::new(
+                client.clone(),
+                connect_timeout,
+                command_timeout,
+            ),
+            client,
+            namespace,
         }
     }
 
@@ -614,18 +641,11 @@ impl RedisRuntime {
         namespaced_value(&self.namespace, suffix)
     }
 
-    pub(crate) async fn connection(&self) -> Result<MultiplexedConnection> {
-        let conn = self
-            .cached_connection
-            .get_or_try_init(|| async {
-                self.client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(Error::other)
-            })
-            .await?;
-
-        Ok(conn.clone())
+    pub(crate) async fn connection(&self) -> Result<ManagedRedisConnection> {
+        self.connection_provider
+            .connection()
+            .await
+            .map_err(Error::other)
     }
 
     async fn ping(&self) -> Result<()> {
@@ -653,11 +673,29 @@ impl RedisRuntime {
             return Ok(BackendSubscription::new(rx));
         }
 
-        let mut pubsub = self.client.get_async_pubsub().await.map_err(Error::other)?;
+        let connect_timeout = self.connection_provider.connect_timeout();
+        let mut pubsub = tokio::time::timeout(connect_timeout, self.client.get_async_pubsub())
+            .await
+            .map_err(|_| {
+                Error::message(format!(
+                    "Redis pub/sub connection timed out after {}ms",
+                    connect_timeout.as_millis()
+                ))
+            })?
+            .map_err(Error::other)?;
         let mut logical_topics = HashMap::new();
+        let command_timeout = self.connection_provider.command_timeout();
         for topic in topics {
             let redis_topic = self.websocket_topic(topic);
-            pubsub.subscribe(&redis_topic).await.map_err(Error::other)?;
+            tokio::time::timeout(command_timeout, pubsub.subscribe(&redis_topic))
+                .await
+                .map_err(|_| {
+                    Error::message(format!(
+                        "Redis SUBSCRIBE timed out after {}ms",
+                        command_timeout.as_millis()
+                    ))
+                })?
+                .map_err(Error::other)?;
             logical_topics.insert(redis_topic, topic.clone());
         }
 

@@ -9,6 +9,7 @@ Normalized contract manifest for generated SDKs, OpenAPI, validation, and realti
 ```rust
 pub const CONTRACT_MANIFEST_VERSION: u32;
 enum ContractHttpBody { None, Json, Multipart, Unknown }
+enum ContractParameterLocation { Path, Query, Header, Cookie }
 enum ContractTransport { Http, WebSocket }
 enum ContractValueKind { Show 15 variants    Unknown, Scalar, Array, Object, File, FileList, Date, DateTime, LocalDateTime, Time, Decimal, Uuid, Json, Page, Error }
 struct ContractAction
@@ -25,6 +26,7 @@ struct ContractManifest
   fn with_validation_schemas( self, schemas: Vec<ContractValidationSchema>, ) -> Self
   fn with_realtime_channels( self, channels: Vec<ContractRealtimeChannel>, ) -> Self
   fn infer_transport_body_kinds(&mut self)
+struct ContractParameter
 struct ContractPayload
 struct ContractRealtimeChannel
 struct ContractRealtimeEvent

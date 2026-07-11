@@ -1,4 +1,8 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::sync::OnceLock;
+
+use toml::Value;
 
 #[derive(Clone, Copy)]
 struct PublishedField {
@@ -116,6 +120,14 @@ const APP_FIELDS: &[PublishedField] = &[
         true,
         true,
         Some("\"development\", \"production\", \"staging\", \"testing\", or custom label"),
+    ),
+    field(
+        "security_tier",
+        "\"strict\"",
+        "strict",
+        false,
+        false,
+        Some("Optional \"strict\" or \"relaxed\" override; custom environments default strict"),
     ),
     field("timezone", "\"UTC\"", "UTC", true, false, None),
     field(
@@ -322,6 +334,22 @@ const REDIS_FIELDS: &[PublishedField] = &[
         false,
         false,
         Some("Key prefix - auto-derived from app.name:app.environment if not set"),
+    ),
+    field(
+        "connect_timeout_ms",
+        "5000",
+        "5000",
+        false,
+        false,
+        Some("Maximum time for each Redis connection attempt"),
+    ),
+    field(
+        "command_timeout_ms",
+        "5000",
+        "5000",
+        false,
+        false,
+        Some("Maximum time to wait for a Redis command response"),
     ),
 ];
 
@@ -699,6 +727,14 @@ const AUDIT_FIELDS: &[PublishedField] = &[
         false,
         Some("Exact/normalized field names; #[foundry(audit_exclude)] still removes fields entirely"),
     ),
+    field(
+        "retention_days",
+        "0",
+        "0",
+        false,
+        false,
+        Some("Audit retention window used by audit:prune (0 = keep forever)"),
+    ),
 ];
 
 const RUNTIME_FIELDS: &[PublishedField] = &[
@@ -928,6 +964,30 @@ const LOGGING_FIELDS: &[PublishedField] = &[
         false,
         Some("Auto-delete logs older than N days (0 = keep forever)"),
     ),
+    field(
+        "file_queue_capacity",
+        "8192",
+        "8192",
+        false,
+        false,
+        Some("Bounded background file-log queue; overload drops newest records"),
+    ),
+    field(
+        "file_max_record_bytes",
+        "65536",
+        "65536",
+        false,
+        false,
+        Some("Maximum file-log record bytes; oversized records are dropped"),
+    ),
+    field(
+        "file_flush_timeout_ms",
+        "5000",
+        "5000",
+        false,
+        false,
+        Some("Shutdown flush deadline for accepted file-log records"),
+    ),
 ];
 
 const OBSERVABILITY_FIELDS: &[PublishedField] = &[
@@ -1062,14 +1122,24 @@ const HASHING_FIELDS: &[PublishedField] = &[
     field("parallelism", "1", "1", false, false, None),
 ];
 
-const CRYPT_FIELDS: &[PublishedField] = &[field(
-    "key",
-    "\"\"",
-    "",
-    false,
-    false,
-    Some("Base64 key - generate with `key:generate`"),
-)];
+const CRYPT_FIELDS: &[PublishedField] = &[
+    field(
+        "key",
+        "\"\"",
+        "",
+        false,
+        false,
+        Some("Primary base64 key used for new ciphertext - generate with `key:generate`"),
+    ),
+    field(
+        "previous_keys",
+        "[]",
+        "[]",
+        false,
+        false,
+        Some("Older base64 keys accepted for decryption only, newest first"),
+    ),
+];
 
 const I18N_FIELDS: &[PublishedField] = &[
     field("default_locale", "\"en\"", "en", false, false, None),
@@ -1693,8 +1763,9 @@ const PUBLISHED_SECTIONS: &[PublishedSection] = &[
                     "# driver = \"s3\"",
                     "# bucket = \"\"",
                     "# region = \"\"",
-                    "# key = \"\"",
-                    "# secret = \"\"",
+                    "# key = \"\"  # Optional; omit with secret to use the AWS credential provider chain",
+                    "# secret = \"\"  # Optional; must be configured together with key",
+                    "# session_token = \"\"  # Optional token for explicit temporary credentials",
                     "# endpoint = \"\"  # Custom endpoint for MinIO, R2, etc.",
                     "# url = \"\"  # Public URL prefix (optional)",
                     "# use_path_style = false",
@@ -1704,8 +1775,9 @@ const PUBLISHED_SECTIONS: &[PublishedSection] = &[
                     "# STORAGE__DISKS__S3__DRIVER=s3",
                     "# STORAGE__DISKS__S3__BUCKET=",
                     "# STORAGE__DISKS__S3__REGION=",
-                    "# STORAGE__DISKS__S3__KEY=",
-                    "# STORAGE__DISKS__S3__SECRET=",
+                    "# STORAGE__DISKS__S3__KEY=  # Optional; omit with secret to use the AWS credential provider chain",
+                    "# STORAGE__DISKS__S3__SECRET=  # Optional; must be configured together with key",
+                    "# STORAGE__DISKS__S3__SESSION_TOKEN=  # Optional token for explicit temporary credentials",
                     "# STORAGE__DISKS__S3__ENDPOINT=  # Custom endpoint for MinIO, R2, etc.",
                     "# STORAGE__DISKS__S3__URL=  # Public URL prefix (optional)",
                     "# STORAGE__DISKS__S3__USE_PATH_STYLE=false",
@@ -1716,6 +1788,196 @@ const PUBLISHED_SECTIONS: &[PublishedSection] = &[
     ),
 ];
 
+struct PublishedConfigSchema {
+    roots: BTreeSet<String>,
+    fields: BTreeSet<String>,
+    open_prefixes: BTreeSet<String>,
+    wildcard_fields: Vec<Vec<String>>,
+}
+
+fn published_config_schema() -> &'static PublishedConfigSchema {
+    static SCHEMA: OnceLock<PublishedConfigSchema> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let mut roots = BTreeSet::new();
+        let mut fields = BTreeSet::new();
+        let mut example_fields = BTreeMap::<Vec<String>, BTreeSet<String>>::new();
+
+        for section in PUBLISHED_SECTIONS {
+            for part in section.parts {
+                match part {
+                    PublishedPart::Table(table) => {
+                        if let Some(root) = table.path.first() {
+                            roots.insert((*root).to_string());
+                        }
+                        let prefix = table.path.join(".");
+                        for field in table.fields {
+                            fields.insert(format!("{prefix}.{}", field.key));
+                        }
+                    }
+                    PublishedPart::Example(example) => {
+                        for (table, field) in example_config_fields(example) {
+                            example_fields.entry(table).or_default().insert(field);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut children_by_parent = BTreeMap::<Vec<String>, BTreeSet<String>>::new();
+        for path in example_fields.keys() {
+            if let Some((child, parent)) = path.split_last() {
+                children_by_parent
+                    .entry(parent.to_vec())
+                    .or_default()
+                    .insert(child.clone());
+            }
+            if let Some(root) = path.first() {
+                roots.insert(root.clone());
+            }
+        }
+        let mut open_prefixes = BTreeSet::new();
+        let mut wildcard_fields = Vec::new();
+        for (parent, children) in &children_by_parent {
+            if children.len() > 1 {
+                let mut allowed_fields = BTreeSet::new();
+                for child in children {
+                    let mut table = parent.clone();
+                    table.push(child.clone());
+                    if let Some(table_fields) = example_fields.get(&table) {
+                        allowed_fields.extend(table_fields.iter().cloned());
+                    }
+                }
+                for field in allowed_fields {
+                    let mut pattern = parent.clone();
+                    pattern.push("*".to_string());
+                    pattern.push(field);
+                    wildcard_fields.push(pattern);
+                }
+            }
+        }
+        for (table, table_fields) in example_fields {
+            let parent_has_dynamic_children = table
+                .split_last()
+                .and_then(|(_, parent)| children_by_parent.get(parent))
+                .is_some_and(|children| children.len() > 1);
+            if !parent_has_dynamic_children {
+                open_prefixes.insert(table.join("."));
+            }
+            let prefix = table.join(".");
+            for field in table_fields {
+                fields.insert(format!("{prefix}.{field}"));
+            }
+        }
+
+        PublishedConfigSchema {
+            roots,
+            fields,
+            open_prefixes,
+            wildcard_fields,
+        }
+    })
+}
+
+fn example_config_fields(example: &PublishedExample) -> Vec<(Vec<String>, String)> {
+    let mut table = None;
+    let mut fields = Vec::new();
+    for line in example.toml_lines {
+        let line = line.trim();
+        if let Some(path) = line
+            .strip_prefix("# [")
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            table = Some(path.split('.').map(ToOwned::to_owned).collect::<Vec<_>>());
+            continue;
+        }
+        let Some(field) = line
+            .strip_prefix("# ")
+            .and_then(|line| line.split_once('='))
+            .map(|(field, _)| field.trim())
+            .filter(|field| !field.is_empty())
+        else {
+            continue;
+        };
+        if let Some(table) = &table {
+            fields.push((table.clone(), field.to_string()));
+        }
+    }
+    fields
+}
+
+pub(super) fn is_known_framework_config_path(path: &[String]) -> bool {
+    let joined = path.join(".");
+    let schema = published_config_schema();
+    schema.fields.contains(&joined)
+        || schema.open_prefixes.iter().any(|prefix| {
+            joined == *prefix
+                || joined
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+        || schema.wildcard_fields.iter().any(|pattern| {
+            pattern.len() == path.len()
+                && pattern
+                    .iter()
+                    .zip(path)
+                    .all(|(expected, actual)| expected == "*" || expected == actual)
+        })
+}
+
+pub(super) fn unknown_framework_config_keys(root: &Value) -> Vec<String> {
+    let schema = published_config_schema();
+    let mut leaves = Vec::new();
+    collect_leaf_paths(root, &mut Vec::new(), &mut leaves);
+    let mut unknown = leaves
+        .into_iter()
+        .filter(|path| {
+            let Some(root) = path.first() else {
+                return false;
+            };
+            let normalized_root = root.to_ascii_lowercase();
+            (schema.roots.contains(&normalized_root)
+                || schema
+                    .roots
+                    .iter()
+                    .any(|known| edit_distance(&normalized_root, known) <= 2))
+                && !is_known_framework_config_path(path)
+        })
+        .map(|path| path.join("."))
+        .collect::<Vec<_>>();
+    unknown.sort();
+    unknown.dedup();
+    unknown
+}
+
+fn collect_leaf_paths(value: &Value, path: &mut Vec<String>, leaves: &mut Vec<Vec<String>>) {
+    match value {
+        Value::Table(table) if !table.is_empty() => {
+            for (key, value) in table {
+                path.push(key.clone());
+                collect_leaf_paths(value, path, leaves);
+                path.pop();
+            }
+        }
+        _ if !path.is_empty() => leaves.push(path.clone()),
+        _ => {}
+    }
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_byte) in left.bytes().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_byte) in right.bytes().enumerate() {
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + usize::from(left_byte != right_byte));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
 const CONFIG_HEADER: &str = "\
 # =============================================================================
 # Foundry Framework Configuration
@@ -1724,8 +1986,9 @@ const CONFIG_HEADER: &str = "\
 # Required fields are uncommented. Optional fields are commented out so users
 # can opt in only to what they need.
 #
-# Environment variable overlay: any key can be overridden via env vars using
-# double-underscore notation. Example: DATABASE__URL=postgres://...
+# Environment variable overlay: any key can be overridden via FOUNDRY-prefixed
+# env vars. Example: FOUNDRY__DATABASE__URL=postgres://...
+# Legacy unprefixed overlays remain accepted for migration and doctor reports them.
 # =============================================================================
 ";
 
@@ -1737,7 +2000,8 @@ fn split_config_header(title: &str) -> String {
 #
 # Foundry loads every direct config/*.toml file in lexical filename order,
 # merges the tables in memory, then applies environment variable overrides.
-# Environment variables use double-underscore notation, e.g. DATABASE__URL=...
+# Environment variables use the FOUNDRY namespace, e.g. FOUNDRY__DATABASE__URL=...
+# Legacy unprefixed overlays remain accepted for migration and doctor reports them.
 # =============================================================================
 "
     )
@@ -1748,9 +2012,10 @@ const ENV_HEADER: &str = "\
 # Foundry Framework - Environment Variables
 #
 # All configuration values can be overridden via environment variables using
-# double-underscore notation: SECTION__KEY=value
+# the explicit namespace: FOUNDRY__SECTION__KEY=value
+# Legacy SECTION__KEY overlays remain accepted for migration and doctor reports them.
 #
-# Nested config: AUTH__TOKENS__ACCESS_TOKEN_TTL_MINUTES=30
+# Nested config: FOUNDRY__AUTH__TOKENS__ACCESS_TOKEN_TTL_MINUTES=30
 # Boolean values: true / false
 # Integer values: 3000
 #
@@ -1831,7 +2096,7 @@ fn render_document(header: &str, target: RenderTarget) -> String {
                     PublishedPart::Example(example),
                 ) => push_example(&mut out, example.toml_heading, example.toml_lines),
                 (RenderTarget::Env, PublishedPart::Example(example)) => {
-                    push_example(&mut out, example.env_heading, example.env_lines)
+                    push_env_example(&mut out, example.env_heading, example.env_lines)
                 }
             }
         }
@@ -1927,11 +2192,27 @@ fn push_example(out: &mut String, heading: Option<&str>, lines: &[&str]) {
     }
 }
 
+fn push_env_example(out: &mut String, heading: Option<&str>, lines: &[&str]) {
+    if let Some(heading) = heading {
+        let _ = writeln!(out, "# {heading}");
+    }
+
+    for line in lines {
+        if let Some(variable) = line.strip_prefix("# ").filter(|line| line.contains('=')) {
+            let _ = writeln!(out, "# {}{variable}", super::ENV_OVERLAY_PREFIX);
+        } else {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+}
+
 fn render_env_prefix(path: &[&str]) -> String {
-    path.iter()
+    let path = path
+        .iter()
         .map(|segment| segment.to_ascii_uppercase())
         .collect::<Vec<_>>()
-        .join("__")
+        .join("__");
+    format!("{}{path}", super::ENV_OVERLAY_PREFIX)
 }
 
 #[cfg(test)]
@@ -1981,6 +2262,44 @@ mod tests {
     }
 
     #[test]
+    fn published_app_config_exposes_security_tier_and_prefixed_env_migration_path() {
+        let config = render_sample_config();
+        let env = render_sample_env();
+
+        assert!(config.contains(
+            "# security_tier = \"strict\"  # Optional \"strict\" or \"relaxed\" override; custom environments default strict"
+        ));
+        assert!(env.contains("# FOUNDRY__APP__SECURITY_TIER=strict"));
+        assert!(env.contains("FOUNDRY__APP__NAME=my-app"));
+        assert!(!env.lines().any(|line| line.starts_with("APP__")));
+    }
+
+    #[test]
+    fn published_schema_drives_closed_and_dynamic_config_key_validation() {
+        assert!(super::is_known_framework_config_path(&[
+            "app".to_string(),
+            "security_tier".to_string(),
+        ]));
+        assert!(super::is_known_framework_config_path(&[
+            "email".to_string(),
+            "mailers".to_string(),
+            "transactional".to_string(),
+            "driver".to_string(),
+        ]));
+        assert!(!super::is_known_framework_config_path(&[
+            "email".to_string(),
+            "mailers".to_string(),
+            "transactional".to_string(),
+            "drivr".to_string(),
+        ]));
+        assert!(!super::is_known_framework_config_path(&[
+            "http".to_string(),
+            "cros".to_string(),
+            "enabled".to_string(),
+        ]));
+    }
+
+    #[test]
     fn published_env_variables_are_unique() {
         let output = render_sample_env();
         let mut seen = BTreeSet::new();
@@ -2021,6 +2340,21 @@ mod tests {
     }
 
     #[test]
+    fn published_redis_config_includes_connection_and_command_timeouts() {
+        let output = render_sample_config();
+        let env = render_sample_env();
+
+        assert!(output.contains(
+            "# connect_timeout_ms = 5000  # Maximum time for each Redis connection attempt"
+        ));
+        assert!(output.contains(
+            "# command_timeout_ms = 5000  # Maximum time to wait for a Redis command response"
+        ));
+        assert!(env.contains("# FOUNDRY__REDIS__CONNECT_TIMEOUT_MS=5000"));
+        assert!(env.contains("# FOUNDRY__REDIS__COMMAND_TIMEOUT_MS=5000"));
+    }
+
+    #[test]
     fn published_http_edge_config_includes_safe_defaults() {
         let output = render_sample_config();
         let env = render_sample_env();
@@ -2041,11 +2375,11 @@ mod tests {
         assert!(output.contains("[http.rate_limit]"));
         assert!(output.contains("# enabled = true  # Enabled by default with actor-or-IP keys"));
         assert!(output.contains("# by = \"actor_or_ip\"  # \"ip\", \"actor\", or \"actor_or_ip\""));
-        assert!(env.contains("# HTTP__MAX_BODY_SIZE_BYTES=0"));
-        assert!(env.contains("# HTTP__CSRF__COOKIE_SAME_SITE=lax"));
-        assert!(env.contains("# HTTP__TRUSTED_PROXY__TRUSTED_CIDRS=[\"173.245.48.0/20\""));
+        assert!(env.contains("# FOUNDRY__HTTP__MAX_BODY_SIZE_BYTES=0"));
+        assert!(env.contains("# FOUNDRY__HTTP__CSRF__COOKIE_SAME_SITE=lax"));
+        assert!(env.contains("# FOUNDRY__HTTP__TRUSTED_PROXY__TRUSTED_CIDRS=[\"173.245.48.0/20\""));
         assert!(env.contains("\"2c0f:f248::/32\"]"));
-        assert!(env.contains("# HTTP__RATE_LIMIT__BY=actor_or_ip"));
+        assert!(env.contains("# FOUNDRY__HTTP__RATE_LIMIT__BY=actor_or_ip"));
     }
 
     #[test]
@@ -2071,13 +2405,13 @@ mod tests {
         assert!(output.contains("# query_token_name = \"token\""));
         assert!(output.contains("# query_token_max_length = 4096"));
         assert!(output.contains("# allowed_origins = []  # Exact Origin allow-list"));
-        assert!(env.contains("# WEBSOCKET__MAX_MESSAGE_SIZE_BYTES=1048576"));
-        assert!(env.contains("# WEBSOCKET__AUTH_REVALIDATION_INTERVAL_SECONDS=30"));
-        assert!(env.contains("# WEBSOCKET__MAX_CONNECTIONS_GLOBAL=10000"));
-        assert!(env.contains("# WEBSOCKET__MAX_CONNECTIONS_PER_IP=100"));
-        assert!(env.contains("# WEBSOCKET__MAX_SUBSCRIPTIONS_PER_CONNECTION=100"));
-        assert!(env.contains("# WEBSOCKET__QUERY_TOKEN_ENABLED=true"));
-        assert!(env.contains("# WEBSOCKET__QUERY_TOKEN_MAX_LENGTH=4096"));
+        assert!(env.contains("# FOUNDRY__WEBSOCKET__MAX_MESSAGE_SIZE_BYTES=1048576"));
+        assert!(env.contains("# FOUNDRY__WEBSOCKET__AUTH_REVALIDATION_INTERVAL_SECONDS=30"));
+        assert!(env.contains("# FOUNDRY__WEBSOCKET__MAX_CONNECTIONS_GLOBAL=10000"));
+        assert!(env.contains("# FOUNDRY__WEBSOCKET__MAX_CONNECTIONS_PER_IP=100"));
+        assert!(env.contains("# FOUNDRY__WEBSOCKET__MAX_SUBSCRIPTIONS_PER_CONNECTION=100"));
+        assert!(env.contains("# FOUNDRY__WEBSOCKET__QUERY_TOKEN_ENABLED=true"));
+        assert!(env.contains("# FOUNDRY__WEBSOCKET__QUERY_TOKEN_MAX_LENGTH=4096"));
     }
 
     #[test]
@@ -2092,12 +2426,12 @@ mod tests {
         assert!(output.contains("# timeout_secs = 30"));
         assert!(output.contains("# max_attachment_bytes = 26214400"));
         assert!(output.contains("# max_total_attachment_bytes = 26214400"));
-        assert!(env.contains("# EMAIL__MAX_ATTACHMENT_BYTES=26214400"));
-        assert!(env.contains("# EMAIL__MAX_TOTAL_ATTACHMENT_BYTES=26214400"));
-        assert!(env.contains("# EMAIL__MAILERS__RESEND__TIMEOUT_SECS=30"));
-        assert!(env.contains("# EMAIL__MAILERS__POSTMARK__TIMEOUT_SECS=30"));
-        assert!(env.contains("# EMAIL__MAILERS__MAILGUN__TIMEOUT_SECS=30"));
-        assert!(env.contains("# EMAIL__MAILERS__SES__TIMEOUT_SECS=30"));
+        assert!(env.contains("# FOUNDRY__EMAIL__MAX_ATTACHMENT_BYTES=26214400"));
+        assert!(env.contains("# FOUNDRY__EMAIL__MAX_TOTAL_ATTACHMENT_BYTES=26214400"));
+        assert!(env.contains("# FOUNDRY__EMAIL__MAILERS__RESEND__TIMEOUT_SECS=30"));
+        assert!(env.contains("# FOUNDRY__EMAIL__MAILERS__POSTMARK__TIMEOUT_SECS=30"));
+        assert!(env.contains("# FOUNDRY__EMAIL__MAILERS__MAILGUN__TIMEOUT_SECS=30"));
+        assert!(env.contains("# FOUNDRY__EMAIL__MAILERS__SES__TIMEOUT_SECS=30"));
     }
 
     #[test]
@@ -2116,10 +2450,10 @@ mod tests {
         ));
         assert!(output.contains("[auth.email_verification]"));
         assert!(output.contains("# expiry_minutes = 1440  # Email verification token lifetime (0 = no expiry/auto-prune)"));
-        assert!(env.contains("# AUTH__TOKENS__PRUNE_RETENTION_DAYS=30"));
-        assert!(env.contains("# AUTH__SESSIONS__COOKIE_SAME_SITE=lax"));
-        assert!(env.contains("# AUTH__PASSWORD_RESETS__EXPIRY_MINUTES=60"));
-        assert!(env.contains("# AUTH__EMAIL_VERIFICATION__EXPIRY_MINUTES=1440"));
+        assert!(env.contains("# FOUNDRY__AUTH__TOKENS__PRUNE_RETENTION_DAYS=30"));
+        assert!(env.contains("# FOUNDRY__AUTH__SESSIONS__COOKIE_SAME_SITE=lax"));
+        assert!(env.contains("# FOUNDRY__AUTH__PASSWORD_RESETS__EXPIRY_MINUTES=60"));
+        assert!(env.contains("# FOUNDRY__AUTH__EMAIL_VERIFICATION__EXPIRY_MINUTES=1440"));
     }
 
     #[test]
@@ -2133,7 +2467,7 @@ mod tests {
         ));
         assert!(output.contains("\"password_hash\""));
         assert!(output.contains("\"refresh_token\""));
-        assert!(env.contains("# AUDIT__REDACT_SENSITIVE_FIELDS=true"));
+        assert!(env.contains("# FOUNDRY__AUDIT__REDACT_SENSITIVE_FIELDS=true"));
         assert!(env.contains("\"password_hash\""));
     }
 
@@ -2149,8 +2483,8 @@ mod tests {
         assert!(output.contains(
             "# max_blocking_threads = 0  # Tokio blocking thread cap for sync runners (0 = Tokio default)"
         ));
-        assert!(env.contains("# RUNTIME__WORKER_THREADS=0"));
-        assert!(env.contains("# RUNTIME__MAX_BLOCKING_THREADS=0"));
+        assert!(env.contains("# FOUNDRY__RUNTIME__WORKER_THREADS=0"));
+        assert!(env.contains("# FOUNDRY__RUNTIME__MAX_BLOCKING_THREADS=0"));
     }
 
     #[test]
@@ -2164,11 +2498,11 @@ mod tests {
         assert!(output.contains("# remember_singleflight = true"));
         assert!(output.contains("# remember_distributed_lock = false"));
         assert!(output.contains("# remember_lock_ttl_ms = 30000"));
-        assert!(env.contains("# CACHE__ERROR_MODE=strict"));
-        assert!(env.contains("# CACHE__KEY_MAX_LENGTH=512"));
-        assert!(env.contains("# CACHE__REMEMBER_SINGLEFLIGHT=true"));
-        assert!(env.contains("# CACHE__REMEMBER_DISTRIBUTED_LOCK=false"));
-        assert!(env.contains("# CACHE__REMEMBER_LOCK_TTL_MS=30000"));
+        assert!(env.contains("# FOUNDRY__CACHE__ERROR_MODE=strict"));
+        assert!(env.contains("# FOUNDRY__CACHE__KEY_MAX_LENGTH=512"));
+        assert!(env.contains("# FOUNDRY__CACHE__REMEMBER_SINGLEFLIGHT=true"));
+        assert!(env.contains("# FOUNDRY__CACHE__REMEMBER_DISTRIBUTED_LOCK=false"));
+        assert!(env.contains("# FOUNDRY__CACHE__REMEMBER_LOCK_TTL_MS=30000"));
     }
 
     #[test]
@@ -2181,8 +2515,8 @@ mod tests {
         assert!(output.contains(
             "# max_export_rows = 50000  # Max rows generated into XLSX downloads/jobs (0 = unlimited)"
         ));
-        assert!(env.contains("# DATATABLE__MAX_PER_PAGE=500"));
-        assert!(env.contains("# DATATABLE__MAX_EXPORT_ROWS=50000"));
+        assert!(env.contains("# FOUNDRY__DATATABLE__MAX_PER_PAGE=500"));
+        assert!(env.contains("# FOUNDRY__DATATABLE__MAX_EXPORT_ROWS=50000"));
     }
 
     #[test]
@@ -2203,11 +2537,18 @@ mod tests {
         assert!(output.contains("# attachment_orphan_audit_enabled = true"));
         assert!(output.contains("# attachment_orphan_delete_enabled = false"));
         assert!(output.contains("# attachment_orphan_prefix = \"attachments/\""));
-        assert!(env.contains("# STORAGE__MAX_UPLOAD_SIZE_BYTES=104857600"));
-        assert!(env.contains("# STORAGE__UPLOAD_TEMP_RETENTION_SECONDS=3600"));
-        assert!(env.contains("# STORAGE__IMAGE_MAX_INPUT_BYTES=52428800"));
-        assert!(env.contains("# STORAGE__ATTACHMENT_ORPHAN_AUDIT_ENABLED=true"));
-        assert!(env.contains("# STORAGE__ATTACHMENT_ORPHAN_PREFIX=attachments/"));
+        assert!(output.contains(
+            "# key = \"\"  # Optional; omit with secret to use the AWS credential provider chain"
+        ));
+        assert!(output.contains(
+            "# session_token = \"\"  # Optional token for explicit temporary credentials"
+        ));
+        assert!(env.contains("# FOUNDRY__STORAGE__MAX_UPLOAD_SIZE_BYTES=104857600"));
+        assert!(env.contains("# FOUNDRY__STORAGE__UPLOAD_TEMP_RETENTION_SECONDS=3600"));
+        assert!(env.contains("# FOUNDRY__STORAGE__IMAGE_MAX_INPUT_BYTES=52428800"));
+        assert!(env.contains("# FOUNDRY__STORAGE__ATTACHMENT_ORPHAN_AUDIT_ENABLED=true"));
+        assert!(env.contains("# FOUNDRY__STORAGE__ATTACHMENT_ORPHAN_PREFIX=attachments/"));
+        assert!(env.contains("# FOUNDRY__STORAGE__DISKS__S3__SESSION_TOKEN="));
     }
 
     fn config_repository_root_sections() -> BTreeSet<String> {
@@ -2245,7 +2586,13 @@ mod tests {
         let mut ordered = Vec::new();
 
         for name in env_variable_names(output) {
-            let root = name.split("__").next().unwrap().to_ascii_lowercase();
+            let root = name
+                .strip_prefix("FOUNDRY__")
+                .unwrap_or(&name)
+                .split("__")
+                .next()
+                .unwrap()
+                .to_ascii_lowercase();
             if seen.insert(root.clone()) {
                 ordered.push(root);
             }

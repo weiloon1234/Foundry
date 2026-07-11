@@ -53,11 +53,17 @@ let jobs = app.jobs()?;
 jobs.dispatch(SendWelcomeEmail {
     user_id: "123".into(),
     email: "alice@example.com".into(),
-})?;
+}).await?;
 
-// Dispatch with delay
-let run_at = DateTime::now().add_days(1).timestamp_millis();
-jobs.dispatch_later(SendWelcomeEmail { /* ... */ }, run_at)?;
+// Typed relative delay
+jobs.dispatch_after(SendWelcomeEmail { /* ... */ }, Duration::from_secs(60)).await?;
+
+// Typed absolute time
+let run_at = DateTime::now().add_days(1);
+jobs.dispatch_at(SendWelcomeEmail { /* ... */ }, run_at).await?;
+
+// Raw epoch-millisecond compatibility form
+jobs.dispatch_later(SendWelcomeEmail { /* ... */ }, run_at.timestamp_millis()).await?;
 ```
 
 ### Job Options
@@ -289,7 +295,8 @@ history_prune_batch_size = 1000
 `job_history` is the persistent observability store behind `/_foundry/jobs/stats` and
 `/_foundry/jobs/failed`. Workers own pruning internally, coordinated by a distributed lock, so
 consumer apps do not need to register a scheduler task. Runtime job counters remain process-local
-and reset on restart.
+and reset on restart. `track_history` controls database history independently from
+`observability.capture_enabled`; set `track_history = false` when no history writes are desired.
 
 ---
 
@@ -405,7 +412,7 @@ Schedules can dispatch background jobs instead of running work inline:
 registry.daily(ScheduleId::new("nightly_export"), |inv| async move {
     inv.app().jobs()?.dispatch(GenerateNightlyExport {
         date: Date::today().to_string(),
-    })?;
+    }).await?;
     Ok(())
 })?;
 ```
@@ -495,6 +502,8 @@ registrar.listen_event::<OrderPlaced, _>(SendOrderConfirmationListener);
 ```
 
 Multiple listeners can handle the same event. They run in registration order.
+`Event::ID` is globally unique across event types; registering a different Rust
+event type under an existing semantic ID fails bootstrap.
 
 ### Dispatching Events
 
@@ -579,13 +588,18 @@ let mut tx = app.begin_transaction().await?;
 
 // ... create order in transaction ...
 
-// This notification uses events internally
+tx.dispatch_event_after_commit(OrderPlaced {
+    order_id: order.id.to_string(),
+    customer_id: customer.id.to_string(),
+    total: order.total,
+});
+
 tx.notify_after_commit(&customer, &OrderPlacedNotification {
     order_id: order.id.to_string(),
 })?;
 
 tx.commit().await?;
-// Events/notifications fire only after commit succeeds
+// Event origin is captured above; events/notifications run only after commit.
 ```
 
 ---
@@ -649,7 +663,7 @@ App::builder()
         s.daily(ScheduleId::new("daily_report"), |inv| async move {
             inv.app().jobs()?.dispatch(GenerateDailySalesReport {
                 date: Date::today().to_string(),
-            })?;
+            }).await?;
             Ok(())
         })
     })

@@ -16,6 +16,52 @@ pub(crate) fn format_prometheus(snapshot: &RuntimeSnapshot) -> String {
         if snapshot.bootstrap_complete { 1 } else { 0 },
     );
 
+    write_gauge(
+        &mut out,
+        "foundry_log_file_writer_enabled",
+        "Whether the bounded background file log writer is enabled",
+        u64::from(snapshot.logging.enabled),
+    );
+    write_gauge(
+        &mut out,
+        "foundry_log_file_queue_capacity",
+        "Configured background file log queue capacity",
+        snapshot.logging.queue_capacity as u64,
+    );
+    write_gauge(
+        &mut out,
+        "foundry_log_file_queue_pending",
+        "Accepted file log records waiting to be written",
+        snapshot.logging.pending_records,
+    );
+    write_help_type(
+        &mut out,
+        "foundry_log_file_records_total",
+        "Background file log record outcomes",
+        "counter",
+    );
+    for (outcome, value) in [
+        ("accepted", snapshot.logging.accepted_total),
+        ("written", snapshot.logging.written_total),
+        ("dropped", snapshot.logging.dropped_total),
+        ("rejected", snapshot.logging.rejected_total),
+        ("oversized", snapshot.logging.oversized_total),
+        ("write_error", snapshot.logging.write_errors_total),
+    ] {
+        write_counter_label(
+            &mut out,
+            "foundry_log_file_records_total",
+            "outcome",
+            outcome,
+            value,
+        );
+    }
+    write_sample(
+        &mut out,
+        "foundry_log_file_flush_timeouts_total",
+        snapshot.logging.flush_timeouts_total,
+    );
+
     // HTTP request counters
     write_help_type(
         &mut out,
@@ -482,12 +528,25 @@ mod tests {
         SchedulerRuntimeSnapshot, WebSocketRuntimeSnapshot,
     };
     use crate::logging::types::RuntimeBackendKind;
+    use crate::logging::LogWriterRuntimeSnapshot;
 
     #[test]
     fn formats_prometheus_text() {
         let snapshot = RuntimeSnapshot {
             backend: RuntimeBackendKind::Memory,
             bootstrap_complete: true,
+            logging: LogWriterRuntimeSnapshot {
+                enabled: true,
+                queue_capacity: 8,
+                pending_records: 1,
+                accepted_total: 10,
+                written_total: 7,
+                dropped_total: 2,
+                rejected_total: 1,
+                oversized_total: 3,
+                write_errors_total: 1,
+                flush_timeouts_total: 1,
+            },
             http: HttpRuntimeSnapshot {
                 requests_total: 100,
                 informational_total: 0,
@@ -558,6 +617,12 @@ mod tests {
         let output = format_prometheus(&snapshot);
 
         assert!(output.contains("foundry_bootstrap_complete 1"));
+        assert!(output.contains("foundry_log_file_writer_enabled 1"));
+        assert!(output.contains("foundry_log_file_queue_capacity 8"));
+        assert!(output.contains("foundry_log_file_queue_pending 1"));
+        assert!(output.contains("foundry_log_file_records_total{outcome=\"dropped\"} 2"));
+        assert!(output.contains("foundry_log_file_records_total{outcome=\"rejected\"} 1"));
+        assert!(output.contains("foundry_log_file_flush_timeouts_total 1"));
         assert!(output.contains("foundry_http_requests_total{class=\"2xx\"} 80"));
         assert!(output.contains("foundry_http_requests_total{class=\"5xx\"} 5"));
         assert!(output.contains("foundry_http_edge_rejections_total{reason=\"rate_limited\"} 3"));
@@ -617,6 +682,7 @@ mod tests {
         let snapshot = RuntimeSnapshot {
             backend: RuntimeBackendKind::Memory,
             bootstrap_complete: false,
+            logging: Default::default(),
             http: HttpRuntimeSnapshot {
                 requests_total: 0,
                 informational_total: 0,
@@ -698,6 +764,7 @@ mod tests {
         let snapshot = RuntimeSnapshot {
             backend: RuntimeBackendKind::Memory,
             bootstrap_complete: false,
+            logging: Default::default(),
             http: HttpRuntimeSnapshot {
                 requests_total: 0,
                 informational_total: 0,

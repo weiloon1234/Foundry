@@ -153,7 +153,7 @@ impl LoginThrottle {
     }
 
     fn lock_threshold(&self) -> u64 {
-        self.max_failures.saturating_sub(1).max(1) as u64
+        self.max_failures as u64
     }
 }
 
@@ -297,6 +297,34 @@ mod tests {
         for _ in 0..4 {
             throttle.record_failure("person@example.com").await.unwrap();
         }
+
+        assert!(throttle.before_attempt("person@example.com").await.is_ok());
+
+        throttle.record_failure("person@example.com").await.unwrap();
+
+        let error = throttle
+            .before_attempt("person@example.com")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, LockoutError::LockedOut { .. }));
+    }
+
+    #[tokio::test]
+    async fn one_allowed_failure_locks_after_the_first_failure() {
+        let store = Arc::new(MemoryStore::default());
+        let throttle = LoginThrottle::from_config(
+            test_app(),
+            store,
+            LockoutConfig {
+                enabled: true,
+                max_failures: 1,
+                lockout_minutes: 15,
+                window_minutes: 15,
+            },
+        );
+
+        assert!(throttle.before_attempt("person@example.com").await.is_ok());
+        throttle.record_failure("person@example.com").await.unwrap();
 
         let error = throttle
             .before_attempt("person@example.com")

@@ -3,16 +3,14 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use uuid::Uuid;
 
 use crate::database::extensions::{
-    current_extension_scope, uuid_array_from_ids, AnyModelExtension, ModelExtensionLoader,
-    TranslationCacheShape,
+    current_extension_scope, AnyModelExtension, ModelExtensionLoader, TranslationCacheShape,
 };
 use crate::database::{
     ColumnRef, ComparisonOp, Condition, DbValue, Expr, OrderBy, Query, QueryExecutor, Sql, TableRef,
 };
-use crate::foundation::{AppContext, Error, Result};
+use crate::foundation::{AppContext, Result};
 
 tokio::task_local! {
     /// The current request's locale, set automatically by request middleware.
@@ -96,7 +94,7 @@ impl TranslationJoin {
     {
         Condition::and([
             self.column("translatable_id")
-                .compare(ComparisonOp::Eq, translatable_id.into()),
+                .compare(ComparisonOp::Eq, Expr::cast_text(translatable_id.into())),
             self.column("translatable_type")
                 .eq_value(M::translatable_type()),
             self.column("field").eq_value(field.into()),
@@ -183,7 +181,12 @@ impl TranslatedFields {
         let translated = values
             .get(current_locale)
             .or_else(|| values.get(default_locale))
-            .or_else(|| values.values().next())
+            .or_else(|| {
+                values
+                    .iter()
+                    .min_by(|(left, _), (right, _)| left.cmp(right))
+                    .map(|(_, value)| value)
+            })
             .cloned()
             .unwrap_or_default();
         Self { values, translated }
@@ -234,15 +237,13 @@ pub trait HasTranslations: Send + Sync {
         E: QueryExecutor,
     {
         let translatable_id = self.translatable_id();
-        let translatable_uuid = parse_translatable_uuid(&translatable_id)?;
-
         Query::insert_into(MODEL_TRANSLATIONS_TABLE)
             .values([
                 (
                     "translatable_type",
                     DbValue::Text(Self::translatable_type().to_string()),
                 ),
-                ("translatable_id", DbValue::Uuid(translatable_uuid)),
+                ("translatable_id", DbValue::Text(translatable_id.clone())),
                 ("locale", DbValue::Text(locale.to_string())),
                 ("field", DbValue::Text(field.to_string())),
                 ("value", DbValue::Text(value.to_string())),
@@ -310,10 +311,7 @@ pub trait HasTranslations: Send + Sync {
         let translatable_id = self.translatable_id();
         let rows = translation_select_query()
             .where_eq("translatable_type", Self::translatable_type())
-            .where_eq(
-                "translatable_id",
-                parse_translatable_uuid(&translatable_id)?,
-            )
+            .where_eq("translatable_id", translatable_id)
             .where_eq("locale", locale.to_string())
             .where_eq("field", field.to_string())
             .get(&*app.database()?)
@@ -349,10 +347,7 @@ pub trait HasTranslations: Send + Sync {
         let translatable_id = self.translatable_id();
         let rows = translation_select_query()
             .where_eq("translatable_type", Self::translatable_type())
-            .where_eq(
-                "translatable_id",
-                parse_translatable_uuid(&translatable_id)?,
-            )
+            .where_eq("translatable_id", translatable_id)
             .where_eq("locale", locale.to_string())
             .get(&*app.database()?)
             .await?;
@@ -389,10 +384,7 @@ pub trait HasTranslations: Send + Sync {
         let translatable_id = self.translatable_id();
         let rows = translation_select_query()
             .where_eq("translatable_type", Self::translatable_type())
-            .where_eq(
-                "translatable_id",
-                parse_translatable_uuid(&translatable_id)?,
-            )
+            .where_eq("translatable_id", translatable_id)
             .where_eq("field", field.to_string())
             .get(&*app.database()?)
             .await?;
@@ -430,10 +422,7 @@ pub trait HasTranslations: Send + Sync {
         let rows = order_translation_rows(
             translation_select_query()
                 .where_eq("translatable_type", Self::translatable_type())
-                .where_eq(
-                    "translatable_id",
-                    parse_translatable_uuid(&translatable_id)?,
-                ),
+                .where_eq("translatable_id", translatable_id),
         )
         .get(&*app.database()?)
         .await?;
@@ -452,10 +441,7 @@ pub trait HasTranslations: Send + Sync {
         let translatable_id = self.translatable_id();
         let affected = Query::delete_from(MODEL_TRANSLATIONS_TABLE)
             .where_eq("translatable_type", Self::translatable_type())
-            .where_eq(
-                "translatable_id",
-                parse_translatable_uuid(&translatable_id)?,
-            )
+            .where_eq("translatable_id", translatable_id.clone())
             .where_eq("locale", locale.to_string())
             .execute(executor)
             .await?;
@@ -475,10 +461,7 @@ pub trait HasTranslations: Send + Sync {
         let translatable_id = self.translatable_id();
         let affected = Query::delete_from(MODEL_TRANSLATIONS_TABLE)
             .where_eq("translatable_type", Self::translatable_type())
-            .where_eq(
-                "translatable_id",
-                parse_translatable_uuid(&translatable_id)?,
-            )
+            .where_eq("translatable_id", translatable_id.clone())
             .where_eq("field", field.to_string())
             .execute(executor)
             .await?;
@@ -498,10 +481,7 @@ pub trait HasTranslations: Send + Sync {
         let translatable_id = self.translatable_id();
         let affected = Query::delete_from(MODEL_TRANSLATIONS_TABLE)
             .where_eq("translatable_type", Self::translatable_type())
-            .where_eq(
-                "translatable_id",
-                parse_translatable_uuid(&translatable_id)?,
-            )
+            .where_eq("translatable_id", translatable_id.clone())
             .execute(executor)
             .await?;
         invalidate_translation_cache(Self::translatable_type(), &translatable_id);
@@ -547,10 +527,9 @@ async fn load_translation_rows(
         return Ok(Vec::new());
     }
 
-    let ids = uuid_array_from_ids(translatable_ids)?;
     let base = translation_select_query()
         .where_eq("translatable_type", translatable_type.to_string())
-        .where_in("translatable_id", ids);
+        .where_in("translatable_id", translatable_ids.iter().cloned());
     let query = match shape {
         TranslationCacheShape::Single { locale, field } => base
             .where_eq("locale", locale.clone())
@@ -562,14 +541,6 @@ async fn load_translation_rows(
     let rows = order_translation_rows(query).get(executor).await?;
 
     rows.iter().map(row_to_model_translation).collect()
-}
-
-fn parse_translatable_uuid(id: &str) -> Result<Uuid> {
-    Uuid::parse_str(id).map_err(|error| {
-        Error::message(format!(
-            "model translation expected UUID translatable_id `{id}`: {error}"
-        ))
-    })
 }
 
 fn translation_select_query() -> Query {
@@ -643,6 +614,69 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn translated_fields_follow_current_default_then_lexicographic_fallback() {
+        let current = TranslatedFields::from_entries(
+            vec![
+                ("zh".to_string(), "Chinese".to_string()),
+                ("en".to_string(), "English".to_string()),
+                ("ms".to_string(), "Malay".to_string()),
+            ],
+            "ms",
+            "en",
+        );
+        assert_eq!(current.translated, "Malay");
+
+        let default = TranslatedFields::from_entries(
+            vec![
+                ("zh".to_string(), "Chinese".to_string()),
+                ("en".to_string(), "English".to_string()),
+            ],
+            "fr",
+            "en",
+        );
+        assert_eq!(default.translated, "English");
+
+        let fallback = TranslatedFields::from_entries(
+            vec![
+                ("zh".to_string(), "Chinese".to_string()),
+                ("ms".to_string(), "Malay".to_string()),
+            ],
+            "fr",
+            "en",
+        );
+        assert_eq!(fallback.translated, "Malay");
+    }
+
+    #[test]
+    fn translated_fields_final_fallback_is_independent_of_entry_order() {
+        let forward = TranslatedFields::from_entries(
+            vec![
+                ("zh".to_string(), "Chinese".to_string()),
+                ("de".to_string(), "German".to_string()),
+                ("ms".to_string(), "Malay".to_string()),
+            ],
+            "fr",
+            "en",
+        );
+        let reverse = TranslatedFields::from_entries(
+            vec![
+                ("ms".to_string(), "Malay".to_string()),
+                ("de".to_string(), "German".to_string()),
+                ("zh".to_string(), "Chinese".to_string()),
+            ],
+            "fr",
+            "en",
+        );
+
+        assert_eq!(forward.translated, "German");
+        assert_eq!(reverse.translated, "German");
+        assert_eq!(
+            TranslatedFields::from_entries(Vec::new(), "fr", "en").translated,
+            ""
+        );
+    }
+
     #[derive(Default)]
     struct CountingTranslationExecutor {
         query_count: AtomicUsize,
@@ -661,14 +695,14 @@ mod tests {
                 DbValue::Text(value) => value.clone(),
                 _ => panic!("expected translatable_type binding"),
             };
-            let ids: Vec<Uuid> = bindings
+            let ids = bindings[1..bindings.len() - 1]
                 .iter()
-                .filter_map(|binding| match binding {
-                    DbValue::Uuid(value) => Some(*value),
-                    _ => None,
+                .map(|binding| match binding {
+                    DbValue::Text(value) => value.clone(),
+                    _ => panic!("expected translatable_id text binding"),
                 })
-                .collect();
-            assert!(!ids.is_empty(), "expected translatable_id uuid bindings");
+                .collect::<Vec<_>>();
+            assert!(!ids.is_empty(), "expected translatable_id text bindings");
             let field = bindings
                 .iter()
                 .rev()
@@ -697,8 +731,8 @@ mod tests {
     #[tokio::test]
     async fn lazy_translation_cache_batches_known_scope_ids() {
         let executor = CountingTranslationExecutor::default();
-        let first_id = Uuid::now_v7().to_string();
-        let second_id = Uuid::now_v7().to_string();
+        let first_id = "sku:first/item".to_string();
+        let second_id = "9002".to_string();
         let shape = TranslationCacheShape::Field {
             field: "name".to_string(),
         };
@@ -730,7 +764,7 @@ mod tests {
     async fn translation_write_helpers_use_executor_and_invalidate_scope_cache() {
         let executor = RecordingTranslationExecutor::default();
         let translatable = TestTranslatable {
-            id: Uuid::now_v7().to_string(),
+            id: "sku:desk-42".to_string(),
         };
         let shape = TranslationCacheShape::All;
 
@@ -789,7 +823,7 @@ mod tests {
             calls[0].1,
             vec![
                 DbValue::Text("test_translatables".to_string()),
-                DbValue::Uuid(Uuid::parse_str(&translatable.id).unwrap()),
+                DbValue::Text(translatable.id.clone()),
                 DbValue::Text("en".to_string()),
                 DbValue::Text("name".to_string()),
                 DbValue::Text("Desk".to_string()),
@@ -816,7 +850,7 @@ mod tests {
             .contains("LEFT JOIN \"model_translations\" AS \"product_names\" ON"));
         assert!(compiled
             .sql
-            .contains("\"product_names\".\"translatable_id\" = \"products\".\"id\""));
+            .contains("\"product_names\".\"translatable_id\" = (\"products\".\"id\")::text"));
         assert!(compiled
             .sql
             .contains("\"product_names\".\"translatable_type\" = $2::text"));
@@ -831,14 +865,18 @@ mod tests {
             .contains("COALESCE(\"product_names\".\"value\", $1::text) AS \"name\""));
     }
 
-    fn translation_record(translatable_type: &str, translatable_id: Uuid, field: &str) -> DbRecord {
+    fn translation_record(
+        translatable_type: &str,
+        translatable_id: String,
+        field: &str,
+    ) -> DbRecord {
         let mut record = DbRecord::new();
         record.insert("id", DbValue::Uuid(Uuid::now_v7()));
         record.insert(
             "translatable_type",
             DbValue::Text(translatable_type.to_string()),
         );
-        record.insert("translatable_id", DbValue::Uuid(translatable_id));
+        record.insert("translatable_id", DbValue::Text(translatable_id));
         record.insert("locale", DbValue::Text("en".to_string()));
         record.insert("field", DbValue::Text(field.to_string()));
         record.insert("value", DbValue::Text("Translated".to_string()));

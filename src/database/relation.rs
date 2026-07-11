@@ -8,12 +8,13 @@ use async_trait::async_trait;
 use crate::foundation::{Error, Result};
 use crate::logging::{catch_sync_panic, panic_payload_message};
 
+use super::aggregate::decode_aggregate_value;
 use super::ast::{
     AggregateNode, ColumnRef, ComparisonOp, Condition, DbValue, Expr, JoinKind, JoinNode, QueryAst,
     RelationKind, RelationNode, SelectItem, SelectNode, TableRef,
 };
 use super::compiler::PostgresCompiler;
-use super::extensions::{register_model_records, AnyModelExtension};
+use super::extensions::{register_model_records, AnyModelExtension, MetadataCacheShape};
 use super::model::{Column, FromDbValue, Model, ToDbValue};
 use super::projection::ProjectionMeta;
 use super::query::ModelQuery;
@@ -251,6 +252,28 @@ where
         self
     }
 
+    pub fn with_meta(mut self, key: impl Into<String>) -> Self
+    where
+        To: crate::metadata::HasMetadata,
+    {
+        self.child_extensions
+            .push(crate::metadata::metadata_extension_loader(
+                MetadataCacheShape::Key(key.into()),
+            ));
+        self
+    }
+
+    pub fn with_metadata(mut self) -> Self
+    where
+        To: crate::metadata::HasMetadata,
+    {
+        self.child_extensions
+            .push(crate::metadata::metadata_extension_loader(
+                MetadataCacheShape::All,
+            ));
+        self
+    }
+
     pub fn with_translated_field(mut self, field: impl Into<String>) -> Self
     where
         To: crate::translations::HasTranslations,
@@ -467,6 +490,28 @@ where
         self.child_extensions
             .push(crate::attachments::attachment_extension_loader(
                 collection.into(),
+            ));
+        self
+    }
+
+    pub fn with_meta(mut self, key: impl Into<String>) -> Self
+    where
+        To: crate::metadata::HasMetadata,
+    {
+        self.child_extensions
+            .push(crate::metadata::metadata_extension_loader(
+                MetadataCacheShape::Key(key.into()),
+            ));
+        self
+    }
+
+    pub fn with_metadata(mut self) -> Self
+    where
+        To: crate::metadata::HasMetadata,
+    {
+        self.child_extensions
+            .push(crate::metadata::metadata_extension_loader(
+                MetadataCacheShape::All,
             ));
         self
     }
@@ -1020,7 +1065,9 @@ where
         for parent in parents.iter_mut() {
             let value = relation_parent_key(&self.relation, parent)?
                 .and_then(|key| grouped.get(&key.relation_key()))
-                .map(|record| record.decode::<Option<Value>>(RELATION_AGGREGATE_ALIAS))
+                .map(|record| {
+                    decode_aggregate_value::<Option<Value>>(record, RELATION_AGGREGATE_ALIAS)
+                })
                 .transpose()
                 .map_err(|error| {
                     relation_load_error(&self.relation, "decode aggregate value", error)
@@ -1102,7 +1149,9 @@ where
         for parent in parents.iter_mut() {
             let value = many_to_many_parent_key(&self.relation, parent)?
                 .and_then(|key| grouped.get(&key.relation_key()))
-                .map(|record| record.decode::<Option<Value>>(RELATION_AGGREGATE_ALIAS))
+                .map(|record| {
+                    decode_aggregate_value::<Option<Value>>(record, RELATION_AGGREGATE_ALIAS)
+                })
                 .transpose()
                 .map_err(|error| {
                     many_to_many_load_error(&self.relation, "decode aggregate value", error)

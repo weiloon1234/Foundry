@@ -11,7 +11,7 @@ impl MigrationFile for Entry {
             CREATE TABLE model_translations (
                 id UUID PRIMARY KEY DEFAULT uuidv7(),
                 translatable_type TEXT NOT NULL,
-                translatable_id UUID NOT NULL,
+                translatable_id TEXT NOT NULL,
                 locale TEXT NOT NULL,
                 field TEXT NOT NULL,
                 value TEXT NOT NULL,

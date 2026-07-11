@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use foundry::kernel::cli::CliKernel;
 use foundry::prelude::*;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha1::Sha1;
 use tempfile::TempDir;
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -16,7 +16,28 @@ const MFA_TABLE: &str = "auth_mfa_totp_factors";
 const TOTP_PERIOD_SECONDS: i64 = 30;
 const TOTP_DIGITS: u32 = 6;
 
-type HmacSha256 = Hmac<Sha256>;
+type HmacSha1 = Hmac<Sha1>;
+
+struct TokenActorHydrator;
+
+#[async_trait]
+impl ActorHydrator for TokenActorHydrator {
+    async fn hydrate(&self, actor: &Actor, _app: &AppContext) -> Result<Option<Actor>> {
+        Ok(Some(
+            Actor::new(actor.id.clone(), actor.guard.clone())
+                .with_permissions([PermissionId::new("actor:current")]),
+        ))
+    }
+}
+
+struct TokenHydratorProvider;
+
+#[async_trait]
+impl ServiceProvider for TokenHydratorProvider {
+    async fn register(&self, registrar: &mut ServiceRegistrar) -> Result<()> {
+        registrar.register_actor_hydrator(GuardId::new("text_api"), TokenActorHydrator)
+    }
+}
 
 fn postgres_url() -> Option<String> {
     std::env::var("FOUNDRY_TEST_POSTGRES_URL")
@@ -41,6 +62,14 @@ impl TokenTestRuntime {
     }
 
     async fn new_with_config(extra_config: &str) -> Option<Self> {
+        Self::new_with_options(extra_config, false).await
+    }
+
+    async fn new_with_hydrator(extra_config: &str) -> Option<Self> {
+        Self::new_with_options(extra_config, true).await
+    }
+
+    async fn new_with_options(extra_config: &str, register_hydrator: bool) -> Option<Self> {
         let url = postgres_url()?;
         let dir = tempfile::tempdir().ok()?;
         fs::write(
@@ -56,11 +85,11 @@ impl TokenTestRuntime {
         )
         .ok()?;
 
-        let kernel = App::builder()
-            .load_config_dir(dir.path())
-            .build_cli_kernel()
-            .await
-            .ok()?;
+        let mut builder = App::builder().load_config_dir(dir.path());
+        if register_hydrator {
+            builder = builder.register_provider(TokenHydratorProvider);
+        }
+        let kernel = builder.build_cli_kernel().await.ok()?;
         let app = kernel.app().clone();
         let database = app.database().ok()?;
 
@@ -191,7 +220,7 @@ fn current_totp_step() -> i64 {
 fn totp_code(secret: &str, step: i64) -> String {
     let secret = decode_base32(secret);
     let counter = (step as u64).to_be_bytes();
-    let mut mac = HmacSha256::new_from_slice(&secret).unwrap();
+    let mut mac = HmacSha1::new_from_slice(&secret).unwrap();
     mac.update(&counter);
     let result = mac.finalize().into_bytes();
     let offset = (result[result.len() - 1] & 0x0f) as usize;
@@ -237,7 +266,7 @@ async fn reset_personal_access_tokens(database: &DatabaseManager) {
         .raw_execute(
             r#"
             CREATE TABLE personal_access_tokens (
-                id UUID PRIMARY KEY DEFAULT uuidv7(),
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 guard TEXT NOT NULL,
                 actor_id TEXT NOT NULL,
                 name TEXT NOT NULL DEFAULT '',
@@ -320,7 +349,7 @@ async fn reset_mfa_totp_factors(database: &DatabaseManager) {
         .raw_execute(
             r#"
             CREATE TABLE auth_mfa_totp_factors (
-                id UUID PRIMARY KEY DEFAULT uuidv7(),
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 guard TEXT NOT NULL,
                 actor_id TEXT NOT NULL,
                 secret_ciphertext TEXT NOT NULL,
@@ -605,6 +634,84 @@ async fn token_manager_issue_refresh_and_revoke_all_use_text_actor_ids() {
         .await
         .unwrap()
         .is_none());
+
+    runtime.cleanup().await;
+}
+
+#[tokio::test]
+async fn full_tokens_hydrate_current_actor_while_mfa_pending_tokens_stay_restricted() {
+    let _guard = token_lock().await;
+    let Some(runtime) = TokenTestRuntime::new_with_hydrator(
+        r#"
+        [auth]
+        default_guard = "text_api"
+
+        [auth.guards.text_api]
+        driver = "token"
+        "#,
+    )
+    .await
+    else {
+        return;
+    };
+
+    let tokens = runtime.app.tokens().unwrap();
+    let full = MfaManager::new(&runtime.app)
+        .unwrap()
+        .issue_full_token(
+            &Actor::new("acct-hydrated", DirectManagerActor::guard()),
+            "full",
+        )
+        .await
+        .unwrap();
+
+    let directly_validated = tokens.validate(&full.access_token).await.unwrap().unwrap();
+    assert!(directly_validated.has_permission(PermissionId::new("actor:current")));
+
+    let authenticated = runtime
+        .app
+        .auth()
+        .unwrap()
+        .authenticate_token(&full.access_token, Some(&GuardId::new("text_api")))
+        .await
+        .unwrap();
+    assert!(authenticated.has_permission(PermissionId::new("actor:current")));
+
+    let scoped = tokens
+        .issue_with_abilities::<DirectManagerActor>(
+            "acct-hydrated",
+            "scoped",
+            vec!["actor:current".to_string(), "token:stale".to_string()],
+        )
+        .await
+        .unwrap();
+    let scoped_actor = runtime
+        .app
+        .auth()
+        .unwrap()
+        .authenticate_token(&scoped.access_token, Some(&GuardId::new("text_api")))
+        .await
+        .unwrap();
+    assert!(scoped_actor.has_permission(PermissionId::new("actor:current")));
+    assert!(!scoped_actor.has_permission(PermissionId::new("token:stale")));
+
+    let pending = tokens
+        .issue_mfa_pending(
+            &Actor::new("acct-hydrated", GuardId::new("text_api")),
+            "mfa",
+            10,
+        )
+        .await
+        .unwrap();
+    let pending_actor = tokens
+        .validate(&pending.access_token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        pending_actor.has_permission(PermissionId::new(foundry::auth::token::MFA_PENDING_ABILITY,))
+    );
+    assert!(!pending_actor.has_permission(PermissionId::new("actor:current")));
 
     runtime.cleanup().await;
 }

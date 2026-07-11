@@ -26,6 +26,7 @@ struct DatatableFieldRef
 ```rust
 struct DatatableContext
   fn new( app: &'a AppContext, actor: Option<&'a Actor>, request: &'a DatatableRequest, ) -> Self
+  fn with_locale_and_timezone( app: &'a AppContext, actor: Option<&'a Actor>, request: &'a DatatableRequest, locale: Option<String>, timezone: Timezone, ) -> Self
   fn t(&self, key: &str) -> String
 ```
 
@@ -48,6 +49,7 @@ trait DatatableQuery: Clone
   fn apply_having(self, condition: Condition) -> Self
   fn apply_order(self, order: OrderBy) -> Self
   fn apply_limit(self, limit: u64) -> Self
+  fn stream<'a, E>(
   fn get<'life0, 'life1, 'async_trait, E>(
   fn paginate<'life0, 'life1, 'async_trait, E>(
 ```
@@ -61,10 +63,19 @@ async fn build_download_response<D>( app: &AppContext, actor: Option<&Actor>, re
 ## foundry::datatable::export
 
 ```rust
+pub const LEGACY_DATATABLE_EXPORT_MAX_BYTES: u64;
 struct GeneratedDatatableExport
-struct NoopExportDelivery
+struct GeneratedDatatableExportFile
+  fn datatable_id(&self) -> &str
+  fn filename(&self) -> &str
+  fn columns(&self) -> &[String]
+  fn path(&self) -> &Path
+  fn size(&self) -> u64
+  async fn open(&self) -> Result<File>
+  async fn read_bounded(&self, max_bytes: u64) -> Result<Vec<u8>>
 trait DatatableExportDelivery
   fn deliver<'life0, 'life1, 'async_trait>(
+  fn deliver_file<'life0, 'life1, 'async_trait>(
 ```
 
 ## foundry::datatable::export_job
@@ -148,6 +159,7 @@ trait DynDatatable
   fn json<'life0, 'life1, 'life2, 'async_trait>(
   fn download<'life0, 'life1, 'life2, 'async_trait>(
   fn queue_email<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+  fn export_file<'life0, 'life1, 'life2, 'async_trait>(
 ```
 
 ## foundry::datatable::relation_filter

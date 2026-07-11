@@ -3,6 +3,21 @@ use crate::support::ValidationRuleId;
 #[derive(Clone)]
 pub(crate) enum FieldRule {
     Required,
+    RequiredIf {
+        other_field: String,
+        other_value: String,
+        expected_values: Vec<String>,
+    },
+    RequiredUnless {
+        other_field: String,
+        other_value: String,
+        expected_values: Vec<String>,
+    },
+    RequiredWith {
+        other_fields: Vec<(String, String)>,
+    },
+    Present,
+    Prohibited,
     Email,
     Min(usize),
     Max(usize),
@@ -11,6 +26,7 @@ pub(crate) enum FieldRule {
     Url,
     Uuid,
     Numeric,
+    Boolean,
     Alpha,
     AlphaNumeric,
     InList(Vec<String>),
@@ -67,6 +83,7 @@ pub(crate) enum FieldRule {
     AppEnum {
         valid_keys: Vec<String>,
     },
+    Distinct,
 }
 
 #[derive(Clone)]
@@ -80,6 +97,74 @@ macro_rules! impl_field_rules {
         pub fn required(mut self) -> Self {
             self.steps.push(FieldStep {
                 rule: FieldRule::Required,
+                message: None,
+            });
+            self
+        }
+
+        pub fn required_if(
+            mut self,
+            other_field: impl Into<String>,
+            other_value: impl Into<String>,
+            expected_values: impl IntoIterator<Item = impl Into<String>>,
+        ) -> Self {
+            self.steps.push(FieldStep {
+                rule: FieldRule::RequiredIf {
+                    other_field: other_field.into(),
+                    other_value: other_value.into(),
+                    expected_values: expected_values.into_iter().map(Into::into).collect(),
+                },
+                message: None,
+            });
+            self
+        }
+
+        pub fn required_unless(
+            mut self,
+            other_field: impl Into<String>,
+            other_value: impl Into<String>,
+            expected_values: impl IntoIterator<Item = impl Into<String>>,
+        ) -> Self {
+            self.steps.push(FieldStep {
+                rule: FieldRule::RequiredUnless {
+                    other_field: other_field.into(),
+                    other_value: other_value.into(),
+                    expected_values: expected_values.into_iter().map(Into::into).collect(),
+                },
+                message: None,
+            });
+            self
+        }
+
+        pub fn required_with<I, N, V>(mut self, other_fields: I) -> Self
+        where
+            I: IntoIterator<Item = (N, V)>,
+            N: Into<String>,
+            V: Into<String>,
+        {
+            self.steps.push(FieldStep {
+                rule: FieldRule::RequiredWith {
+                    other_fields: other_fields
+                        .into_iter()
+                        .map(|(name, value)| (name.into(), value.into()))
+                        .collect(),
+                },
+                message: None,
+            });
+            self
+        }
+
+        pub fn present(mut self) -> Self {
+            self.steps.push(FieldStep {
+                rule: FieldRule::Present,
+                message: None,
+            });
+            self
+        }
+
+        pub fn prohibited(mut self) -> Self {
+            self.steps.push(FieldStep {
+                rule: FieldRule::Prohibited,
                 message: None,
             });
             self
@@ -147,6 +232,14 @@ macro_rules! impl_field_rules {
         pub fn numeric(mut self) -> Self {
             self.steps.push(FieldStep {
                 rule: FieldRule::Numeric,
+                message: None,
+            });
+            self
+        }
+
+        pub fn boolean(mut self) -> Self {
+            self.steps.push(FieldStep {
+                rule: FieldRule::Boolean,
                 message: None,
             });
             self
@@ -458,8 +551,21 @@ macro_rules! impl_field_rules {
             self
         }
 
+        pub fn distinct(mut self) -> Self {
+            self.steps.push(FieldStep {
+                rule: FieldRule::Distinct,
+                message: None,
+            });
+            self
+        }
+
         pub fn nullable(mut self) -> Self {
             self.nullable = true;
+            self
+        }
+
+        pub fn sometimes(mut self) -> Self {
+            self.sometimes = true;
             self
         }
 

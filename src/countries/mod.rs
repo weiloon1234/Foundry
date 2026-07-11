@@ -1,10 +1,15 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::database::{DbType, DbValue, OrderBy, Query, QueryExecutor, Sql};
 use crate::foundation::{AppContext, Error, Result};
 
 const BUILTIN_SEED: &str = include_str!("seed.json");
+const IANA_ZONE_TAB: &str = include_str!("iana-zone-2026a.tab");
+const IANA_TZDB_VERSION: &str = "2026a";
 const COUNTRIES_TABLE: &str = "countries";
+const COUNTRIES_WITHOUT_IANA_ZONES: [&str; 2] = ["BV", "HM"];
 
 /// Country activation status.
 #[derive(Clone, Debug, Default, PartialEq, Eq, foundry_macros::AppEnum)]
@@ -22,10 +27,12 @@ impl CountryStatus {
         }
     }
 
-    pub fn parse(s: &str) -> Self {
+    /// Parse a persisted status value, returning `None` for unknown values.
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "enabled" => Self::Enabled,
-            _ => Self::Disabled,
+            "enabled" => Some(Self::Enabled),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
         }
     }
 
@@ -53,13 +60,13 @@ pub struct Country {
     pub capital: Option<String>,
     pub region: Option<String>,
     pub subregion: Option<String>,
-    pub currencies: serde_json::Value,
+    pub currencies: Vec<CountryCurrency>,
     pub primary_currency_code: Option<String>,
     pub calling_code: Option<String>,
     pub calling_root: Option<String>,
-    pub calling_suffixes: serde_json::Value,
-    pub tlds: serde_json::Value,
-    pub timezones: serde_json::Value,
+    pub calling_suffixes: Vec<String>,
+    pub tlds: Vec<String>,
+    pub timezones: Vec<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub independent: Option<bool>,
@@ -180,7 +187,7 @@ pub struct CountrySeed {
     pub capitals: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CountryCurrency {
     pub code: String,
     #[serde(default)]
@@ -193,8 +200,83 @@ pub struct CountryCurrency {
 
 /// Load the built-in 250 country seed records.
 pub fn load_seed() -> Result<Vec<CountrySeed>> {
-    serde_json::from_str(BUILTIN_SEED)
-        .map_err(|e| Error::message(format!("failed to parse built-in countries seed: {e}")))
+    let mut countries: Vec<CountrySeed> = serde_json::from_str(BUILTIN_SEED)
+        .map_err(|e| Error::message(format!("failed to parse built-in countries seed: {e}")))?;
+    apply_iana_timezones(&mut countries)?;
+    Ok(countries)
+}
+
+fn apply_iana_timezones(countries: &mut [CountrySeed]) -> Result<()> {
+    let mut timezones_by_country = parse_iana_zone_tab()?;
+
+    // XK is an ISO user-assigned code, so zone.tab intentionally omits it.
+    // IANA's Europe source groups Kosovo under the Europe/Belgrade rules.
+    timezones_by_country.insert("XK".to_string(), vec!["Europe/Belgrade".to_string()]);
+
+    for country in countries {
+        let iso2 = country.iso2.trim().to_ascii_uppercase();
+        match timezones_by_country.remove(&iso2) {
+            Some(timezones) => country.timezones = timezones,
+            None if COUNTRIES_WITHOUT_IANA_ZONES.contains(&iso2.as_str()) => {
+                country.timezones.clear();
+            }
+            None => {
+                return Err(Error::message(format!(
+                    "country `{iso2}` has no timezone mapping in IANA tzdb {IANA_TZDB_VERSION}"
+                )))
+            }
+        }
+    }
+
+    if !timezones_by_country.is_empty() {
+        return Err(Error::message(format!(
+            "IANA tzdb {IANA_TZDB_VERSION} contains country codes absent from the built-in seed: {}",
+            timezones_by_country
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
+fn parse_iana_zone_tab() -> Result<BTreeMap<String, Vec<String>>> {
+    let mut timezones_by_country = BTreeMap::<String, Vec<String>>::new();
+
+    for (index, line) in IANA_ZONE_TAB.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let mut columns = line.split('\t');
+        let country_codes = columns.next().unwrap_or_default();
+        let _coordinates = columns.next();
+        let timezone = columns.next().ok_or_else(|| {
+            Error::message(format!(
+                "invalid IANA tzdb {IANA_TZDB_VERSION} zone.tab row {}",
+                index + 1
+            ))
+        })?;
+        timezone.parse::<chrono_tz::Tz>().map_err(|error| {
+            Error::message(format!(
+                "IANA tzdb {IANA_TZDB_VERSION} timezone `{timezone}` is unsupported: {error}"
+            ))
+        })?;
+
+        for country_code in country_codes.split(',') {
+            let zones = timezones_by_country
+                .entry(country_code.to_string())
+                .or_default();
+            if !zones.iter().any(|existing| existing == timezone) {
+                zones.push(timezone.to_string());
+            }
+        }
+    }
+
+    Ok(timezones_by_country)
 }
 
 /// Seed the countries table from built-in data.
@@ -325,8 +407,20 @@ async fn upsert_country_seed(executor: &dyn QueryExecutor, seed: &CountrySeed) -
 }
 
 fn row_to_country(row: &crate::database::DbRecord) -> Result<Country> {
+    let iso2 = row.try_text("iso2")?;
+    let stored_status = row.try_text("status")?;
+    let status = CountryStatus::parse(&stored_status).ok_or_else(|| {
+        Error::message(format!(
+            "country `{iso2}` has unknown status `{stored_status}`"
+        ))
+    })?;
+
     Ok(Country {
-        iso2: row.try_text("iso2")?,
+        currencies: decode_country_json_collection(row, "currencies", &iso2)?,
+        calling_suffixes: decode_country_json_collection(row, "calling_suffixes", &iso2)?,
+        tlds: decode_country_json_collection(row, "tlds", &iso2)?,
+        timezones: decode_country_json_collection(row, "timezones", &iso2)?,
+        iso2,
         iso3: row.try_text("iso3")?,
         iso_numeric: row.optional_text("iso_numeric"),
         name: row.try_text("name")?,
@@ -334,25 +428,9 @@ fn row_to_country(row: &crate::database::DbRecord) -> Result<Country> {
         capital: row.optional_text("capital"),
         region: row.optional_text("region"),
         subregion: row.optional_text("subregion"),
-        currencies: match row.get("currencies") {
-            Some(DbValue::Json(v)) => v.clone(),
-            _ => serde_json::json!([]),
-        },
         primary_currency_code: row.optional_text("primary_currency_code"),
         calling_code: row.optional_text("calling_code"),
         calling_root: row.optional_text("calling_root"),
-        calling_suffixes: match row.get("calling_suffixes") {
-            Some(DbValue::Json(v)) => v.clone(),
-            _ => serde_json::json!([]),
-        },
-        tlds: match row.get("tlds") {
-            Some(DbValue::Json(v)) => v.clone(),
-            _ => serde_json::json!([]),
-        },
-        timezones: match row.get("timezones") {
-            Some(DbValue::Json(v)) => v.clone(),
-            _ => serde_json::json!([]),
-        },
         latitude: match row.get("latitude") {
             Some(DbValue::Float64(v)) => Some(*v),
             _ => None,
@@ -370,7 +448,7 @@ fn row_to_country(row: &crate::database::DbRecord) -> Result<Country> {
             _ => None,
         },
         flag_emoji: row.optional_text("flag_emoji"),
-        status: CountryStatus::parse(&row.try_text("status")?),
+        status,
         conversion_rate: match row.get("conversion_rate") {
             Some(DbValue::Float64(v)) => Some(*v),
             _ => None,
@@ -382,9 +460,40 @@ fn row_to_country(row: &crate::database::DbRecord) -> Result<Country> {
     })
 }
 
+fn decode_country_json_collection<T>(
+    row: &crate::database::DbRecord,
+    field: &str,
+    iso2: &str,
+) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let value = match row.get(field) {
+        Some(DbValue::Json(value)) => value.clone(),
+        Some(value) => {
+            return Err(Error::message(format!(
+                "country `{iso2}` field `{field}` expected JSON, got {:?}",
+                value.db_type()
+            )))
+        }
+        None => {
+            return Err(Error::message(format!(
+                "country `{iso2}` field `{field}` is missing"
+            )))
+        }
+    };
+
+    serde_json::from_value(value).map_err(|error| {
+        Error::message(format!(
+            "country `{iso2}` field `{field}` has invalid data: {error}"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::DbRecord;
 
     #[test]
     fn load_seed_parses_all_250_countries() {
@@ -399,6 +508,27 @@ mod tests {
         assert_eq!(my.name, "Malaysia");
         assert_eq!(my.iso3, "MYS");
         assert!(my.flag_emoji.is_some());
+        assert_eq!(my.timezones, vec!["Asia/Kuala_Lumpur", "Asia/Kuching"]);
+    }
+
+    #[test]
+    fn seed_timezones_cover_every_country_with_an_iana_or_explicit_mapping() {
+        let countries = load_seed().unwrap();
+        let empty = countries
+            .iter()
+            .filter(|country| country.timezones.is_empty())
+            .map(|country| country.iso2.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(empty, COUNTRIES_WITHOUT_IANA_ZONES);
+        assert_eq!(
+            countries
+                .iter()
+                .find(|country| country.iso2 == "XK")
+                .unwrap()
+                .timezones,
+            vec!["Europe/Belgrade"]
+        );
     }
 
     #[test]
@@ -415,5 +545,83 @@ mod tests {
         let my = countries.iter().find(|c| c.iso2 == "MY").unwrap();
         assert_eq!(my.conversion_rate, None);
         assert_eq!(my.is_default, None);
+    }
+
+    #[test]
+    fn country_status_parsing_rejects_unknown_values() {
+        assert_eq!(
+            CountryStatus::parse("enabled"),
+            Some(CountryStatus::Enabled)
+        );
+        assert_eq!(
+            CountryStatus::parse("disabled"),
+            Some(CountryStatus::Disabled)
+        );
+        assert_eq!(CountryStatus::parse("archived"), None);
+    }
+
+    #[test]
+    fn country_hydration_uses_typed_json_collections_without_changing_json_shape() {
+        let country = row_to_country(&country_record()).unwrap();
+
+        assert_eq!(country.currencies[0].code, "MYR");
+        assert_eq!(country.calling_suffixes, vec!["60"]);
+        assert_eq!(country.tlds, vec![".my"]);
+        assert_eq!(country.timezones, vec!["Asia/Kuala_Lumpur"]);
+
+        let json = serde_json::to_value(country).unwrap();
+        assert_eq!(
+            json["currencies"],
+            serde_json::json!([{"code": "MYR", "name": "Malaysian ringgit", "symbol": "RM", "minor_units": 2}])
+        );
+        assert_eq!(json["calling_suffixes"], serde_json::json!(["60"]));
+        assert_eq!(json["tlds"], serde_json::json!([".my"]));
+        assert_eq!(json["timezones"], serde_json::json!(["Asia/Kuala_Lumpur"]));
+    }
+
+    #[test]
+    fn country_hydration_reports_context_for_invalid_collection_data() {
+        let mut row = country_record();
+        row.insert("currencies", DbValue::Json(serde_json::json!({})));
+
+        let error = row_to_country(&row).unwrap_err();
+
+        assert!(error.to_string().contains("country `MY`"));
+        assert!(error.to_string().contains("field `currencies`"));
+    }
+
+    #[test]
+    fn country_hydration_rejects_unknown_stored_status() {
+        let mut row = country_record();
+        row.insert("status", DbValue::Text("archived".to_string()));
+
+        let error = row_to_country(&row).unwrap_err();
+
+        assert!(error.to_string().contains("country `MY`"));
+        assert!(error.to_string().contains("unknown status `archived`"));
+    }
+
+    fn country_record() -> DbRecord {
+        let mut row = DbRecord::new();
+        row.insert("iso2", DbValue::Text("MY".to_string()));
+        row.insert("iso3", DbValue::Text("MYS".to_string()));
+        row.insert("name", DbValue::Text("Malaysia".to_string()));
+        row.insert(
+            "currencies",
+            DbValue::Json(serde_json::json!([{
+                "code": "MYR",
+                "name": "Malaysian ringgit",
+                "symbol": "RM",
+                "minor_units": 2
+            }])),
+        );
+        row.insert("calling_suffixes", DbValue::Json(serde_json::json!(["60"])));
+        row.insert("tlds", DbValue::Json(serde_json::json!([".my"])));
+        row.insert(
+            "timezones",
+            DbValue::Json(serde_json::json!(["Asia/Kuala_Lumpur"])),
+        );
+        row.insert("status", DbValue::Text("enabled".to_string()));
+        row
     }
 }

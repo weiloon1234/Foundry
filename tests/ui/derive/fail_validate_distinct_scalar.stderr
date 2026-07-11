@@ -1,0 +1,5 @@
+error: `distinct` can only be used on Vec<T> or Option<Vec<T>> fields
+ --> tests/ui/derive/fail_validate_distinct_scalar.rs:7:5
+  |
+7 |     tag: String,
+  |     ^^^

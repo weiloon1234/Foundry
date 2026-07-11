@@ -5,7 +5,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::config::SessionConfig;
-use crate::foundation::{Error, Result};
+use crate::foundation::{AppContext, Error, Result};
 use crate::http::cookie::{
     build_cookie_header_value, clear_cookie_header_value, parse_same_site,
     ClearCookieHeaderOptions, CookieHeaderOptions,
@@ -13,8 +13,7 @@ use crate::http::cookie::{
 use crate::redis::RedisManager;
 use crate::support::{GuardId, Token};
 
-use super::Actor;
-use super::Authenticatable;
+use super::{Actor, ActorHydratorRegistry, Authenticatable, SessionCredentialAuthenticator};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionData {
@@ -28,13 +27,25 @@ struct SessionData {
 ///
 /// Stored as a singleton in the container, accessible via `app.sessions()`.
 pub struct SessionManager {
+    app: AppContext,
     redis: Arc<RedisManager>,
     config: SessionConfig,
+    actor_hydrators: Arc<ActorHydratorRegistry>,
 }
 
 impl SessionManager {
-    pub(crate) fn new(redis: Arc<RedisManager>, config: SessionConfig) -> Self {
-        Self { redis, config }
+    pub(crate) fn new(
+        app: AppContext,
+        redis: Arc<RedisManager>,
+        config: SessionConfig,
+        actor_hydrators: Arc<ActorHydratorRegistry>,
+    ) -> Self {
+        Self {
+            app,
+            redis,
+            config,
+            actor_hydrators,
+        }
     }
 
     pub fn config(&self) -> &SessionConfig {
@@ -79,20 +90,13 @@ impl SessionManager {
     /// Validate a session ID and return the Actor if valid.
     /// Extends TTL if sliding expiry is enabled.
     pub async fn validate(&self, session_id: &str) -> Result<Option<Actor>> {
-        self.validate_with_sliding_expiry(session_id, self.config.sliding_expiry)
-            .await
+        let actor = self
+            .validate_credential(session_id, self.config.sliding_expiry)
+            .await?;
+        self.hydrate(actor).await
     }
 
-    /// Validate a session without extending its TTL.
-    ///
-    /// Long-lived transports use this to observe the same expiry as ordinary
-    /// HTTP traffic without turning background credential checks into session
-    /// activity.
-    pub(crate) async fn validate_without_touch(&self, session_id: &str) -> Result<Option<Actor>> {
-        self.validate_with_sliding_expiry(session_id, false).await
-    }
-
-    async fn validate_with_sliding_expiry(
+    async fn validate_credential(
         &self,
         session_id: &str,
         extend_sliding_expiry: bool,
@@ -125,6 +129,13 @@ impl SessionManager {
         }
 
         Ok(Some(Actor::new(data.actor_id, GuardId::owned(data.guard))))
+    }
+
+    async fn hydrate(&self, actor: Option<Actor>) -> Result<Option<Actor>> {
+        let Some(actor) = actor else {
+            return Ok(None);
+        };
+        self.actor_hydrators.hydrate(actor, &self.app).await
     }
 
     /// Destroy a specific session.
@@ -248,6 +259,22 @@ impl SessionManager {
     }
 }
 
+#[async_trait::async_trait]
+impl SessionCredentialAuthenticator for SessionManager {
+    fn extract_session_id(&self, headers: &HeaderMap) -> Option<String> {
+        SessionManager::extract_session_id(self, headers)
+    }
+
+    async fn authenticate_session(
+        &self,
+        session_id: &str,
+        extend_sliding_expiry: bool,
+    ) -> Result<Option<Actor>> {
+        self.validate_credential(session_id, extend_sliding_expiry)
+            .await
+    }
+}
+
 const MAX_SESSION_ID_LEN: usize = 128;
 
 fn is_valid_session_id(session_id: &str) -> bool {
@@ -265,10 +292,17 @@ mod tests {
     use serde_json::json;
 
     use crate::config::ConfigRepository;
+    use crate::foundation::{AppContext, Container};
+    use crate::validation::RuleRegistry;
 
     fn manager_with_config(config: SessionConfig) -> SessionManager {
-        let redis = Arc::new(RedisManager::from_config(&ConfigRepository::empty()).unwrap());
-        SessionManager::new(redis, config)
+        let repository = ConfigRepository::empty();
+        let redis = Arc::new(RedisManager::from_config(&repository).unwrap());
+        let app = AppContext::new(Container::new(), repository, RuleRegistry::new()).unwrap();
+        let hydrators = Arc::new(crate::auth::ActorHydratorRegistryBuilder::freeze_shared(
+            crate::auth::ActorHydratorRegistryBuilder::shared(),
+        ));
+        SessionManager::new(app, redis, config, hydrators)
     }
 
     #[test]

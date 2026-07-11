@@ -241,17 +241,18 @@ impl Job for SendWelcomeEmail {
 }
 
 // Dispatch
-app.jobs()?.dispatch(SendWelcomeEmail { user_id: "123".into() })?;
+app.jobs()?.dispatch(SendWelcomeEmail { user_id: "123".into() }).await?;
 
 // Dispatch with delay
-app.jobs()?.dispatch_later(job, DateTime::now().add_seconds(60).timestamp_millis())?;
+app.jobs()?.dispatch_later(job, DateTime::now().add_seconds(60).timestamp_millis()).await?;
 
 // Batch
 app.jobs()?.batch("onboard")
     .add(SendWelcomeEmail { .. })?
     .add(CreateDefaultSettings { .. })?
     .on_complete(NotifyAdmin { .. })?
-    .dispatch()?;
+    .dispatch()
+    .await?;
 ```
 
 ## Middleware
@@ -475,15 +476,20 @@ admin route tree with `audit_area("admin")`, and unmarked routes will not produc
 There is no global audit config section anymore. Error reporters are registered in code with
 `AppBuilder::register_error_reporter*()`, so they do not appear in the generated config yet.
 
-Environment variables override config using double-underscore notation:
+Environment variables override config through the explicit `FOUNDRY__`
+namespace and double-underscore paths:
 
 ```bash
-DATABASE__URL=postgres://... SERVER__PORT=8080 cargo run
+FOUNDRY__DATABASE__URL=postgres://... FOUNDRY__SERVER__PORT=8080 cargo run
 ```
 
-Database config supports primary/read endpoints (`DATABASE__URL` and `DATABASE__READ_URL`),
-per-pool overrides (`DATABASE__WRITE_POOL__MAX_CONNECTIONS`, `DATABASE__READ_POOL__MAX_CONNECTIONS`),
-and lazy pools (`DATABASE__CONNECT_LAZY=true`) for serverless Postgres or provider poolers.
+Legacy unprefixed overlays remain supported temporarily and are reported by
+`doctor`. Database config supports primary/read endpoints
+(`FOUNDRY__DATABASE__URL` and `FOUNDRY__DATABASE__READ_URL`), per-pool overrides
+(`FOUNDRY__DATABASE__WRITE_POOL__MAX_CONNECTIONS`,
+`FOUNDRY__DATABASE__READ_POOL__MAX_CONNECTIONS`), and lazy pools
+(`FOUNDRY__DATABASE__CONNECT_LAZY=true`) for serverless Postgres or provider
+poolers.
 
 ## Redis
 
@@ -542,21 +548,38 @@ impl ServiceProvider for AppServiceProvider {
 | **Scaffolding** | |
 | `make:migration` | Create a new migration file |
 | `make:seeder` | Create a new seeder file |
-| `make:model` | Create a new model file; accepts `--path <DIR>` |
+| `make:model` | Create a new model file; accepts `--path <DIR>` and `--table <TABLE>` |
 | `make:job` | Create a new job file; accepts `--path <DIR>` |
 | `make:command` | Create a new command file; accepts `--path <DIR>` |
+| `make:request` | Create a validated HTTP request DTO file |
+| `make:dto` | Create a serializable API DTO file |
+| `make:policy` | Create an authorization policy file |
+| `make:event` | Create a domain event file |
+| `make:listener` | Create an event listener file; requires `--event <TYPE>` |
+| `make:notification` | Create a notification file |
+| `make:mail` | Create an email message file |
+| `make:datatable` | Create a model datatable file; requires `--model <TYPE>` |
+| `make:plugin` | Create an in-app plugin component file |
+| `make:test` | Create an integration test file |
 | **Runtime** | |
+| `dev [PROCESS]...` | Supervise selected `http`, `worker`, `scheduler`, and `websocket` processes from the current executable |
 | `doctor` | Run runtime health checks; accepts `--deploy`, `--json`, and `--strict` |
 | `down` | Put the application into maintenance mode |
 | `up` | Bring the application out of maintenance mode |
 | `routes:list` | List all registered routes |
 | `token:prune` | Prune expired personal access tokens |
+| `audit:prune` | Prune audit rows using configured retention or `--days <DAYS>` |
 | **Plugins** | |
 | `plugin:list` | List registered plugins |
 | `plugin:install-assets` | Install plugin assets |
 | `plugin:scaffold` | Run a plugin scaffold |
 | **Documentation** | |
 | `docs:api` | Generate API surface docs |
+
+`dev` is a local process orchestrator for applications using the documented
+`PROCESS` selector. It prefixes each child process's output, shuts all children
+down together, and supports explicit bounded restart/backoff options. It does
+not generate or install a starter application.
 
 ## Examples
 
@@ -591,7 +614,7 @@ make verify
 # Run tests
 make test
 
-# Postgres acceptance tests
+# Run every target with PostgreSQL-backed branches enabled
 FOUNDRY_TEST_POSTGRES_URL=postgres://... make test-postgres
 
 # Generate API surface docs
@@ -606,7 +629,7 @@ make verify-release
 | Resource | Description |
 |----------|-------------|
 | [API Surface](docs/api/index.md) | Auto-generated public API reference (per module) |
-| [Public API Contract](docs/api/public-api-contract.md) | Import layers and compatibility rules for consumer apps |
+| [Public API Contract](docs/public-api-contract.md) | Import layers and compatibility rules for consumer apps |
 | [API Reference](docs/api-reference.md) | Hand-curated API reference with context |
 | [Getting Started](docs/guides/getting-started.md) | AppBuilder, 5 process types, project structure |
 | [Recipes](docs/guides/recipes.md) | Production readiness, CRUD, queued email, uploads, datatables, plugins |
@@ -616,6 +639,7 @@ make verify-release
 | [Routes & Middleware](docs/guides/routes-and-middleware.md) | Routing, middleware stack, CORS, CSRF, rate limiting |
 | [Email & Notifications](docs/guides/email-and-notifications.md) | Multi-driver email, multi-channel notifications |
 | [Caching & Redis](docs/guides/caching-and-redis.md) | Cache abstraction, namespaced Redis client |
+| [Outbound HTTP Client](docs/guides/http-client.md) | Pooled requests, safe retries, redacted tracing, deterministic fakes |
 | [Storage & Imaging](docs/guides/storage-and-imaging.md) | File uploads, local + S3, image processing |
 | [Background Processing](docs/guides/background-processing.md) | Jobs, scheduler, domain events |
 | [WebSocket](docs/guides/websocket.md) | Channels, rooms, presence, broadcasting |

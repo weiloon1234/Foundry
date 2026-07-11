@@ -139,7 +139,6 @@ impl HasAttachments for Voucher {
                 .single()
                 .resize_to_fill(1200, 630)
                 .format(ImageFormat::WebP)
-                .quality(85)
                 .upscale(true)
                 .hook(VoucherMainImageHook),
         ]
@@ -162,7 +161,7 @@ impl AttachmentSpecHook<Voucher> for VoucherMainImageHook {
     }
 
     async fn after_store(&self, ctx: AttachmentAfterStoreContext<'_, Voucher>) -> Result<()> {
-        // React to ctx.attachment after the DB row exists.
+        // React to ctx.attachment while its atomic collection transaction is active.
         Ok(())
     }
 }
@@ -183,7 +182,6 @@ Attachment::upload(uploaded_file)
     .disk("s3")
     .resize_to_fill(300, 300)
     .format(ImageFormat::WebP)
-    .quality(80)
     .store(&app, "products", &product.id.to_string())
     .await?;
 ```
@@ -191,6 +189,23 @@ Attachment::upload(uploaded_file)
 Image specs reject invalid image uploads with `invalid_attachment_image`. If `.upscale(false)` is set on a fixed resize and the uploaded image is too small, Foundry returns `attachment_image_too_small`.
 
 Foundry also applies storage-level image decode safety limits from `[storage]` before attachment image transforms run. The defaults are intentionally generous; apps can lower them for stricter upload policies without changing `HasAttachments` or model code.
+
+Attachment image `quality` is JPEG-only. WebP attachment output is lossless and
+must not set a quality value.
+
+Every attachment insert takes a PostgreSQL advisory transaction lock scoped to
+the model type, model ID, and collection. Multi-file collections append with
+monotonic `sort_order` values. A `.single()` spec or `replace_attachment`
+inserts the replacement and removes the previous rows in the same transaction,
+so concurrent uploads cannot leave multiple live records. The file upload is
+prepared before the short database lock; superseded files are removed after
+commit and any leftover object is handled by orphan maintenance.
+
+`after_store` hooks run after the new row is inserted but before the collection
+transaction commits. Use `ctx.attachment` as the authoritative new value. If a
+hook fails, Foundry rolls back the row/replacement and removes the prepared
+file. Work that must observe the committed row from another connection should
+be dispatched after the surrounding operation returns.
 
 ### Querying Attachments
 
@@ -203,7 +218,15 @@ let images = product.attachments(&app, "images").await?;
 for img in &images {
     println!("{} — {} ({})", img.name, img.human_size(), img.mime_type.as_deref().unwrap_or("unknown"));
 }
+
+// Reorder a multi-file collection with an exact permutation of current IDs.
+let ordered = images.iter().rev().map(|image| image.id.clone()).collect::<Vec<_>>();
+let images = product.reorder_attachments(&app, "images", &ordered).await?;
 ```
+
+Reordering locks the collection, validates that every current ID occurs exactly
+once, and rewrites positions atomically. Missing, foreign, or duplicate IDs
+leave the existing order unchanged.
 
 ### Localized Attachments
 
@@ -316,7 +339,7 @@ product.detach_keep_file(&app, &attachment.id).await?;
 product.detach_all(&app, "images").await?;
 ```
 
-Foundry worker maintenance audits old objects under `storage.attachment_orphan_prefix` and compares them with `attachments.disk/path`. Candidates are logged by default; deletion requires `storage.attachment_orphan_delete_enabled = true` so shared buckets are not cleaned accidentally. Operators can run the same audit with `cargo run -- attachment:orphans`.
+Foundry worker maintenance audits old objects under `storage.attachment_orphan_prefix` and compares them with `attachments.disk/path`. It walks lexicographic pages until the prefix is exhausted; `attachment_orphan_prune_batch_size` and CLI `--limit` are page sizes, not a cap that repeatedly starves later objects. Candidates are logged by default; deletion requires `storage.attachment_orphan_delete_enabled = true` so shared buckets are not cleaned accidentally. Operators can run the same audit with `cargo run -- attachment:orphans`.
 
 ### Collections
 
@@ -375,7 +398,60 @@ let all: Vec<ModelMeta> = user.all_meta(&app).await?;
 for meta in &all {
     println!("{}: {:?}", meta.key, meta.value);
 }
+
+// Delete every metadata row owned by this model
+user.delete_all_meta(&app).await?;
 ```
+
+### Eager and lazy batch loading
+
+Use `with_meta` when a list needs one key, or `with_metadata` when it needs the
+complete key-value set:
+
+```rust
+let users = User::query()
+    .with_meta("theme")
+    .get(&app)
+    .await?;
+
+for user in &users {
+    let theme: Option<String> = user.get_meta(&app, "theme").await?;
+}
+
+let users = User::query()
+    .with_metadata()
+    .get(&app)
+    .await?;
+```
+
+Both forms batch the metadata query for the hydrated model collection. The
+same methods are available on `RelationDef` and `ManyToManyDef` for nested
+eager loading. HTTP requests get a model-extension cache scope automatically;
+CLI, worker, scheduler, and test code can wrap a unit of work with
+`app.with_model_batching(...)`. Inside that scope, a lazy keyed read batches
+all known sibling IDs, and a complete metadata preload also satisfies later
+keyed reads without another query. Writes invalidate the affected owner's
+cached shapes.
+
+### Orphan maintenance
+
+Polymorphic metadata cannot use a foreign key to every possible owner table.
+Declare each owner explicitly, then audit or prune only that owner type:
+
+```rust
+let owner = MetadataOwner::for_model::<User>()?;
+let orphan_count = audit_metadata_orphans(app.database()?.as_ref(), &owner).await?;
+
+// Run deliberately from an operator command or scheduled maintenance task.
+let deleted = prune_metadata_orphans(app.database()?.as_ref(), &owner).await?;
+```
+
+`MetadataOwner::for_model` requires a UUID primary key, matching the published
+`metadata.metadatable_id` schema. `MetadataOwner::new(type, table, primary_key)`
+is available for manual model implementations and validates table/column names
+before composing PostgreSQL SQL. Foundry never guesses owner tables or prunes
+them globally; applications should register their own explicit maintenance
+schedule.
 
 ### Use Cases
 
@@ -401,6 +477,11 @@ impl HasTranslations for Product {
     fn translatable_id(&self) -> String { self.id.to_string() }
 }
 ```
+
+`translatable_id` is stored as text, so generated UUID IDs and declared manual
+integer/text model keys are all supported. Return the canonical string form of
+the model's primary key. Typed translation joins cast the owner key to text at
+the polymorphic boundary.
 
 ### Setting Translations
 
@@ -478,13 +559,13 @@ product.delete_translations(&app, "zh").await?;
 `translated_field()` resolves the "current" locale in this order:
 1. Task-local `CURRENT_LOCALE` (set by request middleware)
 2. i18n default locale from config
-3. First available locale in the translations
+3. Lexicographically first available locale in the translations
 
 ---
 
 ## Countries — Reference Data
 
-250 built-in countries with currencies, timezones, calling codes, and more.
+250 built-in countries with currencies, IANA timezones, calling codes, and more.
 
 ### Seeding
 
@@ -507,6 +588,12 @@ Or programmatically:
 ```rust
 let count = seed_countries(&app).await?;  // 250 upserted
 ```
+
+Timezone arrays are derived from the bundled IANA tzdb 2026a country-selection
+table. Kosovo's user-assigned `XK` code explicitly follows IANA's
+`Europe/Belgrade` rules. The uninhabited Bouvet Island (`BV`) and Heard Island
+and McDonald Islands (`HM`) have no IANA zone entry and intentionally retain an
+empty array.
 
 ### Querying
 
@@ -550,7 +637,7 @@ if Country::exists(&app, "US").await? {
 | `primary_currency_code` | Option | `"MYR"` |
 | `currencies` | JSON array | `[{"code":"MYR","name":"Malaysian ringgit","symbol":"RM"}]` |
 | `calling_code` | Option | `"+60"` |
-| `timezones` | JSON array | `["Asia/Kuala_Lumpur"]` |
+| `timezones` | JSON array | `["Asia/Kuala_Lumpur", "Asia/Kuching"]` |
 | `latitude` / `longitude` | Option\<f64\> | `2.5` / `112.5` |
 | `flag_emoji` | Option | `"🇲🇾"` |
 | `status` | `CountryStatus` | `CountryStatus::Enabled` or `CountryStatus::Disabled` |
@@ -697,6 +784,9 @@ Setting::upsert(&app, "app.name", json!("New Name")).await?;
 Setting::remove(&app, "app.name").await?;
 ```
 
+`Setting::set` returns an error when the key does not exist. Use `upsert` when
+creation is intentional.
+
 ### Admin Panel Queries
 
 ```rust
@@ -833,6 +923,7 @@ Run `cargo run -- migrate:publish` to get the framework migration files:
 000000000007_create_model_translations.rs
 000000000008_create_countries.rs
 000000000009_create_settings.rs
+000000000013_alter_model_translation_ids_to_text.rs
 ```
 
 Run `cargo run -- seed:publish` if you also want the framework countries seeder in your app:

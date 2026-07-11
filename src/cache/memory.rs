@@ -16,6 +16,7 @@ struct CacheEntry {
 
 pub struct MemoryCacheStore {
     entries: Arc<Mutex<HashMap<String, CacheEntry>>>,
+    control_values: Arc<Mutex<HashMap<String, String>>>,
     max_entries: usize,
 }
 
@@ -23,6 +24,7 @@ impl MemoryCacheStore {
     pub fn new(max_entries: usize) -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
+            control_values: Arc::new(Mutex::new(HashMap::new())),
             max_entries,
         }
     }
@@ -72,8 +74,20 @@ impl CacheStore for MemoryCacheStore {
     }
 
     async fn flush(&self) -> Result<()> {
-        let mut store = self.entries.lock().await;
-        store.clear();
+        self.entries.lock().await.clear();
+        self.control_values.lock().await.clear();
+        Ok(())
+    }
+
+    async fn get_control_raw(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.control_values.lock().await.get(key).cloned())
+    }
+
+    async fn put_control_raw(&self, key: &str, value: &str) -> Result<()> {
+        self.control_values
+            .lock()
+            .await
+            .insert(key.to_string(), value.to_string());
         Ok(())
     }
 }
@@ -143,6 +157,16 @@ mod tests {
         store.flush().await.unwrap();
         assert!(store.get_raw("a").await.unwrap().is_none());
         assert!(store.get_raw("b").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn flush_clears_control_values_with_physical_entries() {
+        let store = MemoryCacheStore::new(100);
+        store.put_control_raw("tag:users", "version").await.unwrap();
+
+        store.flush().await.unwrap();
+
+        assert_eq!(store.get_control_raw("tag:users").await.unwrap(), None);
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 # typescript
 
+TypeScript contracts, route helpers, validation metadata, and SDK export
+
 [Back to index](../index.md)
 
 ## foundry::typescript

@@ -26,6 +26,7 @@ Modifiers change how the validation loop behaves. They are NOT rule steps — th
 | Modifier | Effect |
 |----------|--------|
 | `.nullable()` | Skip all rules if the value is empty or whitespace |
+| `.sometimes()` | Skip all rules only when the request field is absent |
 | `.bail()` | Stop processing rules for this field after the first error |
 | `.with_message(msg)` | Override the error message for the last added rule |
 
@@ -80,6 +81,17 @@ validator
 | Rule | Code | Description |
 |------|------|-------------|
 | `.required()` | `required` | Value must not be empty or whitespace |
+| `.required_if(other, value, expected)` | `required_if` | Required when the other field equals any expected value |
+| `.required_unless(other, value, expected)` | `required_unless` | Required unless the other field equals an expected value |
+| `.required_with(fields)` | `required_with` | Required when any referenced field is non-empty |
+| `.present()` | `present` | Raw JSON key or multipart part must exist; explicit null/empty is present |
+| `.prohibited()` | `prohibited` | Field may be missing/empty but must not carry a non-empty value |
+
+`sometimes` differs from `nullable`: absence skips the chain, while a present
+empty/null value still validates unless `.nullable()` is also applied. Built-in
+JSON and generated multipart extractors preserve raw field presence. For manual
+validation, use `validator.optional_field(name, option)` or
+`field_with_presence(name, value, present)` when missing and empty must differ.
 
 ### String Rules
 
@@ -102,6 +114,7 @@ validator
 | `.min_numeric(n)` | `min_numeric` | Parsed number must be at least `n` |
 | `.max_numeric(n)` | `max_numeric` | Parsed number must be at most `n` |
 | `.between(min, max)` | `between` | Parsed number must be between `min` and `max` (inclusive) |
+| `.boolean()` | `boolean` | Accept typed/lexical `true`, `false`, `1`, or `0` |
 
 ### Format Rules
 
@@ -204,6 +217,13 @@ validator
 
 Errors are reported with indexed field names (e.g. `tags.0`, `tags.1`).
 
+Add `.distinct()` to reject exact, case-sensitive duplicate collection values
+with one collection-level `distinct` error:
+
+```rust
+validator.each("tags", &input.tags).distinct().apply().await?;
+```
+
 ---
 
 ## Validator Methods
@@ -217,6 +237,8 @@ The `Validator` struct provides these methods for controlling validation behavio
 | `.custom_message(field, code, message)` | Override error message for a specific field + rule |
 | `.custom_attribute(field, name)` | Override display name for a field in error messages |
 | `.add_error(field, code, params)` | Manually add a validation error |
+| `.optional_field(name, Option<T>)` | Create a field validator with explicit absent/present state |
+| `.field_with_presence(name, value, present)` | Supply raw presence separately from a value |
 | `.finish()` | Return `Ok(())` or `Err(ValidationErrors)` |
 
 ---
@@ -274,12 +296,12 @@ Custom rule error messages go through the same i18n pipeline as built-in rules. 
 ```json
 // locales/en/validation.json
 {
-    "mobile": "The :attribute field must be a valid mobile number."
+    "mobile": "The {{attribute}} field must be a valid mobile number."
 }
 
 // locales/zh/validation.json
 {
-    "mobile": ":attribute 必须是有效的手机号码。"
+    "mobile": "{{attribute}} 必须是有效的手机号码。"
 }
 ```
 
@@ -342,14 +364,31 @@ pub struct CreateUser {
 
     #[validate(required, app_enum)]
     pub status: UserStatus,   // AppEnum validated + OpenAPI schema auto-resolved
+
+    #[validate(required_if("status", "published", "scheduled"))]
+    pub published_at: Option<DateTime>,
+
+    #[validate(sometimes, boolean)]
+    pub notify: Option<bool>,
+
+    #[validate(distinct, each(min_length(2)))]
+    pub tags: Vec<String>,
 }
 ```
+
+Serde names are the wire-name SSOT. `#[serde(rename = "...")]` and
+`#[serde(rename_all = "...")]` apply consistently to JSON, multipart fields,
+validation error keys, OpenAPI properties, and generated validation metadata.
+Keep field references inside `#[validate(...)]` in Rust form; the derive maps
+them to the corresponding wire name. Different serialize and deserialize names
+are rejected because one DTO exposes one Foundry wire contract.
 
 `#[derive(ApiSchema)]` reads `#[validate(...)]` attributes and converts them to JSON Schema constraints:
 
 | Validate attribute | OpenAPI Schema |
 |-------------------|----------------|
 | `required` | Added to `"required"` array |
+| `present` | Added to `"required"` array |
 | `email` | `"format": "email"` |
 | `url` | `"format": "uri"` |
 | `uuid` | `"format": "uuid"` |
@@ -358,6 +397,7 @@ pub struct CreateUser {
 | `min_numeric(N)` | `"minimum": N` |
 | `max_numeric(N)` | `"maximum": N` |
 | `app_enum` on `AppEnum` field | Enum values auto-resolved from `AppEnum::schema()` |
+| `distinct` on a collection | `"uniqueItems": true` |
 
 `Option<T>` fields are nullable by default unless their rules include `required`. For example,
 `Option<String>` with `#[validate(email)]` accepts `None`, while
@@ -369,6 +409,26 @@ rules run, so numeric rules can be applied directly to fields such as `i32` and 
 `each(...)` likewise supports typed `Vec<T>` and `Option<Vec<T>>` values. Collection-level rules are
 still evaluated alongside `each(...)`; in particular, `#[validate(required, each(...))]` rejects an
 empty vector instead of silently skipping `required`.
+
+Conditional derive arguments reference Rust field names; generated validation
+errors and TypeScript metadata use their serde wire names. Supported forms are:
+
+```rust
+#[validate(required_if("status", "published", "scheduled"))]
+#[validate(required_unless("status", "draft"))]
+#[validate(required_with("email", "phone"))]
+#[validate(present)]
+#[validate(sometimes, email)]
+#[validate(prohibited)]
+#[validate(boolean)]
+#[validate(distinct)] // Vec<T> or Option<Vec<T>>
+```
+
+Conditional comparisons accept scalar fields. `required_with` also understands
+file and collection emptiness. Collection/file use in scalar `required_if` or
+`required_unless`, and scalar use of `distinct`, fail at derive time. Conditional
+rules remain in Foundry validation metadata because ordinary per-property
+OpenAPI constraints cannot represent their cross-field semantics faithfully.
 
 ### Manual (full control)
 
@@ -500,15 +560,15 @@ r.route_with_options("/users", post(create_user),
 
 | Category | Count |
 |----------|-------|
-| Presence | 1 |
+| Presence / conditional | 6 |
 | String | 7 |
-| Numeric | 5 |
+| Numeric / boolean | 6 |
 | Format | 10 |
 | IP | 3 |
-| List | 2 |
+| List / collection | 3 |
 | Comparison | 7 |
 | Enum | 1 |
 | Database (async) | 2 |
-| Modifiers | 3 |
+| Modifiers | 4 |
 | Custom (user-defined) | unlimited |
-| **Total built-in** | **38** |
+| **Total built-in** | **45** |

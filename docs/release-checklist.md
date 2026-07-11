@@ -16,10 +16,18 @@ Use this checklist for `0.1.x` release preparation.
 
 ## Verification
 
-1. Run `make verify-release`.
-2. Confirm both fixture suites still pass:
+1. Point `FOUNDRY_TEST_POSTGRES_URL` at a disposable PostgreSQL 16 database;
+   the CI/release workflows use the same variable and must not silently skip
+   database-backed test bodies.
+2. Run `make verify-release` with that variable exported. Use
+   `make test-postgres` directly when validating the database test matrix.
+3. Confirm both fixture suites still pass:
    - `tests/fixtures/blueprint_app`
    - `tests/fixtures/plugin_consumer_app`
+4. Run `make build-metrics` and compare the clean build time, Foundry rlib size,
+   target size, and dependency count with the previous release artifact. Treat
+   regressions as investigation signals; introduce feature gates only when the
+   measurements and a concrete consumer need justify the added API complexity.
 
 ## Tagging
 

@@ -11,9 +11,23 @@ enum ImageFormat { Jpeg, Png, WebP, Gif, Bmp, Tiff, Avif, Ico }
   fn from_extension(ext: &str) -> Option<Self>
   fn extension(&self) -> &'static str
 enum Rotation { Deg90, Deg180, Deg270 }
+struct ImageDecodeLimits
+  const DEFAULT_MAX_INPUT_BYTES: u64
+  const DEFAULT_MAX_PIXELS: u64 = 50_000_000
+  const DEFAULT_MAX_WIDTH: u64 = 12_000
+  const DEFAULT_MAX_HEIGHT: u64 = 12_000
+  const fn unbounded() -> Self
 struct ImageProcessor
   fn open<P: AsRef<Path>>(path: P) -> Result<Self>
+  fn open_with_limits<P: AsRef<Path>>( path: P, limits: ImageDecodeLimits, ) -> Result<Self>
+  fn open_unbounded<P: AsRef<Path>>(path: P) -> Result<Self>
   fn from_bytes(bytes: &[u8]) -> Result<Self>
+  fn from_bytes_with_limits( bytes: &[u8], limits: ImageDecodeLimits, ) -> Result<Self>
+  fn from_bytes_unbounded(bytes: &[u8]) -> Result<Self>
+  async fn process_file<P, T, F>(path: P, process: F) -> Result<T>
+  async fn process_file_with_limits<P, T, F>( path: P, limits: ImageDecodeLimits, process: F, ) -> Result<T>
+  async fn process_bytes<T, F>(bytes: Vec<u8>, process: F) -> Result<T>
+  async fn process_bytes_with_limits<T, F>( bytes: Vec<u8>, limits: ImageDecodeLimits, process: F, ) -> Result<T>
   fn width(&self) -> u32
   fn height(&self) -> u32
   fn format(&self) -> Option<ImageFormat>

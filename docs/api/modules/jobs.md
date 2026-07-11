@@ -25,7 +25,13 @@ struct JobContext
 struct JobDeadLetterContext
 struct JobDispatcher
   async fn dispatch<J>(&self, job: J) -> Result<()>
+  async fn dispatch_on<J, Q>(&self, job: J, queue: Q) -> Result<()>
+  async fn dispatch_at<J>(&self, job: J, run_at: DateTime) -> Result<()>
+  async fn dispatch_at_on<J, Q>( &self, job: J, run_at: DateTime, queue: Q, ) -> Result<()>
+  async fn dispatch_after<J>(&self, job: J, delay: Duration) -> Result<()>
+  async fn dispatch_after_on<J, Q>( &self, job: J, delay: Duration, queue: Q, ) -> Result<()>
   async fn dispatch_later<J>(&self, job: J, run_at_millis: i64) -> Result<()>
+  async fn dispatch_later_on<J, Q>( &self, job: J, run_at_millis: i64, queue: Q, ) -> Result<()>
   fn batch(&self, name: &str) -> JobBatchBuilder
   fn chain(&self) -> JobChainBuilder
 struct JobMiddlewareRegistry

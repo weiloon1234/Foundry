@@ -164,7 +164,7 @@ fn main() {
     writeln!(index).unwrap();
     writeln!(
         index,
-        "For import stability and compatibility expectations, see [Public API Contract](public-api-contract.md)."
+        "For import stability and compatibility expectations, see [Public API Contract](../public-api-contract.md)."
     )
     .unwrap();
     writeln!(index).unwrap();

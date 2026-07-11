@@ -1,7 +1,28 @@
-use foundry_fixture_plugin_base::{BASE_COMMAND, BASE_PLUGIN_ID};
+use foundry::prelude::PluginTestHarness;
+use foundry_fixture_plugin_base::{
+    FixtureBasePlugin, FixtureBaseService, BASE_COMMAND, BASE_PLUGIN_ID,
+};
 use foundry_fixture_plugin_dep::{FixtureDependentService, DEPENDENT_PLUGIN_ID};
 use foundry_plugin_fixture::app::providers::AppReady;
 use foundry_plugin_fixture::bootstrap;
+
+#[tokio::test]
+async fn plugin_author_template_tests_one_plugin_in_isolation() {
+    let app = PluginTestHarness::new(BASE_PLUGIN_ID, FixtureBasePlugin)
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(app.manifest().id(), &BASE_PLUGIN_ID);
+    assert_eq!(app.contributions().provider_count, 1);
+    assert_eq!(app.contributions().command_count, 1);
+    assert_eq!(
+        app.resolve::<FixtureBaseService>().unwrap().0,
+        "base-plugin"
+    );
+
+    app.shutdown().await.unwrap();
+}
 
 #[tokio::test]
 async fn consumer_app_builds_with_compile_time_plugins() {

@@ -4,7 +4,7 @@ use syn::{Data, DeriveInput, Fields, Type};
 
 use crate::common::{
     option_inner_type, type_argument_if_last_segment_ident, type_path_last_segment_matches,
-    vec_inner_type,
+    vec_inner_type, WireNameResolver,
 };
 
 pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
@@ -13,7 +13,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
 
     match &input.data {
         Data::Struct(data) => expand_struct(name, &name_str, &data.fields, &input.attrs),
-        Data::Enum(data) => expand_enum(name, &name_str, data),
+        Data::Enum(data) => expand_enum(name, &name_str, data, &input.attrs),
         Data::Union(_) => Err(syn::Error::new_spanned(
             &input,
             "ApiSchema cannot be derived for unions",
@@ -25,7 +25,7 @@ fn expand_struct(
     name: &syn::Ident,
     name_str: &str,
     fields: &Fields,
-    _attrs: &[syn::Attribute],
+    attrs: &[syn::Attribute],
 ) -> syn::Result<TokenStream> {
     let named = match fields {
         Fields::Named(named) => named,
@@ -39,13 +39,14 @@ fn expand_struct(
 
     let mut property_inserts = Vec::new();
     let mut required_fields = Vec::new();
+    let wire_names = WireNameResolver::from_serde_attrs(attrs)?;
 
     for field in &named.named {
-        let field_ident = field
+        field
             .ident
             .as_ref()
             .ok_or_else(|| syn::Error::new_spanned(field, "expected named field"))?;
-        let field_name = field_ident.to_string();
+        let field_name = wire_names.field_name(field)?;
         let field_ty = &field.ty;
 
         // Check if field is Option
@@ -132,6 +133,7 @@ fn expand_enum(
     name: &syn::Ident,
     name_str: &str,
     data: &syn::DataEnum,
+    attrs: &[syn::Attribute],
 ) -> syn::Result<TokenStream> {
     // Check if all variants are unit (no fields)
     let is_simple = data
@@ -146,7 +148,12 @@ fn expand_enum(
         ));
     }
 
-    let variant_names: Vec<String> = data.variants.iter().map(|v| v.ident.to_string()).collect();
+    let wire_names = WireNameResolver::from_serde_attrs(attrs)?;
+    let variant_names = data
+        .variants
+        .iter()
+        .map(|variant| wire_names.variant_name(variant))
+        .collect::<syn::Result<Vec<_>>>()?;
 
     Ok(quote! {
         impl ::foundry::openapi::ApiSchema for #name {
@@ -244,6 +251,7 @@ fn type_to_schema_expr(ty: &Type) -> TokenStream {
 #[derive(Debug)]
 enum ValidateConstraint {
     Required,
+    Distinct,
     Email,
     Url,
     UuidFormat,
@@ -257,6 +265,9 @@ impl ValidateConstraint {
     fn to_schema_insert(&self) -> Option<TokenStream> {
         match self {
             Self::Required => None, // handled separately via required array
+            Self::Distinct => Some(quote! {
+                obj.insert("uniqueItems".into(), ::serde_json::json!(true));
+            }),
             Self::Email => Some(quote! {
                 obj.insert("format".into(), ::serde_json::json!("email"));
             }),
@@ -292,7 +303,22 @@ fn parse_validate_constraints(attrs: &[syn::Attribute]) -> syn::Result<Vec<Valid
                 let name = ident.to_string();
 
                 match name.as_str() {
-                    "required" => constraints.push(ValidateConstraint::Required),
+                    "required" | "present" => {
+                        constraints.push(ValidateConstraint::Required);
+                        if input.peek(syn::token::Paren) {
+                            let content;
+                            syn::parenthesized!(content in input);
+                            let _ = content.parse::<TokenStream>();
+                        }
+                    }
+                    "distinct" => {
+                        constraints.push(ValidateConstraint::Distinct);
+                        if input.peek(syn::token::Paren) {
+                            let content;
+                            syn::parenthesized!(content in input);
+                            let _ = content.parse::<TokenStream>();
+                        }
+                    }
                     "email" => constraints.push(ValidateConstraint::Email),
                     "url" => constraints.push(ValidateConstraint::Url),
                     "uuid" => constraints.push(ValidateConstraint::UuidFormat),

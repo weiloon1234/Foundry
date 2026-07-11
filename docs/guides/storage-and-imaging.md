@@ -49,8 +49,9 @@ visibility = "private"              # "public" or "private"
 driver = "s3"
 bucket = "my-bucket"
 region = "ap-southeast-1"
-key = "AKIA..."
-secret = "..."
+# key = "AKIA..."                    # optional; omit both for AWS provider chain
+# secret = "..."                     # required together with key
+# session_token = "..."              # optional temporary-credential token
 # endpoint = "https://..."         # custom endpoint for MinIO, R2, etc.
 # url = "https://cdn.example.com"  # public URL prefix
 # use_path_style = false
@@ -58,6 +59,12 @@ visibility = "public"
 ```
 
 For S3 disks, `visibility` describes the disk's application-level access intent; Foundry does not translate it into an `x-amz-acl` object ACL. New AWS buckets disable ACLs by default, and S3-compatible providers such as Cloudflare R2 do not support that header. Configure public access with the bucket policy, public bucket/custom-domain settings, or CDN represented by `url`. This keeps uploads compatible with [AWS bucket-owner-enforced object ownership](https://docs.aws.amazon.com/AmazonS3/latest/userguide/about-object-ownership.html) and [Cloudflare R2's S3 API](https://developers.cloudflare.com/r2/api/s3/api/). When `put_file` supplies a content type, the S3 adapter stores it as the object's `Content-Type` metadata.
+
+When `key` and `secret` are both omitted, S3 uses the AWS credential provider
+chain (environment, workload/container, and instance identity). Configure both
+for explicit credentials; `session_token` is accepted only with that pair.
+Explicit endpoint and credential settings take precedence, preserving MinIO,
+R2, and other S3-compatible deployments.
 
 Upload caps are storage-level guardrails for `UploadedFile`, `MultipartForm`, and derive-generated multipart DTOs. Route-level validators and file rules still own product-specific limits such as avatar size, gallery count, and allowed MIME types.
 
@@ -164,6 +171,12 @@ pub struct StoredFile {
 }
 ```
 
+`url` is populated only when the write is public and the adapter has a stable
+URL source (for example, a local `url` prefix or configured public S3/CDN
+prefix). Private writes always return `None`, and calling `StorageDisk::url()`
+on a private disk returns an error instead of manufacturing a public address.
+Use `temporary_url()` for private S3 delivery.
+
 ---
 
 ## Storage Manager
@@ -172,12 +185,24 @@ For direct file operations (not from uploads):
 
 ```rust
 let storage = app.storage()?;
+use futures_util::StreamExt as _;
 
 // Write bytes
 storage.put("data/report.json", serde_json::to_vec(&report)?).await?;
 
 // Read bytes
 let bytes = storage.get("data/report.json").await?;
+
+// Stream large input/output without whole-object buffering.
+let source = tokio::fs::File::open("large-report.csv").await?;
+storage
+    .put_stream("data/large-report.csv", source, Some("text/csv"))
+    .await?;
+
+let mut chunks = storage.get_stream("data/large-report.csv").await?;
+while let Some(chunk) = chunks.next().await {
+    consume(chunk?).await?;
+}
 
 // Check existence
 if storage.exists("data/report.json").await? {
@@ -192,7 +217,7 @@ storage.copy("data/report.json", "backups/report.json").await?;
 storage.move_to("temp/upload.csv", "data/import.csv").await?;
 
 // Get URL
-let url = storage.url("avatars/profile.jpg")?;
+let url = storage.url("avatars/profile.jpg").await?;
 
 // Temporary URL (signed, for private S3 files)
 let url = storage.temporary_url("documents/contract.pdf", DateTime::now().add_days(1)).await?;
@@ -208,7 +233,20 @@ cargo run -- attachment:orphans --json --disk s3 --limit 100
 cargo run -- attachment:orphans --delete
 ```
 
-`--delete` requires `storage.attachment_orphan_delete_enabled = true`. Custom storage drivers compile without listing support; they can opt in by implementing `StorageAdapter::list_prefix`.
+`--limit` controls the storage page size; Foundry continues from each exclusive
+path cursor until the prefix is exhausted, preventing later objects from
+starving on recurring runs. `--delete` requires
+`storage.attachment_orphan_delete_enabled = true`. Custom storage drivers
+compile without listing support. For complete orphan scans they must implement
+both `StorageAdapter::list_prefix` and cursor-aware `list_prefix_after`; the
+default serves only the first page and reports pagination as unsupported when
+a continuation is required.
+
+`StorageAdapter::put_stream` and `get_stream` have buffered compatibility
+defaults, so existing custom drivers remain source-compatible. Override them
+to provide genuinely bounded native I/O. Local storage performs atomic
+streaming writes and bounded reads; S3 uses multipart upload with abort on
+failure and streams provider response chunks.
 
 ### Working with Specific Disks
 
@@ -221,7 +259,7 @@ let local = storage.default_disk()?;
 // Named disk
 let s3 = storage.disk("s3")?;
 s3.put("exports/data.csv", csv_bytes).await?;
-let url = s3.url("exports/data.csv")?;
+let url = s3.url("exports/data.csv").await?;
 
 // List configured disks
 let disks = storage.configured_disks();  // ["local", "s3"]
@@ -238,7 +276,7 @@ Chainable pipeline for transforming images. Works with files from disk or raw by
 ### Opening Images
 
 ```rust
-use foundry::imaging::{ImageProcessor, ImageFormat, Rotation};
+use foundry::imaging::{ImageDecodeLimits, ImageFormat, ImageProcessor, Rotation};
 
 // From file path
 let img = ImageProcessor::open("uploads/photo.jpg")?;
@@ -247,8 +285,35 @@ let img = ImageProcessor::open("uploads/photo.jpg")?;
 let bytes = app.storage()?.get("avatars/profile.jpg").await?;
 let img = ImageProcessor::from_bytes(&bytes)?;
 
+// Customize limits for a particular untrusted-input boundary.
+let img = ImageProcessor::from_bytes_with_limits(
+    &bytes,
+    ImageDecodeLimits {
+        max_input_bytes: 10 * 1024 * 1024,
+        max_pixels: 20_000_000,
+        ..ImageDecodeLimits::default()
+    },
+)?;
+
 // Check dimensions
 println!("{}x{}", img.width(), img.height());
+```
+
+`open` and `from_bytes` are bounded by default (50 MiB input, 50 million
+pixels, and 12,000 pixels per dimension). A zero field disables that individual
+custom limit. `open_unbounded` and `from_bytes_unbounded` are explicit escape
+hatches for trusted inputs only.
+
+Image decode and transformation are CPU/blocking work. In async handlers and
+jobs, run the full pipeline on Foundry's blocking pool:
+
+```rust
+let jpeg = ImageProcessor::process_bytes(bytes, |image| {
+    image
+        .resize_to_fit(1_600, 1_600)
+        .quality(85)
+        .to_bytes(ImageFormat::Jpeg)
+}).await?;
 ```
 
 ### Transformations
@@ -268,9 +333,13 @@ let result = ImageProcessor::open("photo.jpg")?
     .blur(2.0)                     // Gaussian blur (sigma)
     .brightness(20)                // adjust brightness (-255 to +255)
     .contrast(1.5)                 // adjust contrast
-    .quality(85)                   // JPEG/WebP quality (1-100)
+    .quality(85)                   // JPEG quality (1-100)
     .to_bytes(ImageFormat::Jpeg)?; // output as bytes
 ```
+
+`quality` applies only to JPEG. WebP output uses the image library's lossless
+encoder; setting `quality` and then requesting WebP (or another non-JPEG
+format) is an error rather than a silently ignored setting.
 
 ### Saving
 
@@ -309,16 +378,16 @@ Common pattern: receive upload, process image, store result:
 async fn upload_avatar(
     State(app): State<AppContext>,
     Auth(user): Auth<User>,
-    mut multipart: Multipart,
+    form: MultipartForm,
 ) -> Result<impl IntoResponse> {
-    let form = MultipartForm::from_multipart(&mut multipart).await?;
     let file = form.file("avatar")?;
 
-    // Process: resize to 256x256, optimize quality
-    let processed = ImageProcessor::open(&file.temp_path)?
-        .resize_to_fill(256, 256)
-        .quality(80)
-        .to_bytes(ImageFormat::WebP)?;
+    // Decode and transform off the async runtime. WebP output is lossless.
+    let processed = ImageProcessor::process_file(file.temp_path.clone(), |image| {
+        image
+            .resize_to_fill(256, 256)
+            .to_bytes(ImageFormat::WebP)
+    }).await?;
 
     // Store processed image
     let storage = app.storage()?;
@@ -334,7 +403,6 @@ async fn upload_avatar(
 ```rust
 async fn upload_photo(app: &AppContext, file: &UploadedFile) -> Result<PhotoUrls> {
     let storage = app.storage()?;
-    let img = ImageProcessor::open(&file.temp_path)?;
     let name = file.generate_storage_name();
     let stem = name.trim_end_matches(&format!(".{}", file.original_extension().unwrap_or_default()));
 
@@ -342,23 +410,25 @@ async fn upload_photo(app: &AppContext, file: &UploadedFile) -> Result<PhotoUrls
     let original = file.store(app, "photos").await?;
 
     // Thumbnail (150x150)
-    let thumb_bytes = ImageProcessor::open(&file.temp_path)?
-        .resize_to_fill(150, 150)
-        .quality(75)
-        .to_bytes(ImageFormat::WebP)?;
+    let thumb_bytes = ImageProcessor::process_file(file.temp_path.clone(), |image| {
+        image
+            .resize_to_fill(150, 150)
+            .to_bytes(ImageFormat::WebP)
+    }).await?;
     storage.put(&format!("photos/thumbs/{stem}.webp"), thumb_bytes).await?;
 
     // Medium (800px wide)
-    let medium_bytes = ImageProcessor::open(&file.temp_path)?
-        .resize_to_fit(800, 800)
-        .quality(85)
-        .to_bytes(ImageFormat::WebP)?;
+    let medium_bytes = ImageProcessor::process_file(file.temp_path.clone(), |image| {
+        image
+            .resize_to_fit(800, 800)
+            .to_bytes(ImageFormat::WebP)
+    }).await?;
     storage.put(&format!("photos/medium/{stem}.webp"), medium_bytes).await?;
 
     Ok(PhotoUrls {
         original: original.url.unwrap_or_default(),
-        thumb: storage.url(&format!("photos/thumbs/{stem}.webp"))?,
-        medium: storage.url(&format!("photos/medium/{stem}.webp"))?,
+        thumb: storage.url(&format!("photos/thumbs/{stem}.webp")).await?,
+        medium: storage.url(&format!("photos/medium/{stem}.webp")).await?,
     })
 }
 ```

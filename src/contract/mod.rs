@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::foundation::{Error, Result};
 use crate::http::RouteManifestEntry;
 
-pub const CONTRACT_MANIFEST_VERSION: u32 = 1;
+pub const CONTRACT_MANIFEST_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ContractManifest {
@@ -31,14 +31,33 @@ impl ContractManifest {
 
     pub fn from_http_routes(routes: &[RouteManifestEntry]) -> Result<Self> {
         let mut manifest = Self::new();
+        let mut action_names = BTreeMap::new();
         manifest.actions = routes
             .iter()
-            .map(ContractAction::from_http_route)
+            .map(|route| {
+                let action = ContractAction::from_http_route(route)?;
+                if let Some(existing) =
+                    action_names.insert(action.action_name.clone(), route.id.as_str())
+                {
+                    return Err(Error::message(format!(
+                        "contract routes `{existing}` and `{}` declare the same business action name `{}`",
+                        route.id, action.action_name
+                    )));
+                }
+                Ok(action)
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut schemas = BTreeMap::new();
         for route in routes {
             if let (Some(name), Some(schema)) = (route.request, &route.request_schema_json) {
                 insert_contract_schema(&mut schemas, name, schema.clone())?;
+            }
+            for parameter in &route.parameters {
+                insert_contract_schema(
+                    &mut schemas,
+                    parameter.schema,
+                    parameter.schema_json.clone(),
+                )?;
             }
             for response in &route.responses {
                 insert_contract_schema(
@@ -46,6 +65,13 @@ impl ContractManifest {
                     response.schema,
                     response.schema_json.clone(),
                 )?;
+            }
+            for error in &route.errors {
+                if let (Some(schema), Some(schema_json)) =
+                    (error.schema, error.schema_json.as_ref())
+                {
+                    insert_contract_schema(&mut schemas, schema, schema_json.clone())?;
+                }
             }
         }
         manifest.schemas = schemas
@@ -144,7 +170,9 @@ pub struct ContractAction {
     pub tags: Vec<String>,
     pub deprecated: bool,
     pub request: Option<ContractPayload>,
+    pub parameters: Vec<ContractParameter>,
     pub responses: Vec<ContractResponse>,
+    pub errors: Vec<ContractError>,
     pub auth: ContractAuth,
     pub client_export: bool,
     pub validation: Option<String>,
@@ -154,6 +182,17 @@ pub struct ContractAction {
 impl ContractAction {
     pub fn from_http_route(route: &RouteManifestEntry) -> Result<Self> {
         let id = route.id.as_str().to_string();
+        let explicit_action_name = route.action_name.as_deref().ok_or_else(|| {
+            Error::message(format!(
+                "contract route `{}` must declare an explicit business action name with `action_name(...)`; route IDs are transport metadata only",
+                route.id
+            ))
+        })?;
+        let action_name = if is_ts_identifier(explicit_action_name) {
+            explicit_action_name.to_string()
+        } else {
+            to_pascal_case_identifier(explicit_action_name, "contract action name")?
+        };
         let request = route.request.map(|schema| ContractPayload {
             schema: schema.to_string(),
         });
@@ -169,14 +208,24 @@ impl ContractAction {
         };
 
         Ok(Self {
-            id: id.clone(),
-            action_name: to_pascal_case_identifier(&id, "contract action name")?,
+            id,
+            action_name,
             summary: route.summary.clone(),
             description: None,
             tags: Vec::new(),
             deprecated: false,
             validation: request.as_ref().map(|payload| payload.schema.clone()),
             request,
+            parameters: route
+                .parameters
+                .iter()
+                .map(|parameter| ContractParameter {
+                    name: parameter.name.clone(),
+                    location: parameter.location,
+                    schema: parameter.schema.to_string(),
+                    required: parameter.required,
+                })
+                .collect(),
             responses: route
                 .responses
                 .iter()
@@ -184,6 +233,15 @@ impl ContractAction {
                     status: response.status,
                     schema: response.schema.to_string(),
                     schema_json: response.schema_json.clone(),
+                })
+                .collect(),
+            errors: route
+                .errors
+                .iter()
+                .map(|error| ContractError {
+                    code: error.code.clone(),
+                    status: error.status,
+                    schema: error.schema.map(ToOwned::to_owned),
                 })
                 .collect(),
             auth: ContractAuth {
@@ -198,8 +256,8 @@ impl ContractAction {
             transport: ContractTransport::Http(ContractHttpTransport {
                 method: route.method.clone(),
                 path: route.path.clone(),
-                path_params: route.params.clone(),
                 body,
+                content_type: route.request_content_type.clone(),
             }),
         })
     }
@@ -216,6 +274,23 @@ pub struct ContractResponse {
     pub schema: String,
     #[serde(skip)]
     pub(crate) schema_json: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractParameter {
+    pub name: String,
+    pub location: ContractParameterLocation,
+    pub schema: String,
+    pub required: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractParameterLocation {
+    Path,
+    Query,
+    Header,
+    Cookie,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,8 +336,8 @@ pub enum ContractTransport {
 pub struct ContractHttpTransport {
     pub method: Option<String>,
     pub path: String,
-    pub path_params: Vec<String>,
     pub body: ContractHttpBody,
+    pub content_type: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -370,6 +445,7 @@ pub struct ContractRealtimeChannel {
     pub replay_count: u32,
     pub allow_client_events: bool,
     pub auth: ContractAuth,
+    pub message_payload: Option<ContractPayload>,
     pub incoming: Vec<ContractRealtimeEvent>,
     pub outgoing: Vec<ContractRealtimeEvent>,
 }
@@ -398,6 +474,12 @@ impl From<&crate::websocket::WebSocketChannelDescriptor> for ContractRealtimeCha
                     .map(|permission| permission.as_str().to_string())
                     .collect(),
             },
+            message_payload: channel
+                .message_payload
+                .as_ref()
+                .map(|schema| ContractPayload {
+                    schema: schema.clone(),
+                }),
             incoming: channel
                 .incoming
                 .iter()
@@ -487,26 +569,37 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::http::{RouteManifestEntry, RouteManifestResponse};
+    use crate::http::{
+        RouteManifestEntry, RouteManifestError, RouteManifestParameter, RouteManifestResponse,
+    };
     use crate::support::RouteId;
 
     fn route(response_schema: Value) -> RouteManifestEntry {
         RouteManifestEntry {
             id: RouteId::new("users.show"),
+            action_name: Some("ShowUser".to_string()),
             path: "/users/:id".to_string(),
             method: Some("get".to_string()),
-            params: vec!["id".to_string()],
+            parameters: vec![RouteManifestParameter {
+                name: "id".to_string(),
+                location: ContractParameterLocation::Path,
+                schema: "String",
+                required: true,
+                schema_json: json!({"type": "string"}),
+            }],
             client_export: true,
             guard: None,
             permissions: Vec::new(),
             summary: None,
             request: Some("UserRequest"),
+            request_content_type: None,
             request_schema_json: Some(json!({"type": "object"})),
             responses: vec![RouteManifestResponse {
                 status: 200,
                 schema: "UserResponse",
                 schema_json: response_schema,
             }],
+            errors: Vec::new(),
         }
     }
 
@@ -535,8 +628,10 @@ mod tests {
     fn conflicting_route_schema_definitions_are_rejected() {
         let mut first = route(json!({"type": "string"}));
         first.id = RouteId::new("users.first");
+        first.action_name = Some("ShowFirstUser".to_string());
         let mut second = route(json!({"type": "integer"}));
         second.id = RouteId::new("users.second");
+        second.action_name = Some("ShowSecondUser".to_string());
 
         let error = ContractManifest::from_http_routes(&[first, second]).unwrap_err();
 
@@ -544,5 +639,86 @@ mod tests {
             error.to_string(),
             "contract contains duplicate schema name `UserResponse` with different definitions"
         );
+    }
+
+    #[test]
+    fn contract_requires_explicit_business_action_name() {
+        let mut route = route(json!({"type": "object"}));
+        route.action_name = None;
+
+        let error = ContractManifest::from_http_routes(&[route]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "contract route `users.show` must declare an explicit business action name with `action_name(...)`; route IDs are transport metadata only"
+        );
+    }
+
+    #[test]
+    fn contract_rejects_duplicate_business_action_names() {
+        let first = route(json!({"type": "object"}));
+        let mut second = route(json!({"type": "object"}));
+        second.id = RouteId::new("accounts.show");
+
+        let error = ContractManifest::from_http_routes(&[first, second]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "contract routes `users.show` and `accounts.show` declare the same business action name `ShowUser`"
+        );
+    }
+
+    #[test]
+    fn action_keeps_transport_id_separate_from_typed_parameters_and_errors() {
+        let mut route = route(json!({"type": "object"}));
+        route.action_name = Some("FindAccount".to_string());
+        route.request_content_type = Some("application/x-www-form-urlencoded".to_string());
+        route.parameters.push(RouteManifestParameter {
+            name: "include_history".to_string(),
+            location: ContractParameterLocation::Query,
+            schema: "bool",
+            required: false,
+            schema_json: json!({"type": "boolean"}),
+        });
+        route.errors.push(RouteManifestError {
+            code: "account_not_found".to_string(),
+            status: 404,
+            schema: Some("AccountNotFound"),
+            schema_json: Some(json!({
+                "type": "object",
+                "properties": {"message": {"type": "string"}}
+            })),
+        });
+
+        let manifest = ContractManifest::from_http_routes(&[route]).unwrap();
+        let action = &manifest.actions[0];
+
+        assert_eq!(manifest.version, 2);
+        assert_eq!(action.id, "users.show");
+        assert_eq!(action.action_name, "FindAccount");
+        assert!(matches!(
+            &action.transport,
+            ContractTransport::Http(http)
+                if http.content_type.as_deref()
+                    == Some("application/x-www-form-urlencoded")
+        ));
+        assert!(action.parameters.iter().any(|parameter| {
+            parameter.name == "include_history"
+                && parameter.location == ContractParameterLocation::Query
+                && parameter.schema == "bool"
+                && !parameter.required
+        }));
+        assert_eq!(
+            action.errors,
+            vec![ContractError {
+                code: "account_not_found".to_string(),
+                status: 404,
+                schema: Some("AccountNotFound".to_string()),
+            }]
+        );
+        assert!(manifest
+            .schemas
+            .iter()
+            .any(|schema| schema.name == "AccountNotFound"));
     }
 }

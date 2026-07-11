@@ -3,18 +3,20 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::contract::{
-    ContractAction, ContractAuth, ContractHttpBody, ContractHttpTransport, ContractManifest,
-    ContractPayload, ContractResponse, ContractSchema, ContractTransport,
+    ContractAction, ContractAuth, ContractError, ContractHttpBody, ContractHttpTransport,
+    ContractManifest, ContractParameter, ContractParameterLocation, ContractPayload,
+    ContractResponse, ContractSchema, ContractTransport,
 };
 use crate::http::route_path_params;
 use crate::http::routes::route_segment_param;
 
-use super::RouteDoc;
+use super::{ApiSchema, RouteDoc};
 
 pub struct DocumentedRoute {
     pub method: String,
     pub path: String,
     pub doc: RouteDoc,
+    pub auth: ContractAuth,
 }
 
 pub fn generate_openapi_spec(title: &str, version: &str, routes: &[DocumentedRoute]) -> Value {
@@ -28,6 +30,10 @@ pub fn generate_openapi_spec_from_contract(
     manifest: &ContractManifest,
 ) -> Value {
     let mut paths: BTreeMap<String, Value> = BTreeMap::new();
+    let has_guarded_actions = manifest
+        .actions
+        .iter()
+        .any(|action| action.auth.guard.is_some());
     let schemas = manifest
         .schemas
         .iter()
@@ -39,7 +45,9 @@ pub fn generate_openapi_spec_from_contract(
             continue;
         };
         let method = http.method.clone().unwrap_or_else(|| "get".to_string());
-        let mut operation = json!({});
+        let mut operation = json!({
+            "operationId": action.action_name,
+        });
         if let Some(ref summary) = action.summary {
             operation["summary"] = json!(summary);
         }
@@ -54,21 +62,31 @@ pub fn generate_openapi_spec_from_contract(
         }
         if let Some(guard) = &action.auth.guard {
             operation["x-foundry-guard"] = json!(guard);
+            operation["security"] = json!([{ "bearerAuth": [] }]);
         }
         if !action.auth.permissions.is_empty() {
             operation["x-foundry-permissions"] = json!(action.auth.permissions);
         }
 
-        if !http.path_params.is_empty() {
+        if !action.parameters.is_empty() {
             operation["parameters"] = Value::Array(
-                http.path_params
+                action
+                    .parameters
                     .iter()
-                    .map(|name| {
+                    .map(|parameter| {
+                        let location = match parameter.location {
+                            ContractParameterLocation::Path => "path",
+                            ContractParameterLocation::Query => "query",
+                            ContractParameterLocation::Header => "header",
+                            ContractParameterLocation::Cookie => "cookie",
+                        };
                         json!({
-                            "name": name,
-                            "in": "path",
-                            "required": true,
-                            "schema": {"type": "string"}
+                            "name": parameter.name,
+                            "in": location,
+                            "required": parameter.required,
+                            "schema": {
+                                "$ref": format!("#/components/schemas/{}", parameter.schema)
+                            }
                         })
                     })
                     .collect(),
@@ -78,13 +96,13 @@ pub fn generate_openapi_spec_from_contract(
         if let Some(req) = action
             .request
             .as_ref()
-            .filter(|_| http.body != ContractHttpBody::None)
+            .filter(|_| http.body != ContractHttpBody::None || http.content_type.is_some())
         {
-            let content_type = match http.body {
+            let content_type = http.content_type.as_deref().unwrap_or(match http.body {
                 ContractHttpBody::Multipart => "multipart/form-data",
                 ContractHttpBody::Json | ContractHttpBody::Unknown => "application/json",
-                ContractHttpBody::None => unreachable!("body kind filtered above"),
-            };
+                ContractHttpBody::None => "application/octet-stream",
+            });
             operation["requestBody"] = json!({
                 "required": true,
                 "content": {
@@ -97,22 +115,7 @@ pub fn generate_openapi_spec_from_contract(
             });
         }
 
-        if !action.responses.is_empty() {
-            let mut responses = json!({});
-            for response in &action.responses {
-                responses[response.status.to_string()] = json!({
-                    "description": "",
-                    "content": {
-                        "application/json": {
-                            "schema": {
-                                "$ref": format!("#/components/schemas/{}", response.schema)
-                            }
-                        }
-                    }
-                });
-            }
-            operation["responses"] = responses;
-        }
+        operation["responses"] = openapi_responses(manifest, action);
 
         let path_entry = paths
             .entry(openapi_path(&http.path))
@@ -120,12 +123,111 @@ pub fn generate_openapi_spec_from_contract(
         path_entry[&method] = operation;
     }
 
+    let security_schemes = if has_guarded_actions {
+        json!({
+            "bearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "Foundry token"
+            }
+        })
+    } else {
+        json!({})
+    };
+
     json!({
         "openapi": "3.1.0",
         "info": { "title": title, "version": version },
         "paths": paths,
-        "components": { "schemas": schemas }
+        "components": {
+            "schemas": schemas,
+            "securitySchemes": security_schemes
+        }
     })
+}
+
+fn openapi_responses(manifest: &ContractManifest, action: &ContractAction) -> Value {
+    let mut responses = serde_json::Map::new();
+
+    for response in &action.responses {
+        responses.insert(
+            response.status.to_string(),
+            json!({
+                "description": status_description(response.status),
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "$ref": format!("#/components/schemas/{}", response.schema)
+                        }
+                    }
+                }
+            }),
+        );
+    }
+
+    let mut errors_by_status = BTreeMap::<u16, Vec<&ContractError>>::new();
+    for error in manifest.errors.iter().chain(&action.errors) {
+        errors_by_status
+            .entry(error.status)
+            .or_default()
+            .push(error);
+    }
+    for (status, errors) in errors_by_status {
+        responses.insert(status.to_string(), openapi_error_response(status, &errors));
+    }
+
+    if responses.is_empty() {
+        responses.insert("default".to_string(), json!({ "description": "Response" }));
+    }
+
+    Value::Object(responses)
+}
+
+fn openapi_error_response(status: u16, errors: &[&ContractError]) -> Value {
+    let mut codes = errors
+        .iter()
+        .map(|error| error.code.as_str())
+        .collect::<Vec<_>>();
+    codes.sort_unstable();
+    codes.dedup();
+    let mut response = json!({
+        "description": format!("{} ({})", status_description(status), codes.join(", ")),
+        "x-foundry-error-codes": codes,
+    });
+
+    let mut schemas = errors
+        .iter()
+        .filter_map(|error| error.schema.as_deref())
+        .collect::<Vec<_>>();
+    schemas.sort_unstable();
+    schemas.dedup();
+    if !schemas.is_empty() {
+        let schema = if schemas.len() == 1 {
+            json!({ "$ref": format!("#/components/schemas/{}", schemas[0]) })
+        } else {
+            json!({
+                "oneOf": schemas
+                    .iter()
+                    .map(|schema| json!({ "$ref": format!("#/components/schemas/{schema}") }))
+                    .collect::<Vec<_>>()
+            })
+        };
+        response["content"] = json!({
+            "application/json": {
+                "schema": schema
+            }
+        });
+    }
+
+    response
+}
+
+fn status_description(status: u16) -> String {
+    axum::http::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|status| status.canonical_reason())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("HTTP {status} response"))
 }
 
 fn contract_manifest_from_documented_routes(routes: &[DocumentedRoute]) -> ContractManifest {
@@ -154,27 +256,82 @@ fn contract_manifest_from_documented_routes(routes: &[DocumentedRoute]) -> Contr
             })
             .collect::<Vec<_>>();
 
+        let mut parameters = route
+            .doc
+            .parameters
+            .iter()
+            .map(|parameter| {
+                schema_map.insert(
+                    parameter.schema.name.to_string(),
+                    (parameter.schema.schema_fn)(),
+                );
+                ContractParameter {
+                    name: parameter.name.clone(),
+                    location: parameter.location,
+                    schema: parameter.schema.name.to_string(),
+                    required: parameter.required,
+                }
+            })
+            .collect::<Vec<_>>();
+        for name in route_path_params(&route.path) {
+            if parameters.iter().any(|parameter| {
+                parameter.location == ContractParameterLocation::Path && parameter.name == name
+            }) {
+                continue;
+            }
+            schema_map.insert(String::schema_name().to_string(), String::schema());
+            parameters.push(ContractParameter {
+                name,
+                location: ContractParameterLocation::Path,
+                schema: String::schema_name().to_string(),
+                required: true,
+            });
+        }
+
+        let errors = route
+            .doc
+            .errors
+            .iter()
+            .map(|error| {
+                let schema = error.schema.as_ref().map(|schema| {
+                    schema_map.insert(schema.name.to_string(), (schema.schema_fn)());
+                    schema.name.to_string()
+                });
+                ContractError {
+                    code: error.code.clone(),
+                    status: error.status,
+                    schema,
+                }
+            })
+            .collect::<Vec<_>>();
+
         actions.push(ContractAction {
             id: format!("{} {}", route.method, route.path),
-            action_name: format!("OpenApiRoute{}", index + 1),
+            action_name: route
+                .doc
+                .action_name
+                .clone()
+                .unwrap_or_else(|| format!("OpenApiRoute{}", index + 1)),
             summary: route.doc.summary.clone(),
             description: route.doc.description.clone(),
             tags: route.doc.tags.clone(),
             deprecated: route.doc.deprecated,
             request,
+            parameters,
             responses,
-            auth: ContractAuth::default(),
+            errors,
+            auth: route.auth.clone(),
             client_export: false,
             validation: None,
             transport: ContractTransport::Http(ContractHttpTransport {
                 method: Some(route.method.clone()),
                 path: route.path.clone(),
-                path_params: route_path_params(&route.path),
                 body: if route.doc.request.is_some() {
                     ContractHttpBody::Json
                 } else {
                     ContractHttpBody::None
                 },
+                content_type: route.doc.request_content_type.clone(),
             }),
         });
     }
@@ -243,10 +400,16 @@ mod tests {
 
     #[test]
     fn bodyless_contract_request_does_not_emit_request_body() {
-        let mut manifest = ContractManifest::new().with_schemas(vec![ContractSchema {
-            name: "ShowUserRequest".to_string(),
-            schema: json!({ "type": "object" }),
-        }]);
+        let mut manifest = ContractManifest::new().with_schemas(vec![
+            ContractSchema {
+                name: "ShowUserRequest".to_string(),
+                schema: json!({ "type": "object" }),
+            },
+            ContractSchema {
+                name: "String".to_string(),
+                schema: json!({ "type": "string" }),
+            },
+        ]);
         manifest.actions = vec![ContractAction {
             id: "admin.users.show".to_string(),
             action_name: "AdminUsersShow".to_string(),
@@ -257,15 +420,22 @@ mod tests {
             request: Some(ContractPayload {
                 schema: "ShowUserRequest".to_string(),
             }),
+            parameters: vec![ContractParameter {
+                name: "id".to_string(),
+                location: ContractParameterLocation::Path,
+                schema: "String".to_string(),
+                required: true,
+            }],
             responses: Vec::new(),
+            errors: Vec::new(),
             auth: ContractAuth::default(),
             client_export: true,
             validation: Some("ShowUserRequest".to_string()),
             transport: ContractTransport::Http(ContractHttpTransport {
                 method: Some("get".to_string()),
                 path: "/users/{id}".to_string(),
-                path_params: vec!["id".to_string()],
                 body: ContractHttpBody::None,
+                content_type: None,
             }),
         }];
 
@@ -281,7 +451,10 @@ mod tests {
 
     #[test]
     fn openapi_paths_use_braced_parameter_syntax() {
-        let mut manifest = ContractManifest::new();
+        let mut manifest = ContractManifest::new().with_schemas(vec![ContractSchema {
+            name: "String".to_string(),
+            schema: json!({ "type": "string" }),
+        }]);
         manifest.actions = vec![ContractAction {
             id: "files.show".to_string(),
             action_name: "FilesShow".to_string(),
@@ -290,15 +463,30 @@ mod tests {
             tags: Vec::new(),
             deprecated: false,
             request: None,
+            parameters: vec![
+                ContractParameter {
+                    name: "id".to_string(),
+                    location: ContractParameterLocation::Path,
+                    schema: "String".to_string(),
+                    required: true,
+                },
+                ContractParameter {
+                    name: "path".to_string(),
+                    location: ContractParameterLocation::Path,
+                    schema: "String".to_string(),
+                    required: true,
+                },
+            ],
             responses: Vec::new(),
+            errors: Vec::new(),
             auth: ContractAuth::default(),
             client_export: true,
             validation: None,
             transport: ContractTransport::Http(ContractHttpTransport {
                 method: Some("get".to_string()),
                 path: "/users/:id/files/{*path}".to_string(),
-                path_params: vec!["id".to_string(), "path".to_string()],
                 body: ContractHttpBody::None,
+                content_type: None,
             }),
         }];
 
@@ -313,16 +501,147 @@ mod tests {
                     "name": "id",
                     "in": "path",
                     "required": true,
-                    "schema": {"type": "string"}
+                    "schema": {"$ref": "#/components/schemas/String"}
                 },
                 {
                     "name": "path",
                     "in": "path",
                     "required": true,
-                    "schema": {"type": "string"}
+                    "schema": {"$ref": "#/components/schemas/String"}
                 }
             ])
         );
+    }
+
+    #[test]
+    fn contract_openapi_emits_operation_security_parameters_and_standard_errors() {
+        let mut manifest = ContractManifest::new().with_schemas(vec![
+            ContractSchema {
+                name: "String".to_string(),
+                schema: String::schema(),
+            },
+            ContractSchema {
+                name: "bool".to_string(),
+                schema: bool::schema(),
+            },
+            ContractSchema {
+                name: "i64".to_string(),
+                schema: i64::schema(),
+            },
+            ContractSchema {
+                name: "User".to_string(),
+                schema: UserSchema::schema(),
+            },
+        ]);
+        manifest.actions = vec![ContractAction {
+            id: "admin.users.show".to_string(),
+            action_name: "GetAdminUser".to_string(),
+            summary: Some("Get an admin user".to_string()),
+            description: None,
+            tags: vec!["admin:users".to_string()],
+            deprecated: false,
+            request: None,
+            parameters: vec![
+                ContractParameter {
+                    name: "id".to_string(),
+                    location: ContractParameterLocation::Path,
+                    schema: "i64".to_string(),
+                    required: true,
+                },
+                ContractParameter {
+                    name: "include_deleted".to_string(),
+                    location: ContractParameterLocation::Query,
+                    schema: "bool".to_string(),
+                    required: false,
+                },
+                ContractParameter {
+                    name: "x-tenant".to_string(),
+                    location: ContractParameterLocation::Header,
+                    schema: "String".to_string(),
+                    required: true,
+                },
+                ContractParameter {
+                    name: "locale".to_string(),
+                    location: ContractParameterLocation::Cookie,
+                    schema: "String".to_string(),
+                    required: false,
+                },
+            ],
+            responses: vec![ContractResponse {
+                status: 200,
+                schema: "User".to_string(),
+                schema_json: UserSchema::schema(),
+            }],
+            errors: vec![ContractError {
+                code: "account_missing".to_string(),
+                status: 404,
+                schema: Some("User".to_string()),
+            }],
+            auth: ContractAuth {
+                guard: Some("admin".to_string()),
+                permissions: vec!["users.read".to_string()],
+            },
+            client_export: true,
+            validation: None,
+            transport: ContractTransport::Http(ContractHttpTransport {
+                method: Some("get".to_string()),
+                path: "/admin/users/{id}".to_string(),
+                body: ContractHttpBody::None,
+                content_type: None,
+            }),
+        }];
+
+        let spec = generate_openapi_spec_from_contract("Foundry", "test", &manifest);
+        let operation = &spec["paths"]["/admin/users/{id}"]["get"];
+
+        assert_eq!(operation["operationId"], "GetAdminUser");
+        assert_eq!(operation["security"], json!([{ "bearerAuth": [] }]));
+        assert_eq!(operation["x-foundry-guard"], "admin");
+        assert_eq!(operation["x-foundry-permissions"], json!(["users.read"]));
+        assert_eq!(
+            spec["components"]["securitySchemes"]["bearerAuth"]["type"],
+            "http"
+        );
+        assert_eq!(
+            spec["components"]["securitySchemes"]["bearerAuth"]["scheme"],
+            "bearer"
+        );
+
+        for (name, location, required, schema) in [
+            ("id", "path", true, "i64"),
+            ("include_deleted", "query", false, "bool"),
+            ("x-tenant", "header", true, "String"),
+            ("locale", "cookie", false, "String"),
+        ] {
+            assert!(operation["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|parameter| {
+                    parameter["name"] == name
+                        && parameter["in"] == location
+                        && parameter["required"] == required
+                        && parameter["schema"]["$ref"] == format!("#/components/schemas/{schema}")
+                }));
+        }
+
+        assert_eq!(operation["responses"]["200"]["description"], "OK");
+        assert_eq!(
+            operation["responses"]["404"]["x-foundry-error-codes"],
+            json!(["account_missing", "not_found"])
+        );
+        assert_eq!(
+            operation["responses"]["404"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/User"
+        );
+        assert_eq!(
+            operation["responses"]["401"]["x-foundry-error-codes"],
+            json!(["unauthorized"])
+        );
+        assert!(operation["responses"]["500"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Internal Server Error"));
     }
 
     #[test]
@@ -332,11 +651,13 @@ mod tests {
                 method: "get".to_string(),
                 path: "/users".to_string(),
                 doc: RouteDoc::new().response::<Vec<UserSchema>>(200),
+                auth: ContractAuth::default(),
             },
             DocumentedRoute {
                 method: "get".to_string(),
                 path: "/orders".to_string(),
                 doc: RouteDoc::new().response::<Vec<OrderSchema>>(200),
+                auth: ContractAuth::default(),
             },
         ];
 
@@ -360,6 +681,31 @@ mod tests {
             spec["components"]["schemas"]["ArrayOfOrder"]["items"],
             OrderSchema::schema()
         );
+    }
+
+    #[test]
+    fn documented_routes_can_override_request_media_type() {
+        let routes = vec![DocumentedRoute {
+            method: "post".to_string(),
+            path: "/sessions".to_string(),
+            doc: RouteDoc::new()
+                .action_name("CreateSession")
+                .request::<UserSchema>()
+                .request_content_type("application/x-www-form-urlencoded")
+                .response::<UserSchema>(201),
+            auth: ContractAuth::default(),
+        }];
+
+        let spec = generate_openapi_spec("Foundry", "test", &routes);
+        let operation = &spec["paths"]["/sessions"]["post"];
+
+        assert_eq!(operation["operationId"], "CreateSession");
+        assert_eq!(
+            operation["requestBody"]["content"]["application/x-www-form-urlencoded"]["schema"]
+                ["$ref"],
+            "#/components/schemas/User"
+        );
+        assert_eq!(operation["responses"]["201"]["description"], "Created");
     }
 
     #[test]

@@ -56,12 +56,18 @@ struct WebSocketContext
 struct WebSocketPublisher
   async fn publish<C, E>( &self, channel: C, event: E, room: Option<&str>, payload: impl Serialize, ) -> Result<()>
   async fn publish_message(&self, message: ServerMessage) -> Result<()>
-  async fn disconnect_user(&self, actor_id: &str) -> Result<()>
+  async fn disconnect_actor<G>(&self, guard: G, actor_id: &str) -> Result<()>
 struct WebSocketRegistrar
   fn new() -> Self
   fn channel<I, H>(&mut self, id: I, handler: H) -> Result<&mut Self>
   fn channel_with_options<I, H>( &mut self, id: I, handler: H, options: WebSocketChannelOptions, ) -> Result<&mut Self>
+  fn typed_channel<T, H>( &mut self, id: impl Into<ChannelId>, handler: H, ) -> Result<&mut Self>
+  fn typed_channel_with_options<T, H>( &mut self, id: impl Into<ChannelId>, handler: H, options: WebSocketChannelOptions, ) -> Result<&mut Self>
+  fn raw_channel<I, H>(&mut self, id: I, handler: H) -> Result<&mut Self>
+  fn raw_channel_with_options<I, H>( &mut self, id: I, handler: H, options: WebSocketChannelOptions, ) -> Result<&mut Self>
 trait ChannelHandler
+  fn handle<'life0, 'async_trait>(
+trait TypedChannelHandler
   fn handle<'life0, 'async_trait>(
 ```
 

@@ -12,6 +12,9 @@ struct EmailManager
   fn mailer(&self, name: &str) -> Result<EmailMailer>
   fn default_mailer(&self) -> Result<EmailMailer>
   fn default_mailer_name(&self) -> &str
+  fn queue_id(&self) -> &QueueId
+  fn template_path(&self) -> &str
+  async fn render_template( &self, message: EmailMessage, template_name: &str, variables: Value, ) -> Result<EmailMessage>
   fn from_address(&self) -> &EmailFromConfig
   fn configured_mailers(&self) -> Vec<String>
   async fn send(&self, message: EmailMessage) -> Result<()>
@@ -49,6 +52,7 @@ struct ResolvedAttachment
 enum MailgunRegion { Us, Eu }
 enum SmtpEncryption { StartTls, Tls, None }
 struct EmailConfig
+  fn queue_id(&self) -> Result<QueueId>
 struct EmailFromConfig
 struct ResolvedLogConfig
   fn from_table(table: &Table) -> Self

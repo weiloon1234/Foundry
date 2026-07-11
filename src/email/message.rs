@@ -78,7 +78,7 @@ impl EmailMessage {
         self
     }
 
-    /// Render an email template and set the body.
+    /// Render an email template from an explicit directory and set the body.
     ///
     /// Loads `{template_name}.html` and `{template_name}.txt` from the template
     /// directory, replaces `{{variable}}` placeholders with the provided values.
@@ -100,6 +100,13 @@ impl EmailMessage {
     ) -> crate::foundation::Result<Self> {
         let renderer = crate::email::template::TemplateRenderer::new(template_path);
         let rendered = renderer.render_async(template_name, &variables).await?;
+        Ok(self.with_rendered_template(rendered))
+    }
+
+    pub(crate) fn with_rendered_template(
+        self,
+        rendered: crate::email::template::RenderedTemplate,
+    ) -> Self {
         let mut msg = self;
         if let Some(html) = rendered.html {
             msg = msg.html_body(html);
@@ -107,7 +114,7 @@ impl EmailMessage {
         if let Some(text) = rendered.text {
             msg = msg.text_body(text);
         }
-        Ok(msg)
+        msg
     }
 
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {

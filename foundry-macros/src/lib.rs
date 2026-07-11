@@ -29,14 +29,14 @@ pub fn derive_foundry_id(input: TokenStream) -> TokenStream {
     expand(input, foundry_id::expand)
 }
 
-#[proc_macro_derive(Validate, attributes(validate))]
+#[proc_macro_derive(Validate, attributes(validate, serde))]
 pub fn derive_validate(input: TokenStream) -> TokenStream {
     expand(input, validate::expand)
 }
 
-#[proc_macro_derive(ApiSchema)]
+#[proc_macro_derive(ApiSchema, attributes(serde, validate))]
 pub fn derive_api_schema(input: TokenStream) -> TokenStream {
-    expand_with_ts(input, openapi::expand)
+    expand(input, openapi::expand)
 }
 
 #[proc_macro_derive(TS)]
@@ -54,33 +54,7 @@ fn expand(
     }
 }
 
-/// Like `expand`, but also appends TypeScript inventory registration.
-fn expand_with_ts(
-    input: TokenStream,
-    f: fn(syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream>,
-) -> TokenStream {
-    match syn::parse::<syn::DeriveInput>(input) {
-        Ok(parsed) => {
-            let ts_tokens = match typescript::expand(parsed.clone()) {
-                Ok(tokens) => tokens,
-                Err(error) => return error.to_compile_error().into(),
-            };
-            match f(parsed) {
-                Ok(main_tokens) => {
-                    let combined = quote::quote! {
-                        #main_tokens
-                        #ts_tokens
-                    };
-                    combined.into()
-                }
-                Err(error) => error.to_compile_error().into(),
-            }
-        }
-        Err(error) => error.to_compile_error().into(),
-    }
-}
-
-/// Like `expand_with_ts`, but also registers enum values for runtime TS export.
+/// Like `expand`, but also registers enum values for runtime TS export.
 fn expand_enum_with_ts(
     input: TokenStream,
     f: fn(syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream>,

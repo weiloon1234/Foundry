@@ -189,10 +189,35 @@ impl FromDbValue for i64 {
     fn from_db_value(value: &DbValue) -> Result<Self> {
         match value {
             DbValue::Int64(value) => Ok(*value),
+            DbValue::Int32(value) => Ok(i64::from(*value)),
+            DbValue::Int16(value) => Ok(i64::from(*value)),
+            DbValue::Numeric(value) => exact_numeric_i64(value),
             DbValue::Null(_) => Err(Error::message("expected int64, found null")),
             _ => Err(Error::message("expected int64 value")),
         }
     }
+}
+
+fn exact_numeric_i64(value: &Numeric) -> Result<i64> {
+    let value = value.as_str().trim();
+    let (integer, fraction) = value
+        .split_once('.')
+        .map_or((value, None), |(integer, fraction)| {
+            (integer, Some(fraction))
+        });
+    if fraction.is_some_and(|fraction| fraction.bytes().any(|digit| digit != b'0')) {
+        return Err(Error::message(
+            "expected exact int64 value, found fractional numeric",
+        ));
+    }
+
+    let integer = match integer {
+        "" | "+" | "-" => "0",
+        integer => integer,
+    };
+    integer
+        .parse::<i64>()
+        .map_err(|_| Error::message("numeric value is outside the int64 range"))
 }
 
 impl FromDbValue for i16 {
@@ -1429,5 +1454,28 @@ mod tests {
         assert!(error
             .to_string()
             .contains("hydration panicked: model hydrate boom"));
+    }
+
+    #[test]
+    fn int64_decoding_accepts_safe_postgres_integer_widening() {
+        assert_eq!(i64::from_db_value(&DbValue::Int16(7)).unwrap(), 7);
+        assert_eq!(i64::from_db_value(&DbValue::Int32(8)).unwrap(), 8);
+        assert_eq!(
+            i64::from_db_value(&DbValue::Numeric(Numeric::new("2500.0000").unwrap())).unwrap(),
+            2500
+        );
+    }
+
+    #[test]
+    fn int64_decoding_rejects_fractional_and_out_of_range_numeric_values() {
+        let fractional =
+            i64::from_db_value(&DbValue::Numeric(Numeric::new("1.5").unwrap())).unwrap_err();
+        assert!(fractional.to_string().contains("fractional numeric"));
+
+        let overflow = i64::from_db_value(&DbValue::Numeric(
+            Numeric::new("9223372036854775808").unwrap(),
+        ))
+        .unwrap_err();
+        assert!(overflow.to_string().contains("outside the int64 range"));
     }
 }

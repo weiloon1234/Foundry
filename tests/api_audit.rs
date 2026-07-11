@@ -54,3 +54,48 @@ fn table_attribute_message(offenders: &[String]) -> String {
         offenders.join("\n")
     )
 }
+
+#[test]
+fn guides_do_not_reintroduce_known_stale_contracts() {
+    let checks = [
+        (
+            "docs/query-blueprint-status.md",
+            "ProjectionQuery::cursor_paginate",
+        ),
+        (
+            "docs/guides/storage-and-imaging.md",
+            "MultipartForm::from_multipart",
+        ),
+        ("docs/guides/validation.md", ":attribute"),
+        ("docs/guides/i18n.md", "{{field}}"),
+        ("docs/guides/websocket.md", "disconnect_user"),
+        ("docs/guides/storage-and-imaging.md", "JPEG/WebP quality"),
+    ];
+
+    for (path, stale_contract) in checks {
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !contents.contains(stale_contract),
+            "{path} contains stale contract `{stale_contract}`"
+        );
+    }
+
+    let api_reference = std::fs::read_to_string("docs/api-reference.md").unwrap();
+    assert!(!api_reference.contains("\nfn dispatch<J: Job>(&self, job: J)"));
+    assert!(!api_reference.contains("\nfn dispatch(self) -> Result<String>"));
+}
+
+#[test]
+fn promised_repository_documents_exist() {
+    for path in ["LICENSE", "docs/public-api-contract.md"] {
+        assert!(
+            std::path::Path::new(path).is_file(),
+            "promised repository document `{path}` is missing"
+        );
+    }
+
+    let readme = std::fs::read_to_string("README.md").unwrap();
+    assert!(readme.contains("docs/public-api-contract.md"));
+    let api_index = std::fs::read_to_string("docs/api/index.md").unwrap();
+    assert!(api_index.contains("../public-api-contract.md"));
+}

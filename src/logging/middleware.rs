@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 use tracing::Instrument;
 
 use super::context::CurrentRequest;
-use super::request_id::{generate_request_id, RequestId, REQUEST_ID_HEADER};
+use super::request_id::{RequestId, REQUEST_ID_HEADER};
 use super::{
     catch_future_panic, panic_payload_message, scope_current_request, scope_current_trace,
     HttpRequestRecord, TraceContext,
@@ -22,13 +22,11 @@ pub(crate) async fn request_context_middleware(
         .headers()
         .get(REQUEST_ID_HEADER)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(generate_request_id);
+        .and_then(|value| RequestId::try_new(value.to_string()).ok())
+        .unwrap_or_else(RequestId::generate);
 
-    request
-        .extensions_mut()
-        .insert(RequestId::new(request_id.clone()));
+    request.extensions_mut().insert(request_id.clone());
+    let request_id = request_id.to_string();
 
     let method = request.method().clone();
     let path = request.uri().path().to_string();
@@ -401,6 +399,46 @@ mod tests {
         assert_eq!(snapshot.requests_total, 1);
         assert_eq!(snapshot.success_total, 1);
         assert_eq!(snapshot.server_error_total, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_inbound_request_ids_are_replaced_with_uuid_v7() {
+        let reporter = Arc::new(StubReporter::default());
+        let (app, _diagnostics) = test_app_with_reporter(reporter);
+        let router = axum::Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                app,
+                request_context_middleware,
+            ));
+
+        let oversized = "x".repeat(crate::logging::REQUEST_ID_MAX_LENGTH + 1);
+        for invalid in ["", "has space", oversized.as_str()] {
+            let response = router
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/ok")
+                        .header(REQUEST_ID_HEADER, invalid)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let request_id = response
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_ne!(request_id, invalid);
+            assert!(request_id.len() <= crate::logging::REQUEST_ID_MAX_LENGTH);
+            assert_eq!(
+                uuid::Uuid::parse_str(request_id).unwrap().get_version_num(),
+                7
+            );
+        }
     }
 
     #[tokio::test]

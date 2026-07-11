@@ -38,6 +38,7 @@ struct CapturedExport {
     recipient: String,
     filename: String,
     data: Vec<u8>,
+    file_backed: bool,
 }
 
 #[derive(Clone)]
@@ -47,12 +48,18 @@ struct CaptureDelivery {
 
 #[async_trait]
 impl DatatableExportDelivery for CaptureDelivery {
-    async fn deliver(&self, export: GeneratedDatatableExport, recipient: &str) -> Result<()> {
+    async fn deliver_file(
+        &self,
+        export: GeneratedDatatableExportFile,
+        recipient: &str,
+    ) -> Result<()> {
+        let data = export.read_bounded(1024 * 1024).await?;
         self.deliveries.lock().unwrap().push(CapturedExport {
-            datatable_id: export.datatable_id,
+            datatable_id: export.datatable_id().to_string(),
             recipient: recipient.to_string(),
-            filename: export.filename,
-            data: export.data,
+            filename: export.filename().to_string(),
+            data,
+            file_backed: true,
         });
         Ok(())
     }
@@ -355,10 +362,16 @@ impl Datatable for PaymentsDatatable {
 
     async fn available_filters(_ctx: &DatatableContext) -> Result<Vec<DatatableFilterRow>> {
         Ok(vec![DatatableFilterRow::pair(
-            DatatableFilterField::decimal_min("minimum_amount", "Minimum Amount")
-                .server_field(Payment::AMOUNT),
-            DatatableFilterField::decimal_max("maximum_amount", "Maximum Amount")
-                .server_field(Payment::AMOUNT),
+            DatatableFilterField::decimal_min("minimum_amount", "Minimum Amount").bind(
+                Payment::AMOUNT.name(),
+                DatatableFilterOp::Gte,
+                DatatableFilterValueKind::Decimal,
+            ),
+            DatatableFilterField::decimal_max("maximum_amount", "Maximum Amount").bind(
+                Payment::AMOUNT.name(),
+                DatatableFilterOp::Lte,
+                DatatableFilterValueKind::Decimal,
+            ),
         )])
     }
 }
@@ -693,6 +706,7 @@ async fn projection_datatable_downloads_and_queues_exports_through_the_registry(
     assert_eq!(deliveries[0].recipient, "reports@example.com");
     assert_eq!(deliveries[0].filename, "merchant-sales.xlsx");
     assert!(deliveries[0].data.starts_with(b"PK"));
+    assert!(deliveries[0].file_backed);
 }
 
 #[tokio::test]

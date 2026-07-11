@@ -9,7 +9,7 @@ Built-in country data (250 countries)
 ```rust
 enum CountryStatus { Enabled, Disabled }
   fn as_str(&self) -> &'static str
-  fn parse(s: &str) -> Self
+  fn parse(s: &str) -> Option<Self>
   fn is_enabled(&self) -> bool
 struct Country
   async fn find(app: &AppContext, iso2: &str) -> Result<Option<Country>>

@@ -29,8 +29,8 @@ All datatable modules live under `src/datatable/`:
 | `datatable_trait.rs` | Unified `Datatable` + sealed `DatatableQuery` traits |
 | `response.rs` | `DatatableJsonResponse`, column/pagination meta |
 | `json.rs` | JSON output mode (paginated) |
-| `download.rs` | XLSX download mode (fully implemented with `rust_xlsxwriter`) |
-| `export.rs` | `DatatableExportDelivery` contract + `NoopExportDelivery` |
+| `download.rs` | Streaming XLSX generation with bounded rows, constant-memory worksheets, and file-backed queued artifacts |
+| `export.rs` | Required `DatatableExportDelivery` contract and temporary artifact lifecycle |
 | `export_job.rs` | Queued export dispatch (fully implemented) |
 | `query_pipeline.rs` | Shared query build pipeline for JSON/download/export |
 | `registry.rs` | `DatatableRegistry` + `DatatableRegistryBuilder` (type-erased lookup by ID) |
@@ -83,14 +83,14 @@ All datatable modules live under `src/datatable/`:
 ### Output Modes (Blueprint: Output Modes)
 
 - **JSON**: `build_json_response()` in `json.rs` — scoped query, auto-filter, custom filter hook, sorting, pagination, row building with column extraction + mapping overrides
-- **Download**: `build_download_response()` in `download.rs` — fully implemented with `rust_xlsxwriter` (bold headers, type-aware cells, exportable column filtering, mapping support)
-- **Email**: `dispatch_export()` in `export_job.rs` — fully implemented with `DatatableExportJob` (`Job` trait, max 3 retries), reuses download pipeline, pluggable `DatatableExportDelivery`
+- **Download**: `build_download_response()` in `download.rs` — bounded database row streaming into `rust_xlsxwriter` constant-memory mode (bold headers, type-aware cells, exportable column filtering, mapping support)
+- **Email**: `dispatch_export()` in `export_job.rs` — `DatatableExportJob` (max 3 retries) restores dispatch-time locale/timezone, generates a temporary file-backed XLSX, and requires a registered `DatatableExportDelivery`
 
 ### Export Contract (Blueprint: Export Contract)
 
-- `DatatableExportDelivery` trait with `deliver()` method
-- `GeneratedDatatableExport` payload with datatable_id, filename, data bytes, columns
-- `NoopExportDelivery` as default/log implementation
+- `DatatableExportDelivery::deliver_file()` receives a cleaned-up-on-drop `GeneratedDatatableExportFile` for bounded stream/copy delivery
+- Existing `deliver(GeneratedDatatableExport, ...)` implementations use a source-compatible adapter bounded by `LEGACY_DATATABLE_EXPORT_MAX_BYTES` (25 MiB)
+- Missing `DatatableExportDelivery` is an explicit job failure; no silent fallback exists
 - `DatatableActorSnapshot` for serializing actor state into export jobs
 
 ### Registry (Blueprint: Registry and Resolution)
@@ -121,6 +121,7 @@ All datatable modules live under `src/datatable/`:
 
 ## Verification Coverage
 
-- JSON, model/projection registry resolution, WHERE/HAVING filters, relation filters, sorting, decimal filters, XLSX download, and queued export delivery are covered by `tests/datatable_acceptance.rs`.
+- JSON, model/projection registry resolution, WHERE/HAVING filters, relation filters, sorting, decimal filters, XLSX download, and file-backed queued export delivery are covered by `tests/datatable_acceptance.rs`.
+- Bounded legacy delivery plus temporary-artifact cleanup on success, error, and panic are covered by unit tests in `src/datatable/export.rs`.
 - Filter engine edge cases and filter metadata bindings are covered by unit tests under `src/datatable/`.
 - Legacy query-param normalization is covered by unit tests in `src/datatable/request.rs`.

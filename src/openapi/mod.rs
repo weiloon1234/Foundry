@@ -6,6 +6,8 @@ pub mod spec;
 
 use serde_json::Value;
 
+use crate::contract::ContractParameterLocation;
+
 /// Trait implemented by types that can generate an OpenAPI JSON Schema.
 /// Derive with `#[derive(ApiSchema)]`.
 pub trait ApiSchema: 'static {
@@ -175,6 +177,23 @@ pub struct SchemaRef {
     pub schema_fn: fn() -> Value,
 }
 
+/// Type-erased schema metadata for one HTTP action parameter.
+#[derive(Clone)]
+pub(crate) struct ParameterRef {
+    pub name: String,
+    pub location: ContractParameterLocation,
+    pub required: bool,
+    pub schema: SchemaRef,
+}
+
+/// Type-erased schema metadata for one action-specific error response.
+#[derive(Clone)]
+pub(crate) struct ErrorRef {
+    pub code: String,
+    pub status: u16,
+    pub schema: Option<SchemaRef>,
+}
+
 impl SchemaRef {
     pub fn of<T: ApiSchema>() -> Self {
         Self {
@@ -187,12 +206,16 @@ impl SchemaRef {
 /// Documentation for a single route.
 #[derive(Clone, Default)]
 pub struct RouteDoc {
+    pub(crate) action_name: Option<String>,
     pub(crate) method: Option<String>,
     pub(crate) summary: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) tags: Vec<String>,
     pub(crate) request: Option<SchemaRef>,
+    pub(crate) request_content_type: Option<String>,
+    pub(crate) parameters: Vec<ParameterRef>,
     pub(crate) responses: Vec<(u16, SchemaRef)>,
+    pub(crate) errors: Vec<ErrorRef>,
     pub(crate) deprecated: bool,
 }
 
@@ -203,6 +226,15 @@ impl RouteDoc {
 
     pub fn method(mut self, m: &str) -> Self {
         self.method = Some(m.to_lowercase());
+        self
+    }
+
+    /// Set the business action name used by generated contracts and SDKs.
+    ///
+    /// This is intentionally independent from the route ID, which remains
+    /// transport metadata for URL generation.
+    pub fn action_name(mut self, action_name: impl Into<String>) -> Self {
+        self.action_name = Some(action_name.into());
         self
     }
 
@@ -246,8 +278,73 @@ impl RouteDoc {
         self
     }
 
+    /// Override the request media type rendered into the OpenAPI contract.
+    pub fn request_content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.request_content_type = Some(content_type.into());
+        self
+    }
+
+    pub fn parameter<T: ApiSchema>(
+        mut self,
+        name: impl Into<String>,
+        location: ContractParameterLocation,
+        required: bool,
+    ) -> Self {
+        let name = name.into();
+        let parameter = ParameterRef {
+            name: name.clone(),
+            location,
+            required,
+            schema: SchemaRef::of::<T>(),
+        };
+        if let Some(existing) = self
+            .parameters
+            .iter_mut()
+            .find(|existing| existing.name == name && existing.location == location)
+        {
+            *existing = parameter;
+        } else {
+            self.parameters.push(parameter);
+        }
+        self
+    }
+
+    pub fn path_parameter<T: ApiSchema>(self, name: impl Into<String>) -> Self {
+        self.parameter::<T>(name, ContractParameterLocation::Path, true)
+    }
+
+    pub fn query_parameter<T: ApiSchema>(self, name: impl Into<String>, required: bool) -> Self {
+        self.parameter::<T>(name, ContractParameterLocation::Query, required)
+    }
+
+    pub fn header_parameter<T: ApiSchema>(self, name: impl Into<String>, required: bool) -> Self {
+        self.parameter::<T>(name, ContractParameterLocation::Header, required)
+    }
+
+    pub fn cookie_parameter<T: ApiSchema>(self, name: impl Into<String>, required: bool) -> Self {
+        self.parameter::<T>(name, ContractParameterLocation::Cookie, required)
+    }
+
     pub fn response<T: ApiSchema>(mut self, status: u16) -> Self {
         self.responses.push((status, SchemaRef::of::<T>()));
+        self
+    }
+
+    pub fn error<T: ApiSchema>(mut self, status: u16, code: impl Into<String>) -> Self {
+        self.errors.push(ErrorRef {
+            code: code.into(),
+            status,
+            schema: Some(SchemaRef::of::<T>()),
+        });
+        self
+    }
+
+    pub fn error_without_schema(mut self, status: u16, code: impl Into<String>) -> Self {
+        self.errors.push(ErrorRef {
+            code: code.into(),
+            status,
+            schema: None,
+        });
         self
     }
 
@@ -269,8 +366,27 @@ impl RouteDoc {
         if self.request.is_none() {
             self.request = defaults.request.clone();
         }
+        if self.request_content_type.is_none() {
+            self.request_content_type = defaults.request_content_type.clone();
+        }
         if self.responses.is_empty() {
             self.responses = defaults.responses.clone();
+        }
+        for parameter in &defaults.parameters {
+            if !self.parameters.iter().any(|existing| {
+                existing.name == parameter.name && existing.location == parameter.location
+            }) {
+                self.parameters.push(parameter.clone());
+            }
+        }
+        for error in &defaults.errors {
+            if !self
+                .errors
+                .iter()
+                .any(|existing| existing.code == error.code && existing.status == error.status)
+            {
+                self.errors.push(error.clone());
+            }
         }
         if defaults.deprecated {
             self.deprecated = true;

@@ -6,7 +6,7 @@ use syn::{DeriveInput, ExprLit, FieldsNamed, Ident, Lit, Type};
 
 use crate::common::{
     ensure_named_struct, require_ident, type_argument_if_last_segment_ident,
-    type_path_last_segment_matches,
+    type_path_last_segment_matches, WireNameResolver,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,7 +83,8 @@ fn parse_validate_args(attrs: &[syn::Attribute]) -> syn::Result<ValidateArgs> {
 #[derive(Clone)]
 struct FieldValidation {
     field_ident: Ident,
-    field_name: String,
+    rust_name: String,
+    wire_name: String,
     is_option: bool,
     is_vec: bool,
     is_uploaded_file: bool,
@@ -93,12 +94,57 @@ struct FieldValidation {
 /// Information about every struct field, used for FromMultipart generation.
 struct FieldInfo {
     ident: Ident,
-    name: String,
+    rust_name: String,
+    wire_name: String,
     is_option: bool,
     is_vec: bool,
     is_uploaded_file: bool,
     is_vec_uploaded_file: bool,
     ty: Type,
+}
+
+#[derive(Clone)]
+struct FieldReference {
+    rust_name: String,
+    wire_name: String,
+    is_option: bool,
+    is_vec: bool,
+    is_uploaded_file: bool,
+}
+
+impl From<&FieldInfo> for FieldReference {
+    fn from(field: &FieldInfo) -> Self {
+        Self {
+            rust_name: field.rust_name.clone(),
+            wire_name: field.wire_name.clone(),
+            is_option: field.is_option,
+            is_vec: field.is_vec,
+            is_uploaded_file: field.is_uploaded_file,
+        }
+    }
+}
+
+fn remap_validate_args(mut args: ValidateArgs, fields: &[FieldInfo]) -> syn::Result<ValidateArgs> {
+    for (field, _, _) in &mut args.messages {
+        *field = validate_wire_name(field, fields)?;
+    }
+    for (field, _) in &mut args.attributes {
+        *field = validate_wire_name(field, fields)?;
+    }
+    Ok(args)
+}
+
+fn validate_wire_name(rust_name: &str, fields: &[FieldInfo]) -> syn::Result<String> {
+    fields
+        .iter()
+        .find(|field| field.rust_name == rust_name)
+        .map(|field| field.wire_name.clone())
+        .ok_or_else(|| {
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("validation metadata references unknown field `{rust_name}`"),
+            )
+        })
 }
 
 #[derive(Clone)]
@@ -234,13 +280,15 @@ fn generate_parse_text_value(
 
 fn parse_field_validations(
     fields: &FieldsNamed,
+    wire_names: &WireNameResolver,
 ) -> syn::Result<(Vec<FieldValidation>, Vec<FieldInfo>)> {
     let mut validations = Vec::new();
     let mut all_fields = Vec::new();
 
     for field in &fields.named {
         let field_ident = require_ident(field)?;
-        let field_name = field_ident.to_string();
+        let rust_name = field_ident.to_string();
+        let wire_name = wire_names.field_name(field)?;
         let field_ty = &field.ty;
         let is_option = type_argument_if_last_segment_ident(field_ty, "Option").is_some();
         let is_vec = is_vec_type(field_ty);
@@ -255,7 +303,8 @@ fn parse_field_validations(
 
         all_fields.push(FieldInfo {
             ident: field_ident.clone(),
-            name: field_name.clone(),
+            rust_name: rust_name.clone(),
+            wire_name: wire_name.clone(),
             is_option,
             is_vec,
             is_uploaded_file,
@@ -272,7 +321,8 @@ fn parse_field_validations(
         if !rules.is_empty() {
             validations.push(FieldValidation {
                 field_ident: field_ident.clone(),
-                field_name: field_name.clone(),
+                rust_name,
+                wire_name,
                 is_option,
                 is_vec,
                 is_uploaded_file,
@@ -452,6 +502,8 @@ const CROSS_FIELD_RULES: &[&str] = &[
     "after_or_equal",
 ];
 
+const CONDITIONAL_VALUE_RULES: &[&str] = &["required_if", "required_unless"];
+
 const TWO_STRING_PARAM_RULES: &[&str] = &["unique", "exists"];
 
 const STRING_PARAM_RULES: &[&str] = &["regex", "starts_with", "ends_with"];
@@ -461,12 +513,16 @@ const FLOAT_PARAM_RULES: &[&str] = &["min_numeric", "max_numeric"];
 pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let ident = input.ident.clone();
     let fields = ensure_named_struct(&input)?;
-    let args = parse_validate_args(&input.attrs)?;
-    let (field_validations, all_fields) = parse_field_validations(fields)?;
+    let wire_names = WireNameResolver::from_serde_attrs(&input.attrs)?;
+    let (field_validations, all_fields) = parse_field_validations(fields, &wire_names)?;
+    let args = remap_validate_args(parse_validate_args(&input.attrs)?, &all_fields)?;
 
-    let field_name_set: Vec<String> = all_fields.iter().map(|f| f.name.clone()).collect();
+    let field_names = all_fields
+        .iter()
+        .map(FieldReference::from)
+        .collect::<Vec<_>>();
 
-    let validate_stmts = generate_validate_body(&field_validations, &ident, &field_name_set)?;
+    let validate_stmts = generate_validate_body(&field_validations, &ident, &field_names)?;
     let after_stmts = args.after.iter().map(|after| {
         quote! {
             #after(self, validator).await?;
@@ -509,16 +565,20 @@ fn generate_ts_validation_registration(
     args: &ValidateArgs,
 ) -> syn::Result<TokenStream> {
     let name = ident.to_string();
+    let field_names = all_fields
+        .iter()
+        .map(FieldReference::from)
+        .collect::<Vec<_>>();
     let fields = all_fields
         .iter()
         .map(|field| {
-            let field_name = &field.name;
+            let field_name = &field.wire_name;
             let validation_rules = field_validations
                 .iter()
-                .find(|validation| validation.field_name == field.name)
+                .find(|validation| validation.rust_name == field.rust_name)
                 .map(|validation| validation.rules.as_slice())
                 .unwrap_or_default();
-            let mut rules = generate_ts_validation_rules(validation_rules)?;
+            let mut rules = generate_ts_validation_rules(validation_rules, &field_names)?;
             if should_add_implicit_nullable(field.is_option, validation_rules) {
                 rules.insert(
                     0,
@@ -575,14 +635,20 @@ fn generate_ts_validation_registration(
     })
 }
 
-fn generate_ts_validation_rules(rules: &[RuleSpec]) -> syn::Result<Vec<TokenStream>> {
+fn generate_ts_validation_rules(
+    rules: &[RuleSpec],
+    field_names: &[FieldReference],
+) -> syn::Result<Vec<TokenStream>> {
     rules
         .iter()
-        .map(generate_ts_validation_rule)
+        .map(|rule| generate_ts_validation_rule(rule, field_names))
         .collect::<syn::Result<Vec<_>>>()
 }
 
-fn generate_ts_validation_rule(rule: &RuleSpec) -> syn::Result<TokenStream> {
+fn generate_ts_validation_rule(
+    rule: &RuleSpec,
+    field_names: &[FieldReference],
+) -> syn::Result<TokenStream> {
     match rule {
         RuleSpec::Simple { name, message } => Ok(generate_ts_rule(
             name,
@@ -596,9 +662,9 @@ fn generate_ts_validation_rule(rule: &RuleSpec) -> syn::Result<TokenStream> {
             name,
             args,
             message,
-        } => generate_ts_parametric_rule(name, args, message),
+        } => generate_ts_parametric_rule(name, args, message, field_names),
         RuleSpec::Each { rules } => {
-            let nested = generate_ts_validation_rules(rules)?;
+            let nested = generate_ts_validation_rules(rules, field_names)?;
             Ok(generate_ts_rule(
                 "each",
                 Vec::new(),
@@ -690,6 +756,7 @@ fn generate_ts_parametric_rule(
     name: &str,
     args: &[syn::Expr],
     message: &Option<String>,
+    field_names: &[FieldReference],
 ) -> syn::Result<TokenStream> {
     if CROSS_FIELD_RULES.contains(&name) {
         if args.len() != 1 {
@@ -702,10 +769,84 @@ fn generate_ts_parametric_rule(
             ));
         }
         let other = extract_string_literal(&args[0], name)?;
+        let other = field_names
+            .iter()
+            .find(|field| field.rust_name == other)
+            .map(|field| &field.wire_name)
+            .ok_or_else(|| {
+                syn::Error::new(
+                    args[0].span(),
+                    format!("field `{other}` referenced in `{name}` does not exist"),
+                )
+            })?;
         return Ok(generate_ts_rule(
             name,
             vec![("other", quote!(#other))],
             quote!(Vec::new()),
+            message,
+            false,
+            Vec::new(),
+        ));
+    }
+
+    if CONDITIONAL_VALUE_RULES.contains(&name) {
+        if args.len() < 2 {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("`{name}` requires a field name and at least one comparison value"),
+            ));
+        }
+        let other = extract_string_literal(&args[0], name)?;
+        let other = field_names
+            .iter()
+            .find(|field| field.rust_name == other)
+            .map(|field| &field.wire_name)
+            .ok_or_else(|| {
+                syn::Error::new(
+                    args[0].span(),
+                    format!("field `{other}` referenced in `{name}` does not exist"),
+                )
+            })?;
+        let values = args[1..]
+            .iter()
+            .map(|value| quote!(::std::string::ToString::to_string(&(#value))));
+        return Ok(generate_ts_rule(
+            name,
+            vec![("other", quote!(#other))],
+            quote!(vec![#(#values),*]),
+            message,
+            false,
+            Vec::new(),
+        ));
+    }
+
+    if name == "required_with" {
+        if args.is_empty() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`required_with` requires at least one field name",
+            ));
+        }
+        let fields = args
+            .iter()
+            .map(|arg| {
+                let field = extract_string_literal(arg, name)?;
+                field_names
+                    .iter()
+                    .find(|candidate| candidate.rust_name == field)
+                    .map(|candidate| candidate.wire_name.clone())
+                    .ok_or_else(|| {
+                        syn::Error::new(
+                            arg.span(),
+                            format!("field `{field}` referenced in `{name}` does not exist"),
+                        )
+                    })
+            })
+            .collect::<syn::Result<Vec<_>>>()?;
+        return Ok(generate_ts_rule(
+            name,
+            Vec::new(),
+            quote!(vec![#(#fields.to_string()),*]),
             message,
             false,
             Vec::new(),
@@ -916,9 +1057,12 @@ fn rule_is_named(rule: &RuleSpec, expected: &str) -> bool {
 
 fn should_add_implicit_nullable(is_option: bool, rules: &[RuleSpec]) -> bool {
     is_option
-        && !rules
-            .iter()
-            .any(|rule| rule_is_named(rule, "nullable") || rule_is_named(rule, "required"))
+        && !rules.iter().any(|rule| {
+            rule_is_named(rule, "nullable")
+                || rule_is_named(rule, "required")
+                || rule_is_named(rule, "present")
+                || rule_is_named(rule, "sometimes")
+        })
 }
 
 fn collection_validation_value(field_ident: &Ident, is_option: bool) -> TokenStream {
@@ -949,6 +1093,23 @@ fn scalar_validation_value(field_ident: &Ident, is_option: bool) -> TokenStream 
     }
 }
 
+fn field_validation_builder(
+    field_ident: &Ident,
+    field_name: &str,
+    value: TokenStream,
+    is_option: bool,
+) -> TokenStream {
+    if is_option {
+        quote!(validator.field_with_presence(
+            #field_name,
+            #value,
+            self.#field_ident.is_some()
+        ))
+    } else {
+        quote!(validator.field(#field_name, #value))
+    }
+}
+
 fn app_enum_rule_type(rules: &[RuleSpec]) -> Option<&syn::Path> {
     rules.iter().find_map(|rule| match rule {
         RuleSpec::AppEnum { type_path } => Some(type_path),
@@ -968,13 +1129,13 @@ fn app_enum_key_string(type_path: &syn::Path, value: TokenStream) -> TokenStream
 fn generate_validate_body(
     field_validations: &[FieldValidation],
     struct_ident: &Ident,
-    all_field_names: &[String],
+    all_field_names: &[FieldReference],
 ) -> syn::Result<Vec<TokenStream>> {
     let mut stmts = Vec::new();
 
     for fv in field_validations {
         let field_ident = &fv.field_ident;
-        let field_name = &fv.field_name;
+        let field_name = &fv.wire_name;
         let nullable_call = if should_add_implicit_nullable(fv.is_option, &fv.rules) {
             quote!(.nullable())
         } else {
@@ -985,7 +1146,16 @@ fn generate_validate_body(
         let text_rules: Vec<&RuleSpec> = fv
             .rules
             .iter()
-            .filter(|r| !is_file_rule(r) && !matches!(r, RuleSpec::Each { .. }))
+            .filter(|r| {
+                !is_file_rule(r)
+                    && !matches!(r, RuleSpec::Each { .. })
+                    && !rule_is_named(r, "distinct")
+            })
+            .collect();
+        let distinct_rules: Vec<&RuleSpec> = fv
+            .rules
+            .iter()
+            .filter(|rule| rule_is_named(rule, "distinct"))
             .collect();
 
         // If there are file rules on a non-uploaded_file field, emit compile error
@@ -996,19 +1166,30 @@ fn generate_validate_body(
             ));
         }
 
-        let mut each_rules = fv.rules.iter().filter_map(|rule| match rule {
-            RuleSpec::Each { rules } => Some(rules.as_slice()),
-            _ => None,
-        });
+        if !distinct_rules.is_empty() && !fv.is_vec {
+            return Err(syn::Error::new(
+                field_ident.span(),
+                "`distinct` can only be used on Vec<T> or Option<Vec<T>> fields",
+            ));
+        }
 
-        if let Some(rules) = each_rules.next() {
+        let each_rules = fv
+            .rules
+            .iter()
+            .filter_map(|rule| match rule {
+                RuleSpec::Each { rules } => Some(rules.as_slice()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        if !each_rules.is_empty() || !distinct_rules.is_empty() {
             if !fv.is_vec {
                 return Err(syn::Error::new(
                     field_ident.span(),
                     "`each(...)` can only be used on Vec<T> or Option<Vec<T>> fields",
                 ));
             }
-            if each_rules.next().is_some() {
+            if each_rules.len() > 1 {
                 return Err(syn::Error::new(
                     field_ident.span(),
                     "only one `each(...)` rule is allowed per field",
@@ -1017,6 +1198,8 @@ fn generate_validate_body(
 
             if !text_rules.is_empty() {
                 let value_expr = collection_validation_value(field_ident, fv.is_option);
+                let field_builder =
+                    field_validation_builder(field_ident, field_name, value_expr, fv.is_option);
                 let rule_chain = generate_rule_chain_from_refs(
                     &text_rules,
                     struct_ident,
@@ -1024,7 +1207,7 @@ fn generate_validate_body(
                     field_ident,
                 )?;
                 stmts.push(quote! {
-                    validator.field(#field_name, #value_expr)
+                    #field_builder
                         #nullable_call
                         #rule_chain
                         .apply()
@@ -1032,8 +1215,15 @@ fn generate_validate_body(
                 });
             }
 
+            let rules = each_rules.first().copied().unwrap_or_default();
             let rule_chain =
                 generate_rule_chain(rules, struct_ident, all_field_names, field_ident)?;
+            let distinct_chain = generate_rule_chain_from_refs(
+                &distinct_rules,
+                struct_ident,
+                all_field_names,
+                field_ident,
+            )?;
 
             let item_value = if let Some(type_path) = app_enum_rule_type(rules) {
                 let key_expr = app_enum_key_string(type_path, quote!((*__item).clone()));
@@ -1054,6 +1244,7 @@ fn generate_validate_body(
                         .map(|__item| #item_value)
                         .collect::<Vec<String>>();
                     validator.each(#field_name, &__values)
+                        #distinct_chain
                         #rule_chain
                         .apply()
                         .await?;
@@ -1074,9 +1265,11 @@ fn generate_validate_body(
                     all_field_names,
                     field_ident,
                 )?;
+                let field_builder =
+                    field_validation_builder(field_ident, field_name, value_expr, fv.is_option);
 
                 stmts.push(quote! {
-                    validator.field(#field_name, #value_expr)
+                    #field_builder
                         #nullable_call
                         #rule_chain
                         .apply()
@@ -1110,9 +1303,11 @@ fn generate_validate_body(
 
             let rule_chain =
                 generate_rule_chain(&fv.rules, struct_ident, all_field_names, field_ident)?;
+            let field_builder =
+                field_validation_builder(field_ident, field_name, value_expr, fv.is_option);
 
             stmts.push(quote! {
-                validator.field(#field_name, #value_expr)
+                #field_builder
                     #nullable_call
                     #rule_chain
                     .apply()
@@ -1224,7 +1419,7 @@ fn generate_file_validation_code(
 fn generate_rule_chain_from_refs(
     rules: &[&RuleSpec],
     struct_ident: &Ident,
-    all_field_names: &[String],
+    all_field_names: &[FieldReference],
     field_ident: &Ident,
 ) -> syn::Result<TokenStream> {
     let owned: Vec<RuleSpec> = rules.iter().cloned().cloned().collect();
@@ -1234,7 +1429,7 @@ fn generate_rule_chain_from_refs(
 fn generate_rule_chain(
     rules: &[RuleSpec],
     struct_ident: &Ident,
-    all_field_names: &[String],
+    all_field_names: &[FieldReference],
     field_ident: &Ident,
 ) -> syn::Result<TokenStream> {
     let mut tokens = Vec::new();
@@ -1284,9 +1479,10 @@ fn generate_rule_chain(
 
 fn generate_simple_rule_call(name: &str) -> syn::Result<TokenStream> {
     match name {
-        "required" | "email" | "numeric" | "alpha" | "alpha_numeric" | "digits" | "url"
-        | "uuid" | "json" | "timezone" | "ip" | "ipv4" | "ipv6" | "date" | "time" | "datetime"
-        | "local_datetime" | "integer" | "nullable" | "bail" => {
+        "required" | "present" | "sometimes" | "prohibited" | "email" | "numeric" | "boolean"
+        | "alpha" | "alpha_numeric" | "digits" | "url" | "uuid" | "json" | "timezone" | "ip"
+        | "ipv4" | "ipv6" | "date" | "time" | "datetime" | "local_datetime" | "integer"
+        | "distinct" | "nullable" | "bail" => {
             let method = syn::Ident::new(name, proc_macro2::Span::call_site());
             Ok(quote!(#method()))
         }
@@ -1302,7 +1498,7 @@ fn generate_parametric_rule_call(
     args: &[syn::Expr],
     message: &Option<String>,
     struct_ident: &Ident,
-    all_field_names: &[String],
+    all_field_names: &[FieldReference],
     _field_ident: &Ident,
 ) -> syn::Result<TokenStream> {
     let with_msg = generate_with_message(message);
@@ -1321,7 +1517,10 @@ fn generate_parametric_rule_call(
         let other_field_name = extract_string_literal(&args[0], name)?;
         let other_field_ident = syn::Ident::new(&other_field_name, args[0].span());
 
-        if !all_field_names.contains(&other_field_name) {
+        let Some(other_field) = all_field_names
+            .iter()
+            .find(|field| field.rust_name == other_field_name)
+        else {
             return Err(syn::Error::new(
                 args[0].span(),
                 format!(
@@ -1329,13 +1528,79 @@ fn generate_parametric_rule_call(
                     other_field_name, name, struct_ident
                 ),
             ));
-        }
+        };
 
+        let other_value = referenced_scalar_value(other_field, &other_field_ident, name)?;
+        let other_wire_name = &other_field.wire_name;
         let method = syn::Ident::new(name, proc_macro2::Span::call_site());
         return Ok(quote!(.#method(
-            #other_field_name,
-            ::std::string::ToString::to_string(&self.#other_field_ident)
+            #other_wire_name,
+            #other_value
         ) #with_msg));
+    }
+
+    if CONDITIONAL_VALUE_RULES.contains(&name) {
+        if args.len() < 2 {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("`{name}` requires a field name and at least one comparison value"),
+            ));
+        }
+        let other_field_name = extract_string_literal(&args[0], name)?;
+        let other_field_ident = syn::Ident::new(&other_field_name, args[0].span());
+        let Some(other_field) = all_field_names
+            .iter()
+            .find(|field| field.rust_name == other_field_name)
+        else {
+            return Err(syn::Error::new(
+                args[0].span(),
+                format!(
+                    "field `{other_field_name}` referenced in `{name}` does not exist on struct `{struct_ident}`"
+                ),
+            ));
+        };
+        let other_value = referenced_scalar_value(other_field, &other_field_ident, name)?;
+        let other_wire_name = &other_field.wire_name;
+        let expected_values = args[1..]
+            .iter()
+            .map(|value| quote!(::std::string::ToString::to_string(&(#value))));
+        let method = syn::Ident::new(name, proc_macro2::Span::call_site());
+        return Ok(quote!(.#method(
+            #other_wire_name,
+            #other_value,
+            vec![#(#expected_values),*]
+        ) #with_msg));
+    }
+
+    if name == "required_with" {
+        if args.is_empty() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`required_with` requires at least one field name",
+            ));
+        }
+        let other_fields = args
+            .iter()
+            .map(|arg| {
+                let other_field_name = extract_string_literal(arg, name)?;
+                let other_field_ident = syn::Ident::new(&other_field_name, arg.span());
+                let Some(other_field) = all_field_names
+                    .iter()
+                    .find(|field| field.rust_name == other_field_name)
+                else {
+                    return Err(syn::Error::new(
+                        arg.span(),
+                        format!(
+                            "field `{other_field_name}` referenced in `{name}` does not exist on struct `{struct_ident}`"
+                        ),
+                    ));
+                };
+                let other_value = referenced_presence_value(other_field, &other_field_ident);
+                let other_wire_name = &other_field.wire_name;
+                Ok(quote!((#other_wire_name, #other_value)))
+            })
+            .collect::<syn::Result<Vec<_>>>()?;
+        return Ok(quote!(.required_with(vec![#(#other_fields),*]) #with_msg));
     }
 
     // Two-string-param rules: unique("table", "col"), exists("table", "col")
@@ -1450,6 +1715,60 @@ fn generate_parametric_rule_call(
     ))
 }
 
+fn referenced_scalar_value(
+    field: &FieldReference,
+    field_ident: &Ident,
+    rule: &str,
+) -> syn::Result<TokenStream> {
+    if field.is_vec || field.is_uploaded_file {
+        return Err(syn::Error::new(
+            field_ident.span(),
+            format!("`{rule}` comparison fields must be scalar values"),
+        ));
+    }
+
+    if field.is_option {
+        Ok(quote! {
+            self.#field_ident
+                .as_ref()
+                .map(::std::string::ToString::to_string)
+                .unwrap_or_default()
+        })
+    } else {
+        Ok(quote!(::std::string::ToString::to_string(&self.#field_ident)))
+    }
+}
+
+fn referenced_presence_value(field: &FieldReference, field_ident: &Ident) -> TokenStream {
+    if field.is_vec {
+        if field.is_option {
+            quote! {
+                self.#field_ident
+                    .as_ref()
+                    .map(|__items| "x".repeat(__items.len()))
+                    .unwrap_or_default()
+            }
+        } else {
+            quote!("x".repeat(self.#field_ident.len()))
+        }
+    } else if field.is_uploaded_file {
+        if field.is_option {
+            quote!(self.#field_ident.as_ref().map(|_| "x").unwrap_or_default())
+        } else {
+            quote!("x")
+        }
+    } else if field.is_option {
+        quote! {
+            self.#field_ident
+                .as_ref()
+                .map(::std::string::ToString::to_string)
+                .unwrap_or_default()
+        }
+    } else {
+        quote!(::std::string::ToString::to_string(&self.#field_ident))
+    }
+}
+
 fn generate_with_message(message: &Option<String>) -> TokenStream {
     match message {
         Some(msg) => quote!(.with_message(#msg)),
@@ -1527,7 +1846,7 @@ fn generate_from_multipart_impl(
 
     for fi in all_fields {
         let ident = &fi.ident;
-        let name = &fi.name;
+        let name = &fi.wire_name;
         let var_name = format_ident!("__val_{}", ident);
 
         if fi.is_vec_uploaded_file {
@@ -1730,6 +2049,19 @@ fn generate_from_multipart_impl(
             }
         }
     };
+    let present_field_names = all_fields
+        .iter()
+        .map(|field| field.wire_name.as_str())
+        .collect::<Vec<_>>();
+    let record_presence = if present_field_names.is_empty() {
+        quote!()
+    } else {
+        quote! {
+            if matches!(__field_name.as_str(), #(#present_field_names)|*) {
+                __present_fields.insert(__field_name.clone());
+            }
+        }
+    };
 
     Ok(quote! {
         #[::foundry::__reexports::async_trait]
@@ -1737,14 +2069,26 @@ fn generate_from_multipart_impl(
             async fn from_multipart(
                 __multipart: &mut axum::extract::Multipart,
             ) -> ::foundry::foundation::Result<Self> {
+                let (__value, _) = Self::from_multipart_with_presence(__multipart).await?;
+                Ok(__value)
+            }
+
+            async fn from_multipart_with_presence(
+                __multipart: &mut axum::extract::Multipart,
+            ) -> ::foundry::foundation::Result<(
+                Self,
+                Option<::std::collections::HashSet<String>>,
+            )> {
                 #(#var_decls)*
                 let mut __upload_counters = ::foundry::storage::UploadCounters::default();
+                let mut __present_fields = ::std::collections::HashSet::new();
 
                 let __parse_result: ::foundry::foundation::Result<()> = async {
                     while let Some(__field) = __multipart.next_field().await
                         .map_err(|e| ::foundry::foundation::Error::message(format!("multipart error: {e}")))?
                     {
                         let __field_name = __field.name().unwrap_or("").to_string();
+                        #record_presence
                         match __field_name.as_str() {
                             #(#match_arms)*
                             _ => {}
@@ -1761,7 +2105,8 @@ fn generate_from_multipart_impl(
                     })
                 })();
 
-                #build_result_handling
+                let __value = (#build_result_handling)?;
+                Ok((__value, Some(__present_fields)))
             }
 
             async fn cleanup_multipart_files(&self) {

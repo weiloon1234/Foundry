@@ -122,7 +122,7 @@ The following are implemented in Foundry but are post-blueprint work and should 
 Fully implemented alongside offset pagination:
 
 - `CursorPagination`, `CursorPaginated<T>`, `CursorMeta`, `CursorInfo`
-- `ModelQuery::cursor_paginate()` and `ProjectionQuery::cursor_paginate()` with encoded cursor tokens
+- `ModelQuery::cursor_paginate()` with opaque versioned `(sort value, primary key)` cursor tokens and deterministic forward/backward ordering
 
 ### Streaming
 

@@ -9,10 +9,13 @@
 ```rust
 struct CliKernel
   fn new(app: AppContext, registrars: Vec<CommandRegistrar>) -> Self
+  fn with_io<I>(self, io: I) -> Self
   fn build_registry(&self) -> Result<CommandRegistry>
   fn app(&self) -> &AppContext
   async fn run(self) -> Result<()>
+  async fn run_status(self) -> Result<CommandExit>
   async fn run_with_args<I, T>(self, args: I) -> Result<()>
+  async fn run_with_args_status<I, T>(self, args: I) -> Result<CommandExit>
 ```
 
 ## foundry::kernel::http

@@ -3,8 +3,10 @@ use async_trait::async_trait;
 use crate::foundation::{AppContext, Result};
 
 use super::{
-    callback, store_database_notification, Notifiable, Notification,
-    NOTIFICATION_BROADCAST_CHANNEL, NOTIFICATION_BROADCAST_EVENT,
+    callback, require_builtin_notification_payload, require_notification_route,
+    store_database_notification, DatabaseNotificationScope, Notifiable, Notification,
+    NOTIFICATION_BROADCAST_CHANNEL, NOTIFICATION_BROADCAST_EVENT, NOTIFY_BROADCAST,
+    NOTIFY_DATABASE, NOTIFY_EMAIL,
 };
 
 /// Adapter trait for notification delivery channels.
@@ -34,12 +36,14 @@ impl NotificationChannel for EmailNotificationChannel {
         notifiable: &dyn Notifiable,
         notification: &dyn Notification,
     ) -> Result<()> {
-        let Some(_email) = callback::route_notification_for(notifiable, "email")? else {
-            return Ok(());
-        };
-        let Some(message) = callback::notification_email(notification, notifiable)? else {
-            return Ok(());
-        };
+        let _email = require_notification_route(
+            callback::route_notification_for(notifiable, NOTIFY_EMAIL.as_ref())?,
+            &NOTIFY_EMAIL,
+        )?;
+        let message = require_builtin_notification_payload(
+            callback::notification_email(notification, notifiable)?,
+            &NOTIFY_EMAIL,
+        )?;
         app.email()?.send(message).await
     }
 }
@@ -56,12 +60,14 @@ impl NotificationChannel for DatabaseNotificationChannel {
         notifiable: &dyn Notifiable,
         notification: &dyn Notification,
     ) -> Result<()> {
-        let Some(data) = callback::notification_database(notification)? else {
-            return Ok(());
-        };
+        let data = require_builtin_notification_payload(
+            callback::notification_database(notification)?,
+            &NOTIFY_DATABASE,
+        )?;
+        let scope = DatabaseNotificationScope::for_notifiable(notifiable)?;
         store_database_notification(
             app,
-            callback::notifiable_id(notifiable)?,
+            &scope,
             callback::notification_type(notification)?,
             data,
         )
@@ -81,9 +87,10 @@ impl NotificationChannel for BroadcastNotificationChannel {
         notifiable: &dyn Notifiable,
         notification: &dyn Notification,
     ) -> Result<()> {
-        let Some(payload) = callback::notification_broadcast(notification)? else {
-            return Ok(());
-        };
+        let payload = require_builtin_notification_payload(
+            callback::notification_broadcast(notification)?,
+            &NOTIFY_BROADCAST,
+        )?;
         let ws = app.websocket()?;
         let room = callback::notifiable_id(notifiable)?;
         ws.publish(

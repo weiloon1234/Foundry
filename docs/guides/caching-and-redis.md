@@ -64,6 +64,10 @@ cache.forget("key").await?;
 cache.flush().await?;
 ```
 
+Redis flush is namespace-safe and O(1): Foundry advances the configured cache
+generation instead of scanning or deleting unrelated Redis keys. Values from
+older generations become unreachable and expire under their existing TTLs.
+
 All values are serialized as JSON. Any type implementing `Serialize + DeserializeOwned` works.
 
 Cache keys must be non-empty and cannot contain control characters. Foundry keeps
@@ -107,6 +111,33 @@ User::model_create()
 
 app.cache()?.forget("dashboard:stats").await?;
 ```
+
+### Cache Tags
+
+Group related entries under one or more tags when invalidating each concrete
+key would duplicate domain knowledge:
+
+```rust
+let users = app.cache()?.tags(["users"]);
+users
+    .put("profile:123", &profile, Duration::from_secs(3600))
+    .await?;
+
+let admins = app.cache()?.tags(["users", "admins"]);
+admins
+    .remember("dashboard", Duration::from_secs(300), || async {
+        load_admin_dashboard().await
+    })
+    .await?;
+
+// Invalidates both tag sets above, but not unrelated or untagged entries.
+app.cache()?.tags(["users"]).flush().await?;
+```
+
+Tag order and duplicates do not change cache identity. Custom `CacheStore`
+implementations remain source-compatible, but must implement
+`get_control_raw` and `put_control_raw` with persistent shared values before
+tag flushing can work on that backend.
 
 ---
 
@@ -212,12 +243,74 @@ conn.publish(&foreign_channel, "ping").await?;
 url = "redis://127.0.0.1/"
 # url = "rediss://default:secret@redis.example.com:6379/"  # TLS Redis / serverless Redis
 # namespace = "my-app"    # auto-derived from app.name:app.environment if not set
+connect_timeout_ms = 5000
+command_timeout_ms = 5000
 ```
 
 Foundry enables Tokio + rustls Redis support, so TLS `rediss://` endpoints work for providers
 that require encrypted Redis connections. `RedisManager` and the internal runtime backend reuse
 multiplexed Redis connections for ordinary commands to avoid connection churn; pub/sub uses its
 own subscription connection.
+
+Connection establishment and every command/pub-sub operation are bounded by
+the configured timeouts. A connection or command-timeout failure invalidates
+the matching cached connection generation, so the next operation reconnects.
+Foundry deliberately does not replay the failed command because a mutating
+command may already have reached Redis before its response was lost.
+
+### Namespace-safe low-level commands
+
+Use the low-level builder for sorted sets, lists, streams, or commands not
+covered by the convenience methods. A command cannot execute until it receives
+at least one typed `RedisKey`; additional keys must also use `.key(...)`:
+
+```rust
+let redis = app.redis()?;
+let mut connection = redis.connection().await?;
+let leaderboard = redis.key("leaderboard:weekly");
+
+let mut add_score = redis.command("ZADD")?.key(&leaderboard);
+add_score.arg(1250).arg("user-42");
+let _: usize = connection.execute_command(&add_score).await?;
+
+let mut rank = redis.command("ZREVRANK")?.key(&leaderboard);
+rank.arg("user-42");
+let rank: Option<usize> = connection.execute_command(&rank).await?;
+```
+
+Prefix arguments cover stream shapes whose first key appears later:
+
+```rust
+let events = redis.key("events:orders");
+let mut read = redis
+    .command("XREAD")?
+    .arg("COUNT")
+    .arg(10)
+    .arg("STREAMS")
+    .key(&events);
+read.arg("0-0");
+// Execute as any type implementing redis::FromRedisValue.
+```
+
+Pipelines and transactions accept only fully built commands. Scripts require a
+typed first key and keep all subsequent keys distinct from ordinary arguments:
+
+```rust
+let counter = redis.key("counter:imports");
+let mut increment = redis.command("INCR")?.key(&counter);
+let mut read = redis.command("GET")?.key(&counter);
+
+let mut transaction = redis.transaction();
+transaction.add_ignored(increment).add(read);
+let values: Vec<i64> = connection.execute_pipeline(&transaction).await?;
+
+let mut script = redis.script(
+    "return redis.call('INCRBY', KEYS[1], ARGV[1])",
+    &counter,
+);
+script.arg(5);
+let total: i64 = connection.execute_script(&script).await?;
+```
 
 ---
 

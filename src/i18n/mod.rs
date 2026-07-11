@@ -46,7 +46,7 @@ type Catalog = HashMap<String, String>;
 /// Manages translation catalogs loaded at startup.
 ///
 /// Scans `{resource_path}/{locale}/*.json`, merges all files per locale into
-/// a single catalog, and provides O(1) translation lookups with a three-tier
+/// a single catalog, and provides translation lookups with a three-tier
 /// fallback chain: requested locale → fallback locale → key itself.
 ///
 /// Thread-safe by design — loaded once, never mutated.
@@ -60,8 +60,8 @@ impl I18nManager {
     /// Load all translation catalogs from the configured resource path.
     ///
     /// Scans `{resource_path}/*/` for locale directories, reads all `*.json`
-    /// files in each, and merges them into per-locale catalogs. Warns on
-    /// duplicate keys (last file wins).
+    /// files in each, and merges them into per-locale catalogs. Locale and file
+    /// traversal is deterministic, and duplicate flattened keys are rejected.
     pub fn load(config: &I18nConfig) -> Result<Self> {
         let resource_path = Path::new(&config.resource_path);
 
@@ -79,37 +79,52 @@ impl I18nManager {
 
         let mut catalogs: HashMap<String, Catalog> = HashMap::new();
 
-        let locale_dirs = fs::read_dir(resource_path)
+        let mut locale_dirs = fs::read_dir(resource_path)
             .map_err(Error::other)?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().is_dir());
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(Error::other)?;
+        locale_dirs.retain(|entry| entry.path().is_dir());
+        locale_dirs.sort_by_key(|entry| entry.file_name());
+
+        let mut locale_paths = HashMap::<String, std::path::PathBuf>::new();
 
         for locale_dir in locale_dirs {
             let locale_name = match locale_dir.file_name().to_str() {
                 Some(name) => name.to_string(),
                 None => continue,
             };
+            register_locale_path(&mut locale_paths, &locale_name, &locale_dir.path())?;
 
             let mut catalog: Catalog = HashMap::new();
+            let mut key_sources = HashMap::new();
 
-            let json_files = fs::read_dir(locale_dir.path())
+            let mut json_files = fs::read_dir(locale_dir.path())
                 .map_err(Error::other)?
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| {
-                    entry
-                        .path()
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .map(|ext| ext.eq_ignore_ascii_case("json"))
-                        .unwrap_or(false)
-                });
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(Error::other)?;
+            json_files.retain(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("json"))
+                    .unwrap_or(false)
+            });
+            json_files.sort_by_key(|entry| entry.file_name());
 
             for json_file in json_files {
-                let content = fs::read_to_string(json_file.path()).map_err(Error::other)?;
+                let path = json_file.path();
+                let content = fs::read_to_string(&path).map_err(Error::other)?;
                 let value: Value = serde_json::from_str(&content).map_err(Error::other)?;
 
                 if let Value::Object(map) = value {
-                    merge_json_into_catalog(&mut catalog, &map, &locale_name);
+                    merge_json_into_catalog(
+                        &mut catalog,
+                        &mut key_sources,
+                        &map,
+                        &locale_name,
+                        &path,
+                    )?;
                 }
             }
 
@@ -123,7 +138,8 @@ impl I18nManager {
             }
         }
 
-        let loaded_locales: Vec<&str> = catalogs.keys().map(|s| s.as_str()).collect();
+        let mut loaded_locales: Vec<&str> = catalogs.keys().map(String::as_str).collect();
+        loaded_locales.sort_unstable();
         tracing::info!("foundry: i18n loaded locales: {:?}", loaded_locales);
 
         Ok(Self {
@@ -141,12 +157,10 @@ impl I18nManager {
     /// 3. `key` itself (the English string is the key)
     pub fn translate(&self, locale: &str, key: &str, values: &[(&str, &str)]) -> String {
         let template = self
-            .catalogs
-            .get(locale)
+            .catalog(locale)
             .and_then(|cat| cat.get(key))
             .or_else(|| {
-                self.catalogs
-                    .get(&self.fallback_locale)
+                self.catalog(&self.fallback_locale)
                     .and_then(|cat| cat.get(key))
             })
             .map(|s| s.as_str())
@@ -166,8 +180,8 @@ impl I18nManager {
     pub fn resolve_locale(&self, accept_language: &str) -> String {
         for tag in parse_accept_language(accept_language) {
             if tag == "*" {
-                if self.has_locale(&self.default_locale) {
-                    return self.default_locale.clone();
+                if let Some(locale) = self.canonical_locale(&self.default_locale) {
+                    return locale.to_string();
                 }
                 continue;
             }
@@ -175,7 +189,9 @@ impl I18nManager {
                 return locale;
             }
         }
-        self.default_locale.clone()
+        self.canonical_locale(&self.default_locale)
+            .unwrap_or(&self.default_locale)
+            .to_string()
     }
 
     /// The configured default locale.
@@ -185,18 +201,18 @@ impl I18nManager {
 
     /// Whether a catalog exists for the given locale.
     pub fn has_locale(&self, locale: &str) -> bool {
-        self.catalogs.contains_key(locale)
+        self.canonical_locale(locale).is_some()
     }
 
     fn match_locale(&self, tag: &str) -> Option<String> {
-        if self.has_locale(tag) {
-            return Some(tag.to_string());
+        if let Some(locale) = self.canonical_locale(tag) {
+            return Some(locale.to_string());
         }
 
         let mut candidate = tag;
         while let Some((base, _rest)) = candidate.rsplit_once('-') {
-            if self.has_locale(base) {
-                return Some(base.to_string());
+            if let Some(locale) = self.canonical_locale(base) {
+                return Some(locale.to_string());
             }
             candidate = base;
         }
@@ -206,7 +222,21 @@ impl I18nManager {
 
     /// List of all loaded locale names.
     pub fn locale_list(&self) -> Vec<&str> {
-        self.catalogs.keys().map(|s| s.as_str()).collect()
+        let mut locales = self.catalogs.keys().map(String::as_str).collect::<Vec<_>>();
+        locales.sort_unstable();
+        locales
+    }
+
+    fn catalog(&self, locale: &str) -> Option<&Catalog> {
+        self.canonical_locale(locale)
+            .and_then(|canonical| self.catalogs.get(canonical))
+    }
+
+    fn canonical_locale(&self, locale: &str) -> Option<&str> {
+        self.catalogs
+            .keys()
+            .find(|loaded| loaded.eq_ignore_ascii_case(locale))
+            .map(String::as_str)
     }
 }
 
@@ -217,6 +247,23 @@ impl I18nManager {
 #[derive(Clone, Debug)]
 pub struct Locale(pub String);
 
+fn register_locale_path(
+    locale_paths: &mut HashMap<String, std::path::PathBuf>,
+    locale: &str,
+    path: &Path,
+) -> Result<()> {
+    let normalized_locale = locale.to_ascii_lowercase();
+    if let Some(existing_path) = locale_paths.get(&normalized_locale) {
+        return Err(Error::message(format!(
+            "i18n locale directories `{}` and `{}` differ only by case",
+            existing_path.display(),
+            path.display()
+        )));
+    }
+    locale_paths.insert(normalized_locale, path.to_path_buf());
+    Ok(())
+}
+
 /// Merge a JSON object (potentially nested) into a flat catalog.
 ///
 /// Nested keys are flattened by joining with `.`:
@@ -225,58 +272,67 @@ pub struct Locale(pub String);
 /// Top-level string values are merged directly. Non-string leaf values are skipped.
 fn merge_json_into_catalog(
     catalog: &mut Catalog,
+    key_sources: &mut HashMap<String, std::path::PathBuf>,
     map: &serde_json::Map<String, Value>,
     locale: &str,
-) {
+    source: &Path,
+) -> Result<()> {
     for (key, value) in map {
         match value {
             Value::String(s) => {
-                if let Some(existing) = catalog.get(key) {
-                    tracing::warn!(
-                        "foundry: i18n duplicate key '{}' in locale '{}', overwriting '{}' with '{}'",
-                        key,
-                        locale,
-                        existing,
-                        s
-                    );
-                }
-                catalog.insert(key.clone(), s.clone());
+                insert_catalog_value(catalog, key_sources, key, s, locale, source)?;
             }
             Value::Object(nested) => {
-                merge_json_nested(catalog, nested, key, locale);
+                merge_json_nested(catalog, key_sources, nested, key, locale, source)?;
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 fn merge_json_nested(
     catalog: &mut Catalog,
+    key_sources: &mut HashMap<String, std::path::PathBuf>,
     map: &serde_json::Map<String, Value>,
     prefix: &str,
     locale: &str,
-) {
+    source: &Path,
+) -> Result<()> {
     for (key, value) in map {
         let full_key = format!("{}.{}", prefix, key);
         match value {
             Value::String(s) => {
-                if let Some(existing) = catalog.get(&full_key) {
-                    tracing::warn!(
-                        "foundry: i18n duplicate key '{}' in locale '{}', overwriting '{}' with '{}'",
-                        full_key,
-                        locale,
-                        existing,
-                        s
-                    );
-                }
-                catalog.insert(full_key, s.clone());
+                insert_catalog_value(catalog, key_sources, &full_key, s, locale, source)?;
             }
             Value::Object(deeper) => {
-                merge_json_nested(catalog, deeper, &full_key, locale);
+                merge_json_nested(catalog, key_sources, deeper, &full_key, locale, source)?;
             }
             _ => {}
         }
     }
+    Ok(())
+}
+
+fn insert_catalog_value(
+    catalog: &mut Catalog,
+    key_sources: &mut HashMap<String, std::path::PathBuf>,
+    key: &str,
+    value: &str,
+    locale: &str,
+    source: &Path,
+) -> Result<()> {
+    if let Some(existing_source) = key_sources.get(key) {
+        return Err(Error::message(format!(
+            "duplicate i18n key `{key}` for locale `{locale}` in `{}` and `{}`",
+            existing_source.display(),
+            source.display()
+        )));
+    }
+
+    key_sources.insert(key.to_string(), source.to_path_buf());
+    catalog.insert(key.to_string(), value.to_string());
+    Ok(())
 }
 
 /// Replace `{{var}}` placeholders with values.
@@ -401,6 +457,76 @@ mod tests {
 
         assert_eq!(manager.translate("en", "Hello", &[]), "Hello");
         assert_eq!(manager.translate("ms", "Hello", &[]), "Helo");
+    }
+
+    #[test]
+    fn locale_lookup_is_case_insensitive_and_preserves_canonical_name() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("en")).unwrap();
+        fs::write(dir.path().join("en/common.json"), r#"{ "Hello": "Hello" }"#).unwrap();
+        fs::create_dir(dir.path().join("pt-BR")).unwrap();
+        fs::write(
+            dir.path().join("pt-BR/common.json"),
+            r#"{ "Hello": "Olá" }"#,
+        )
+        .unwrap();
+
+        let manager = I18nManager::load(&make_config(&dir)).unwrap();
+
+        assert!(manager.has_locale("PT-br"));
+        assert_eq!(manager.translate("pT-Br", "Hello", &[]), "Olá");
+        assert_eq!(manager.resolve_locale("PT-br"), "pt-BR");
+        assert_eq!(manager.resolve_locale("PT-BR-x-private"), "pt-BR");
+    }
+
+    #[test]
+    fn locale_list_is_deterministic() {
+        let dir = tempdir().unwrap();
+        for locale in ["zh-CN", "en", "ms"] {
+            fs::create_dir(dir.path().join(locale)).unwrap();
+            fs::write(
+                dir.path().join(locale).join("common.json"),
+                format!(r#"{{ "locale": "{locale}" }}"#),
+            )
+            .unwrap();
+        }
+
+        let manager = I18nManager::load(&make_config(&dir)).unwrap();
+
+        assert_eq!(manager.locale_list(), vec!["en", "ms", "zh-CN"]);
+    }
+
+    #[test]
+    fn case_only_duplicate_locale_names_are_rejected() {
+        let mut locale_paths = HashMap::new();
+        register_locale_path(&mut locale_paths, "en-US", Path::new("/locales/en-US")).unwrap();
+
+        let error = register_locale_path(&mut locale_paths, "EN-us", Path::new("/locales/EN-us"))
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("differ only by case"));
+        assert!(message.contains("/locales/en-US"));
+        assert!(message.contains("/locales/EN-us"));
+    }
+
+    #[test]
+    fn duplicate_catalog_keys_report_sorted_source_files() {
+        let dir = tempdir().unwrap();
+        let locale_dir = dir.path().join("en");
+        fs::create_dir(&locale_dir).unwrap();
+        fs::write(locale_dir.join("b.json"), r#"{ "Duplicate": "second" }"#).unwrap();
+        fs::write(locale_dir.join("a.json"), r#"{ "Duplicate": "first" }"#).unwrap();
+
+        let error = I18nManager::load(&make_config(&dir))
+            .err()
+            .expect("duplicate catalog key should fail loading");
+        let message = error.to_string();
+
+        assert!(message.contains("duplicate i18n key `Duplicate`"));
+        let first = message.find("a.json").unwrap();
+        let second = message.find("b.json").unwrap();
+        assert!(first < second, "unexpected duplicate diagnostic: {message}");
     }
 
     #[test]

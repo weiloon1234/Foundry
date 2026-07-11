@@ -1,4 +1,4 @@
-.PHONY: fmt fmt-check test test-postgres fixture-check clippy package-check verify verify-release api-docs
+.PHONY: fmt fmt-check test test-postgres fixture-check clippy package-check verify verify-release api-docs build-metrics
 
 fmt:
 	cargo fmt
@@ -10,7 +10,8 @@ test:
 	cargo test --all-targets
 
 test-postgres:
-	cargo test --test database_acceptance
+	@test -n "$$FOUNDRY_TEST_POSTGRES_URL" || (echo "FOUNDRY_TEST_POSTGRES_URL must point to a disposable PostgreSQL database" >&2; exit 2)
+	cargo test --all-targets
 
 fixture-check:
 	cargo test --test blueprint_fixture_acceptance
@@ -44,3 +45,6 @@ verify-release: verify package-check
 api-docs:
 	cargo doc --no-deps
 	cargo run --manifest-path tools/foundry-api-doc/Cargo.toml -- --output-dir docs/api
+
+build-metrics:
+	bash tools/build-metrics.sh

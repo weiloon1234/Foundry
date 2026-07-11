@@ -196,6 +196,9 @@ impl Actor {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct TestActorOverride(pub(crate) Actor);
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthErrorCode {
@@ -405,6 +408,18 @@ pub trait BearerAuthenticator: Send + Sync + 'static {
     async fn authenticate(&self, token: &str) -> Result<Option<Actor>>;
 }
 
+/// Restores the current authorization state for an authenticated actor identity.
+///
+/// Hydrators are registered per guard. The returned actor is authoritative and
+/// must retain the credential actor's ID and guard; identity drift rejects the
+/// credential. Returning `None` also rejects the credential, which is useful
+/// when the actor was deleted, disabled, or otherwise can no longer authenticate.
+/// MFA-pending credentials remain restricted and do not invoke the hydrator.
+#[async_trait]
+pub trait ActorHydrator: Send + Sync + 'static {
+    async fn hydrate(&self, actor: &Actor, app: &AppContext) -> Result<Option<Actor>>;
+}
+
 #[async_trait]
 pub trait Policy: Send + Sync + 'static {
     async fn evaluate(&self, actor: &Actor, app: &AppContext) -> Result<bool>;
@@ -495,12 +510,25 @@ where
 pub(crate) type GuardRegistryHandle = Arc<Mutex<GuardRegistryBuilder>>;
 pub(crate) type PolicyRegistryHandle = Arc<Mutex<PolicyRegistryBuilder>>;
 pub(crate) type AuthenticatableRegistryHandle = Arc<Mutex<AuthenticatableRegistryBuilder>>;
+pub(crate) type ActorHydratorRegistryHandle = Arc<Mutex<ActorHydratorRegistryBuilder>>;
+
+#[async_trait]
+pub(crate) trait SessionCredentialAuthenticator: Send + Sync + 'static {
+    fn extract_session_id(&self, headers: &HeaderMap) -> Option<String>;
+
+    async fn authenticate_session(
+        &self,
+        session_id: &str,
+        extend_sliding_expiry: bool,
+    ) -> Result<Option<Actor>>;
+}
 
 /// Internal enum distinguishing bearer (token) from session (cookie) guard drivers.
 #[derive(Clone)]
 pub(crate) enum GuardAuthenticator {
     Bearer(Arc<dyn BearerAuthenticator>),
-    Session(Arc<session::SessionManager>),
+    Token(Arc<token::TokenManager>),
+    Session(Arc<dyn SessionCredentialAuthenticator>),
 }
 
 #[derive(Default)]
@@ -553,6 +581,24 @@ impl GuardRegistryBuilder {
         Ok(())
     }
 
+    pub(crate) fn register_token<I>(
+        &mut self,
+        id: I,
+        manager: Arc<token::TokenManager>,
+    ) -> Result<()>
+    where
+        I: Into<GuardId>,
+    {
+        let id = id.into();
+        if self.guards.contains_key(&id) {
+            return Err(Error::message(format!(
+                "auth guard `{id}` already registered"
+            )));
+        }
+        self.guards.insert(id, GuardAuthenticator::Token(manager));
+        Ok(())
+    }
+
     pub(crate) fn freeze_shared(
         handle: GuardRegistryHandle,
     ) -> HashMap<GuardId, GuardAuthenticator> {
@@ -590,6 +636,82 @@ impl PolicyRegistryBuilder {
     ) -> HashMap<PolicyId, Arc<dyn Policy>> {
         let mut builder = lock_unpoisoned(&handle, "policy registry");
         std::mem::take(&mut builder.policies)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ActorHydratorRegistryBuilder {
+    hydrators: HashMap<GuardId, Arc<dyn ActorHydrator>>,
+}
+
+impl ActorHydratorRegistryBuilder {
+    pub(crate) fn shared() -> ActorHydratorRegistryHandle {
+        Arc::new(Mutex::new(Self::default()))
+    }
+
+    pub(crate) fn register_arc<I>(
+        &mut self,
+        guard: I,
+        hydrator: Arc<dyn ActorHydrator>,
+    ) -> Result<()>
+    where
+        I: Into<GuardId>,
+    {
+        let guard = guard.into();
+        if self.hydrators.contains_key(&guard) {
+            return Err(Error::message(format!(
+                "actor hydrator for guard `{guard}` already registered"
+            )));
+        }
+        self.hydrators.insert(guard, hydrator);
+        Ok(())
+    }
+
+    pub(crate) fn freeze_shared(handle: ActorHydratorRegistryHandle) -> ActorHydratorRegistry {
+        let mut builder = lock_unpoisoned(&handle, "actor hydrator registry");
+        ActorHydratorRegistry {
+            hydrators: std::mem::take(&mut builder.hydrators),
+        }
+    }
+}
+
+pub(crate) struct ActorHydratorRegistry {
+    hydrators: HashMap<GuardId, Arc<dyn ActorHydrator>>,
+}
+
+impl ActorHydratorRegistry {
+    pub(crate) async fn hydrate(
+        &self,
+        credential_actor: Actor,
+        app: &AppContext,
+    ) -> Result<Option<Actor>> {
+        if token::actor_has_mfa_pending(&credential_actor) {
+            return Ok(Some(credential_actor));
+        }
+
+        let Some(hydrator) = self.hydrators.get(&credential_actor.guard).cloned() else {
+            return Ok(Some(credential_actor));
+        };
+
+        let guard = credential_actor.guard.clone();
+        let Some(hydrated) = run_actor_hydrator(&guard, hydrator, &credential_actor, app).await?
+        else {
+            return Ok(None);
+        };
+
+        if hydrated.id != credential_actor.id || hydrated.guard != credential_actor.guard {
+            tracing::warn!(
+                target: "foundry.auth",
+                credential_actor_id = %credential_actor.id,
+                credential_guard = %credential_actor.guard,
+                hydrated_actor_id = %hydrated.id,
+                hydrated_guard = %hydrated.guard,
+                "actor hydrator returned a different identity"
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(hydrated))
     }
 }
 
@@ -678,15 +800,24 @@ impl AuthenticatableRegistry {
 
 #[derive(Clone)]
 pub struct AuthManager {
+    app: AppContext,
     config: AuthConfig,
     guards: Arc<HashMap<GuardId, GuardAuthenticator>>,
+    actor_hydrators: Arc<ActorHydratorRegistry>,
 }
 
 impl AuthManager {
-    pub(crate) fn new(config: AuthConfig, guards: HashMap<GuardId, GuardAuthenticator>) -> Self {
+    pub(crate) fn new(
+        app: AppContext,
+        config: AuthConfig,
+        guards: HashMap<GuardId, GuardAuthenticator>,
+        actor_hydrators: Arc<ActorHydratorRegistry>,
+    ) -> Self {
         Self {
+            app,
             config,
             guards: Arc::new(guards),
+            actor_hydrators,
         }
     }
 
@@ -714,25 +845,19 @@ impl AuthManager {
         };
 
         match authenticator {
-            GuardAuthenticator::Bearer(bearer) => {
-                let token = self.extract_token(headers)?;
-                let actor = run_bearer_authenticator(&guard_id, bearer, &token)
-                    .await?
+            GuardAuthenticator::Session(session_authenticator) => {
+                let session_id = session_authenticator
+                    .extract_session_id(headers)
                     .ok_or_else(|| {
-                        AuthError::unauthorized_code(AuthErrorCode::InvalidBearerToken)
+                        AuthError::unauthorized_code(AuthErrorCode::MissingSessionCookie)
                     })?;
-                validate_actor_guard(actor, &guard_id, AuthErrorCode::InvalidBearerToken)
-            }
-            GuardAuthenticator::Session(session_manager) => {
-                let session_id = session_manager.extract_session_id(headers).ok_or_else(|| {
-                    AuthError::unauthorized_code(AuthErrorCode::MissingSessionCookie)
-                })?;
-                let actor = session_manager
-                    .validate(&session_id)
+                self.authenticate_session_id(&session_id, &guard_id, true)
                     .await
-                    .map_err(|error| AuthError::internal(error.to_string()))?
-                    .ok_or_else(|| AuthError::unauthorized_code(AuthErrorCode::InvalidSession))?;
-                validate_actor_guard(actor, &guard_id, AuthErrorCode::InvalidSession)
+            }
+            bearer_authenticator => {
+                let token = self.extract_token(headers)?;
+                self.authenticate_bearer_credential(bearer_authenticator, &token, &guard_id)
+                    .await
             }
         }
     }
@@ -751,19 +876,88 @@ impl AuthManager {
             )));
         };
 
+        self.authenticate_bearer_credential(authenticator, token, &guard_id)
+            .await
+    }
+
+    async fn authenticate_bearer_credential(
+        &self,
+        authenticator: GuardAuthenticator,
+        token: &str,
+        guard_id: &GuardId,
+    ) -> std::result::Result<Actor, AuthError> {
         match authenticator {
             GuardAuthenticator::Bearer(bearer) => {
-                let Some(actor) = run_bearer_authenticator(&guard_id, bearer, token).await? else {
+                let Some(actor) = run_bearer_authenticator(guard_id, bearer, token).await? else {
                     return Err(AuthError::unauthorized_code(
                         AuthErrorCode::InvalidBearerToken,
                     ));
                 };
-                validate_actor_guard(actor, &guard_id, AuthErrorCode::InvalidBearerToken)
+                self.hydrate_authenticated_actor(
+                    actor,
+                    guard_id,
+                    AuthErrorCode::InvalidBearerToken,
+                )
+                .await
+            }
+            GuardAuthenticator::Token(token_manager) => {
+                let actor = token_manager
+                    .validate(token)
+                    .await
+                    .map_err(|error| AuthError::internal(error.to_string()))?
+                    .ok_or_else(|| {
+                        AuthError::unauthorized_code(AuthErrorCode::InvalidBearerToken)
+                    })?;
+                validate_actor_guard(actor, guard_id, AuthErrorCode::InvalidBearerToken)
             }
             GuardAuthenticator::Session(_) => Err(AuthError::internal(format!(
                 "guard `{guard_id}` uses session authentication; use a bearer token guard or authenticate via cookies instead"
             ))),
         }
+    }
+
+    pub(crate) async fn authenticate_session_id(
+        &self,
+        session_id: &str,
+        guard_id: &GuardId,
+        extend_sliding_expiry: bool,
+    ) -> std::result::Result<Actor, AuthError> {
+        let Some(authenticator) = self.guards.get(guard_id).cloned() else {
+            return Err(AuthError::internal(format!(
+                "auth guard `{guard_id}` is not registered"
+            )));
+        };
+        let GuardAuthenticator::Session(session_authenticator) = authenticator else {
+            return Err(AuthError::internal(format!(
+                "guard `{guard_id}` does not use session authentication"
+            )));
+        };
+
+        let actor = session_authenticator
+            .authenticate_session(session_id, extend_sliding_expiry)
+            .await
+            .map_err(|error| AuthError::internal(error.to_string()))?
+            .ok_or_else(|| AuthError::unauthorized_code(AuthErrorCode::InvalidSession))?;
+
+        self.hydrate_authenticated_actor(actor, guard_id, AuthErrorCode::InvalidSession)
+            .await
+    }
+
+    async fn hydrate_authenticated_actor(
+        &self,
+        actor: Actor,
+        expected_guard: &GuardId,
+        invalid_credential_code: AuthErrorCode,
+    ) -> std::result::Result<Actor, AuthError> {
+        let actor = validate_actor_guard(actor, expected_guard, invalid_credential_code)?;
+        let actor = self
+            .actor_hydrators
+            .hydrate(actor, &self.app)
+            .await
+            .map_err(|error| AuthError::internal(error.to_string()))?
+            .ok_or_else(|| AuthError::unauthorized_code(invalid_credential_code))?;
+
+        validate_actor_guard(actor, expected_guard, invalid_credential_code)
     }
 
     pub fn extract_token(&self, headers: &HeaderMap) -> std::result::Result<String, AuthError> {
@@ -872,6 +1066,18 @@ async fn run_bearer_authenticator(
     }
 }
 
+async fn run_actor_hydrator(
+    guard: &GuardId,
+    hydrator: Arc<dyn ActorHydrator>,
+    actor: &Actor,
+    app: &AppContext,
+) -> Result<Option<Actor>> {
+    match catch_async_panic(|| hydrator.hydrate(actor, app)).await {
+        Ok(result) => result,
+        Err(panic) => Err(auth_hydrator_panic_error(guard, panic)),
+    }
+}
+
 async fn run_policy_evaluator(
     policy: &PolicyId,
     policy_handler: Arc<dyn Policy>,
@@ -893,6 +1099,19 @@ fn auth_guard_panic_error(guard: &GuardId, panic: Box<dyn Any + Send>) -> AuthEr
         "auth guard panicked"
     );
     AuthError::internal(format!("auth guard `{guard}` panicked: {message}"))
+}
+
+fn auth_hydrator_panic_error(guard: &GuardId, panic: Box<dyn Any + Send>) -> Error {
+    let message = panic_payload_message(panic);
+    tracing::error!(
+        target: "foundry.auth",
+        guard = %guard,
+        panic = %message,
+        "actor hydrator panicked"
+    );
+    Error::message(format!(
+        "actor hydrator for guard `{guard}` panicked: {message}"
+    ))
 }
 
 fn auth_policy_panic_error(policy: &PolicyId, panic: Box<dyn Any + Send>) -> Error {
@@ -1063,6 +1282,7 @@ pub type Auth<M> = AuthenticatedModel<M>;
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -1071,8 +1291,9 @@ mod tests {
     use axum::response::IntoResponse;
 
     use super::{
-        Actor, AuthConfig, AuthErrorCode, AuthManager, AuthenticatableRegistryBuilder, Authorizer,
-        GuardRegistryBuilder, PermissionId, PolicyRegistryBuilder, StaticBearerAuthenticator,
+        Actor, ActorHydratorRegistryBuilder, AuthConfig, AuthErrorCode, AuthManager,
+        AuthenticatableRegistryBuilder, Authorizer, GuardAuthenticator, GuardRegistryBuilder,
+        PermissionId, PolicyRegistryBuilder, StaticBearerAuthenticator,
     };
     use crate::config::ConfigRepository;
     use crate::database::{
@@ -1109,6 +1330,57 @@ mod tests {
         }
     }
 
+    struct CurrentActorHydrator {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl super::ActorHydrator for CurrentActorHydrator {
+        async fn hydrate(&self, actor: &Actor, _app: &AppContext) -> crate::Result<Option<Actor>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(
+                Actor::new(actor.id.clone(), actor.guard.clone())
+                    .with_roles([RoleId::new("current-role")])
+                    .with_permissions([PermissionId::new("current:permission")]),
+            ))
+        }
+    }
+
+    struct DriftingActorHydrator;
+
+    #[async_trait]
+    impl super::ActorHydrator for DriftingActorHydrator {
+        async fn hydrate(&self, actor: &Actor, _app: &AppContext) -> crate::Result<Option<Actor>> {
+            Ok(Some(Actor::new(
+                actor.id.clone(),
+                GuardId::new("different-guard"),
+            )))
+        }
+    }
+
+    struct StaticSessionCredentialAuthenticator {
+        actor: Actor,
+    }
+
+    #[async_trait]
+    impl super::SessionCredentialAuthenticator for StaticSessionCredentialAuthenticator {
+        fn extract_session_id(&self, headers: &HeaderMap) -> Option<String> {
+            headers
+                .get(header::COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| *value == "foundry_session=session-1")
+                .map(|_| "session-1".to_string())
+        }
+
+        async fn authenticate_session(
+            &self,
+            session_id: &str,
+            _extend_sliding_expiry: bool,
+        ) -> crate::Result<Option<Actor>> {
+            Ok((session_id == "session-1").then(|| self.actor.clone()))
+        }
+    }
+
     fn app() -> AppContext {
         AppContext::new(
             Container::new(),
@@ -1116,6 +1388,27 @@ mod tests {
             RuleRegistry::new(),
         )
         .unwrap()
+    }
+
+    fn auth_manager(
+        config: AuthConfig,
+        guards: HashMap<GuardId, GuardAuthenticator>,
+    ) -> AuthManager {
+        auth_manager_with_hydrators(
+            config,
+            guards,
+            Arc::new(ActorHydratorRegistryBuilder::freeze_shared(
+                ActorHydratorRegistryBuilder::shared(),
+            )),
+        )
+    }
+
+    fn auth_manager_with_hydrators(
+        config: AuthConfig,
+        guards: HashMap<GuardId, GuardAuthenticator>,
+        actor_hydrators: Arc<super::ActorHydratorRegistry>,
+    ) -> AuthManager {
+        AuthManager::new(app(), config, guards, actor_hydrators)
     }
 
     #[test]
@@ -1158,10 +1451,210 @@ mod tests {
         assert!(error.to_string().contains("already registered"));
     }
 
+    #[test]
+    fn rejects_duplicate_actor_hydrator_registration() {
+        let hydrators = ActorHydratorRegistryBuilder::shared();
+        let calls = Arc::new(AtomicUsize::new(0));
+        hydrators
+            .lock()
+            .unwrap()
+            .register_arc(
+                GuardId::new("api"),
+                Arc::new(CurrentActorHydrator {
+                    calls: calls.clone(),
+                }),
+            )
+            .unwrap();
+
+        let error = hydrators
+            .lock()
+            .unwrap()
+            .register_arc(
+                GuardId::new("api"),
+                Arc::new(CurrentActorHydrator { calls }),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already registered"));
+    }
+
+    #[tokio::test]
+    async fn bearer_authentication_uses_the_hydrator_as_current_actor_state() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hydrators = ActorHydratorRegistryBuilder::shared();
+        hydrators
+            .lock()
+            .unwrap()
+            .register_arc(
+                GuardId::new("api"),
+                Arc::new(CurrentActorHydrator {
+                    calls: calls.clone(),
+                }),
+            )
+            .unwrap();
+        let manager = auth_manager_with_hydrators(
+            AuthConfig::default(),
+            HashMap::from([(
+                GuardId::new("api"),
+                GuardAuthenticator::Bearer(Arc::new(
+                    StaticBearerAuthenticator::new().token(
+                        "token-1",
+                        Actor::new("user-1", GuardId::new("api"))
+                            .with_permissions([PermissionId::new("token:scope")]),
+                    ),
+                )),
+            )]),
+            Arc::new(ActorHydratorRegistryBuilder::freeze_shared(hydrators)),
+        );
+
+        let actor = manager.authenticate_token("token-1", None).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(actor.has_role(RoleId::new("current-role")));
+        assert!(actor.has_permission(PermissionId::new("current:permission")));
+        assert!(!actor.has_permission(PermissionId::new("token:scope")));
+    }
+
+    #[tokio::test]
+    async fn session_authentication_uses_the_guard_actor_hydrator() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hydrators = ActorHydratorRegistryBuilder::shared();
+        hydrators
+            .lock()
+            .unwrap()
+            .register_arc(
+                GuardId::new("web"),
+                Arc::new(CurrentActorHydrator {
+                    calls: calls.clone(),
+                }),
+            )
+            .unwrap();
+        let manager = auth_manager_with_hydrators(
+            AuthConfig {
+                default_guard: GuardId::new("web"),
+                ..AuthConfig::default()
+            },
+            HashMap::from([(
+                GuardId::new("web"),
+                GuardAuthenticator::Session(Arc::new(StaticSessionCredentialAuthenticator {
+                    actor: Actor::new("user-1", GuardId::new("web")),
+                })),
+            )]),
+            Arc::new(ActorHydratorRegistryBuilder::freeze_shared(hydrators)),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "foundry_session=session-1".parse().unwrap());
+
+        let actor = manager.authenticate_headers(&headers, None).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(actor.has_role(RoleId::new("current-role")));
+        assert!(actor.has_permission(PermissionId::new("current:permission")));
+    }
+
+    #[tokio::test]
+    async fn mfa_pending_actor_remains_restricted_and_skips_full_hydration() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hydrators = ActorHydratorRegistryBuilder::shared();
+        hydrators
+            .lock()
+            .unwrap()
+            .register_arc(
+                GuardId::new("api"),
+                Arc::new(CurrentActorHydrator {
+                    calls: calls.clone(),
+                }),
+            )
+            .unwrap();
+        let pending = Actor::new("user-1", GuardId::new("api"))
+            .with_permissions([PermissionId::new(crate::auth::token::MFA_PENDING_ABILITY)]);
+        let manager = auth_manager_with_hydrators(
+            AuthConfig::default(),
+            HashMap::from([(
+                GuardId::new("api"),
+                GuardAuthenticator::Bearer(Arc::new(
+                    StaticBearerAuthenticator::new().token("pending-token", pending),
+                )),
+            )]),
+            Arc::new(ActorHydratorRegistryBuilder::freeze_shared(hydrators)),
+        );
+
+        let actor = manager
+            .authenticate_token("pending-token", None)
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(crate::auth::token::actor_has_mfa_pending(&actor));
+        assert!(!actor.has_permission(PermissionId::new("current:permission")));
+    }
+
+    #[tokio::test]
+    async fn bearer_authentication_rejects_hydrator_guard_drift() {
+        let hydrators = ActorHydratorRegistryBuilder::shared();
+        hydrators
+            .lock()
+            .unwrap()
+            .register_arc(GuardId::new("api"), Arc::new(DriftingActorHydrator))
+            .unwrap();
+        let manager = auth_manager_with_hydrators(
+            AuthConfig::default(),
+            HashMap::from([(
+                GuardId::new("api"),
+                GuardAuthenticator::Bearer(Arc::new(
+                    StaticBearerAuthenticator::new()
+                        .token("token-1", Actor::new("user-1", GuardId::new("api"))),
+                )),
+            )]),
+            Arc::new(ActorHydratorRegistryBuilder::freeze_shared(hydrators)),
+        );
+
+        let error = manager
+            .authenticate_token("token-1", None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code(), Some(AuthErrorCode::InvalidBearerToken));
+    }
+
+    #[tokio::test]
+    async fn session_authentication_rejects_hydrator_guard_drift() {
+        let hydrators = ActorHydratorRegistryBuilder::shared();
+        hydrators
+            .lock()
+            .unwrap()
+            .register_arc(GuardId::new("web"), Arc::new(DriftingActorHydrator))
+            .unwrap();
+        let manager = auth_manager_with_hydrators(
+            AuthConfig {
+                default_guard: GuardId::new("web"),
+                ..AuthConfig::default()
+            },
+            HashMap::from([(
+                GuardId::new("web"),
+                GuardAuthenticator::Session(Arc::new(StaticSessionCredentialAuthenticator {
+                    actor: Actor::new("user-1", GuardId::new("web")),
+                })),
+            )]),
+            Arc::new(ActorHydratorRegistryBuilder::freeze_shared(hydrators)),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "foundry_session=session-1".parse().unwrap());
+
+        let error = manager
+            .authenticate_headers(&headers, None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code(), Some(AuthErrorCode::InvalidSession));
+    }
+
     #[tokio::test]
     async fn uses_default_guard_and_parses_bearer_header() {
         let actor = Actor::new("user-1", GuardId::new("api"));
-        let manager = AuthManager::new(
+        let manager = auth_manager(
             AuthConfig::default(),
             HashMap::from([(
                 GuardId::new("api"),
@@ -1181,7 +1674,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_authentication_rejects_actor_guard_mismatch() {
-        let manager = AuthManager::new(
+        let manager = auth_manager(
             AuthConfig::default(),
             HashMap::from([(
                 GuardId::new("admin"),
@@ -1216,7 +1709,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_authenticator_panic_becomes_internal_auth_error() {
-        let manager = AuthManager::new(
+        let manager = auth_manager(
             AuthConfig::default(),
             HashMap::from([(
                 GuardId::new("api"),

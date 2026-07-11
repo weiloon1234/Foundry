@@ -198,6 +198,9 @@ async fn doctor_command(invocation: CommandInvocation) -> Result<()> {
 async fn run_doctor(app: &AppContext, deploy: bool, strict: bool) -> DoctorReport {
     let mut report = DoctorReport::new(deploy, strict);
     report.push(check_app_config(app));
+    report.push(check_security_tier(app));
+    report.push(check_config_keys(app));
+    report.push(check_legacy_env_overlays(app));
     report.push(check_database(app).await);
     report.push(check_migrations(app).await);
     report.push(check_runtime_backend(app).await);
@@ -210,10 +213,13 @@ fn check_app_config(app: &AppContext) -> DoctorCheck {
     match app.config().app() {
         Ok(config) => {
             let signing_key = signing_key_state(&config);
+            let security_tier = config.resolved_security_tier();
             let message = format!("app `{}` loaded for `{}`", config.name, config.environment);
             let details = json!({
                 "name": config.name.clone(),
                 "environment": config.environment.to_string(),
+                "security_tier": security_tier.as_str(),
+                "security_tier_explicit": config.security_tier.is_some(),
                 "timezone": config.timezone.to_string(),
                 "signing_key": signing_key,
             });
@@ -233,6 +239,84 @@ fn check_app_config(app: &AppContext) -> DoctorCheck {
         }
         Err(error) => DoctorCheck::failed("config", error.to_string()),
     }
+}
+
+fn check_security_tier(app: &AppContext) -> DoctorCheck {
+    let config = match app.config().app() {
+        Ok(config) => config,
+        Err(error) => return DoctorCheck::failed("config_security_tier", error.to_string()),
+    };
+    let tier = config.resolved_security_tier();
+    let details = json!({
+        "environment": config.environment.to_string(),
+        "security_tier": tier.as_str(),
+        "explicit": config.security_tier.is_some(),
+    });
+
+    if config.custom_security_tier_requires_confirmation() {
+        return DoctorCheck::warning_with_details(
+            "config_security_tier",
+            format!(
+                "custom environment `{}` is using the strict fail-closed tier; set app.security_tier explicitly to confirm or override it",
+                config.environment
+            ),
+            details,
+        );
+    }
+
+    DoctorCheck::ok_with_details(
+        "config_security_tier",
+        format!("security tier resolved to `{tier}`"),
+        details,
+    )
+}
+
+fn check_config_keys(app: &AppContext) -> DoctorCheck {
+    let unknown_config = app.config().unknown_config_keys();
+    let unknown_env = app.config().unknown_prefixed_env_overlays();
+    let details = json!({
+        "unknown_config_keys": unknown_config,
+        "unknown_prefixed_env_overlays": unknown_env,
+    });
+
+    if unknown_config.is_empty() && unknown_env.is_empty() {
+        return DoctorCheck::ok_with_details(
+            "config_keys",
+            "framework config keys match the published schema",
+            details,
+        );
+    }
+
+    DoctorCheck::warning_with_details(
+        "config_keys",
+        format!(
+            "found {} unknown framework config key(s) and {} unknown FOUNDRY-prefixed env overlay(s)",
+            unknown_config.len(),
+            unknown_env.len()
+        ),
+        details,
+    )
+}
+
+fn check_legacy_env_overlays(app: &AppContext) -> DoctorCheck {
+    let overlays = app.config().legacy_unprefixed_env_overlays();
+    let details = json!({ "variables": overlays });
+    if overlays.is_empty() {
+        return DoctorCheck::ok_with_details(
+            "config_env_overlays",
+            "all config env overlays use the FOUNDRY namespace",
+            details,
+        );
+    }
+
+    DoctorCheck::warning_with_details(
+        "config_env_overlays",
+        format!(
+            "{} legacy unprefixed env overlay(s) remain supported for migration; rename them with the FOUNDRY__ prefix",
+            overlays.len()
+        ),
+        details,
+    )
 }
 
 fn signing_key_state(config: &crate::config::AppConfig) -> &'static str {
@@ -442,7 +526,9 @@ mod tests {
     use std::fs;
 
     use super::{DoctorReport, DoctorStatus};
+    use crate::config::SecurityTier;
     use crate::foundation::App;
+    use serde_json::json;
     use tempfile::tempdir;
 
     #[test]
@@ -500,6 +586,98 @@ mod tests {
             super::readiness_verdict(&report),
             "Production readiness: blocked - strict mode treats warnings as failures."
         );
+    }
+
+    #[tokio::test]
+    async fn custom_environment_fails_closed_and_strict_doctor_requires_confirmation() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("00-app.toml"),
+            r#"
+                [app]
+                environment = "eu-prod"
+            "#,
+        )
+        .unwrap();
+        let kernel = App::builder()
+            .load_config_dir(directory.path())
+            .build_cli_kernel()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            kernel
+                .app()
+                .config()
+                .app()
+                .unwrap()
+                .resolved_security_tier(),
+            SecurityTier::Strict
+        );
+        let report = super::run_doctor(kernel.app(), true, true).await;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "config_security_tier")
+            .unwrap();
+
+        assert_eq!(check.status, DoctorStatus::Warning);
+        assert_eq!(check.details.as_ref().unwrap()["security_tier"], "strict");
+        assert!(report.should_fail_command());
+    }
+
+    #[tokio::test]
+    async fn strict_doctor_blocks_unknown_keys_and_legacy_env_overlays() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("00-app.toml"),
+            r#"
+                [app]
+                enviroment = "production"
+
+                [databse]
+                url = "postgres://localhost/foundry"
+            "#,
+        )
+        .unwrap();
+        std::env::set_var("FOUNDRY__SERVRE__PORT", "4555");
+        std::env::set_var("CFG03_LEGACY__FLAG", "true");
+        let kernel = App::builder()
+            .load_config_dir(directory.path())
+            .build_cli_kernel()
+            .await
+            .unwrap();
+        std::env::remove_var("FOUNDRY__SERVRE__PORT");
+        std::env::remove_var("CFG03_LEGACY__FLAG");
+
+        let report = super::run_doctor(kernel.app(), true, true).await;
+        let keys = report
+            .checks
+            .iter()
+            .find(|check| check.name == "config_keys")
+            .unwrap();
+        let overlays = report
+            .checks
+            .iter()
+            .find(|check| check.name == "config_env_overlays")
+            .unwrap();
+
+        assert_eq!(keys.status, DoctorStatus::Warning);
+        assert_eq!(
+            keys.details.as_ref().unwrap()["unknown_config_keys"],
+            json!(["app.enviroment", "databse.url"])
+        );
+        assert_eq!(
+            keys.details.as_ref().unwrap()["unknown_prefixed_env_overlays"],
+            json!(["FOUNDRY__SERVRE__PORT"])
+        );
+        assert_eq!(overlays.status, DoctorStatus::Warning);
+        assert!(overlays.details.as_ref().unwrap()["variables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "CFG03_LEGACY__FLAG"));
+        assert!(report.should_fail_command());
     }
 
     #[tokio::test]

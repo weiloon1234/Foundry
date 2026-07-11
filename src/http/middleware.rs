@@ -1255,16 +1255,27 @@ fn rate_limit_key_from_request(state: &RateLimitState, request: &Request) -> Opt
         RateLimitBy::Actor => request
             .extensions()
             .get::<crate::auth::Actor>()
-            .map(|actor| format!("actor:{}", actor.id)),
+            .map(actor_rate_limit_key),
         RateLimitBy::ActorOrIp => Some(
             request
                 .extensions()
                 .get::<crate::auth::Actor>()
-                .map(|actor| format!("actor:{}", actor.id))
+                .map(actor_rate_limit_key)
                 .unwrap_or_else(|| format!("ip:{}", extract_client_ip(request))),
         ),
         RateLimitBy::Ip => Some(format!("ip:{}", extract_client_ip(request))),
     }
+}
+
+fn actor_rate_limit_key(actor: &crate::auth::Actor) -> String {
+    let guard = actor.guard.as_ref();
+    format!(
+        "actor:{}:{}:{}:{}",
+        guard.len(),
+        guard,
+        actor.id.len(),
+        actor.id
+    )
 }
 
 struct RateLimitInfo {
@@ -1352,7 +1363,7 @@ pub(crate) async fn enforce_rate_limit_for_actor(
 ) -> Option<Response> {
     let key_identifier = match state.by {
         RateLimitBy::Ip => format!("ip:{client_ip}"),
-        RateLimitBy::Actor | RateLimitBy::ActorOrIp => format!("actor:{}", actor.id),
+        RateLimitBy::Actor | RateLimitBy::ActorOrIp => actor_rate_limit_key(actor),
     };
 
     enforce_rate_limit(state, &key_identifier).await
@@ -1796,8 +1807,8 @@ impl TrustedProxy {
             && app
                 .config()
                 .app()
-                .map(|config| config.environment.is_production_like())
-                .unwrap_or(false)
+                .map(|config| config.resolved_security_tier().is_strict())
+                .unwrap_or(true)
         {
             tracing::warn!(
                 "foundry: TrustedProxy middleware trusts all proxy headers; configure http.trusted_proxy.trusted_cidrs for production"
@@ -2637,6 +2648,57 @@ mod tests {
             rate_limit_key_from_request(&state, &request).as_deref(),
             Some("ip:203.0.113.9")
         );
+    }
+
+    #[test]
+    fn actor_rate_limit_keys_include_the_guard_identity() {
+        let state = RateLimitState {
+            max: 1,
+            window_secs: 60,
+            key_prefix: "test:".to_string(),
+            by: RateLimitBy::Actor,
+            store: RateLimitStore::Memory(Arc::new(Mutex::new(HashMap::new()))),
+        };
+        let user = crate::auth::Actor::new("shared-id", crate::support::GuardId::new("user"));
+        let admin = crate::auth::Actor::new("shared-id", crate::support::GuardId::new("admin"));
+        let mut user_request = HttpRequest::builder().body(Body::empty()).unwrap();
+        user_request.extensions_mut().insert(user.clone());
+        let mut admin_request = HttpRequest::builder().body(Body::empty()).unwrap();
+        admin_request.extensions_mut().insert(admin.clone());
+
+        assert_eq!(
+            rate_limit_key_from_request(&state, &user_request),
+            Some(actor_rate_limit_key(&user))
+        );
+        assert_eq!(
+            rate_limit_key_from_request(&state, &admin_request),
+            Some(actor_rate_limit_key(&admin))
+        );
+        assert_ne!(actor_rate_limit_key(&user), actor_rate_limit_key(&admin));
+    }
+
+    #[tokio::test]
+    async fn post_auth_actor_rate_limits_are_isolated_by_guard() {
+        let state = RateLimitState {
+            max: 1,
+            window_secs: 60,
+            key_prefix: format!("test:{}:", uuid::Uuid::now_v7()),
+            by: RateLimitBy::Actor,
+            store: RateLimitStore::Memory(Arc::new(Mutex::new(HashMap::new()))),
+        };
+        let user = crate::auth::Actor::new("shared-id", crate::support::GuardId::new("user"));
+        let admin = crate::auth::Actor::new("shared-id", crate::support::GuardId::new("admin"));
+        let client_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        assert!(enforce_rate_limit_for_actor(&state, &user, client_ip)
+            .await
+            .is_none());
+        assert!(enforce_rate_limit_for_actor(&state, &admin, client_ip)
+            .await
+            .is_none());
+        assert!(enforce_rate_limit_for_actor(&state, &user, client_ip)
+            .await
+            .is_some());
     }
 
     // ---- MaintenanceMode tests ----

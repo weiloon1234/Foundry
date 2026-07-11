@@ -24,7 +24,7 @@ use super::ast::{
     WindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec,
 };
 use super::compiler::PostgresCompiler;
-use super::extensions::{register_model_records, AnyModelExtension};
+use super::extensions::{register_model_records, AnyModelExtension, MetadataCacheShape};
 use super::model::{
     upsert_assignment, AfterCommitSink, Column, CreateDraft, FromDbValue, IntoColumnValue,
     IntoFieldValue, Model, ModelCreatedEvent, ModelCreatingEvent, ModelDeletedEvent,
@@ -275,8 +275,10 @@ impl CursorPagination {
     }
 }
 
+const CURSOR_TOKEN_VERSION: u8 = 1;
+
 #[derive(Clone, Debug, Serialize)]
-pub struct CursorPaginated<T: Serialize> {
+pub struct CursorPaginated<T> {
     pub data: Vec<T>,
     pub meta: CursorMeta,
     pub cursors: CursorInfo,
@@ -295,26 +297,361 @@ pub struct CursorInfo {
     pub prev: Option<String>,
 }
 
-impl<T: Serialize> CursorPaginated<T> {
-    /// Encode a value as a cursor string (base64url).
-    pub fn encode_cursor(value: &impl std::fmt::Display) -> String {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-        URL_SAFE_NO_PAD.encode(value.to_string().as_bytes())
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CursorToken {
+    #[serde(rename = "v")]
+    version: u8,
+    #[serde(rename = "t")]
+    table: String,
+    #[serde(rename = "s")]
+    sort_column: String,
+    #[serde(rename = "sv")]
+    sort_value: CursorTokenValue,
+    #[serde(rename = "p")]
+    primary_key_column: String,
+    #[serde(rename = "pv")]
+    primary_key_value: CursorTokenValue,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    tag = "t",
+    content = "v",
+    rename_all = "snake_case"
+)]
+enum CursorTokenValue {
+    Null(DbType),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    Bool(bool),
+    Float32(u32),
+    Float64(u64),
+    Numeric(super::ast::Numeric),
+    Text(String),
+    Json(serde_json::Value),
+    Uuid(uuid::Uuid),
+    TimestampTz(crate::support::DateTime),
+    Timestamp(crate::support::LocalDateTime),
+    Date(crate::support::Date),
+    Time(crate::support::Time),
+    Bytea(Vec<u8>),
+    Int16Array(Vec<i16>),
+    Int32Array(Vec<i32>),
+    Int64Array(Vec<i64>),
+    BoolArray(Vec<bool>),
+    Float32Array(Vec<u32>),
+    Float64Array(Vec<u64>),
+    NumericArray(Vec<super::ast::Numeric>),
+    TextArray(Vec<String>),
+    JsonArray(Vec<serde_json::Value>),
+    UuidArray(Vec<uuid::Uuid>),
+    TimestampTzArray(Vec<crate::support::DateTime>),
+    TimestampArray(Vec<crate::support::LocalDateTime>),
+    DateArray(Vec<crate::support::Date>),
+    TimeArray(Vec<crate::support::Time>),
+    ByteaArray(Vec<Vec<u8>>),
+}
+
+#[derive(Clone, Copy)]
+struct CursorDescriptor<'a> {
+    table: &'a str,
+    sort_column: &'a str,
+    sort_type: DbType,
+    primary_key_column: &'a str,
+    primary_key_type: DbType,
+}
+
+struct CursorBoundary {
+    sort_value: DbValue,
+    primary_key_value: DbValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorDirection {
+    Forward,
+    Backward,
+}
+
+impl CursorDescriptor<'_> {
+    fn encode_record(self, record: &DbRecord) -> Result<String> {
+        let sort_value = cursor_record_value(record, self.sort_column, self.sort_type)?;
+        let primary_key_value =
+            cursor_record_value(record, self.primary_key_column, self.primary_key_type)?;
+        encode_cursor_token(CursorToken {
+            version: CURSOR_TOKEN_VERSION,
+            table: self.table.to_string(),
+            sort_column: self.sort_column.to_string(),
+            sort_value: CursorTokenValue::from(sort_value),
+            primary_key_column: self.primary_key_column.to_string(),
+            primary_key_value: CursorTokenValue::from(primary_key_value),
+        })
     }
 
-    /// Set cursor values from the first and last items in the result.
-    pub fn with_cursors(
-        mut self,
-        first_value: Option<&impl std::fmt::Display>,
-        last_value: Option<&impl std::fmt::Display>,
-    ) -> Self {
-        if self.meta.has_prev {
-            self.cursors.prev = first_value.map(|v| Self::encode_cursor(v));
+    fn decode(self, raw: &str) -> Result<CursorBoundary> {
+        let token = decode_cursor_token(raw)?;
+        if token.version != CURSOR_TOKEN_VERSION {
+            return Err(Error::message(format!(
+                "unsupported cursor version {}; expected {}",
+                token.version, CURSOR_TOKEN_VERSION
+            )));
         }
-        if self.meta.has_next {
-            self.cursors.next = last_value.map(|v| Self::encode_cursor(v));
+        if token.table != self.table
+            || token.sort_column != self.sort_column
+            || token.primary_key_column != self.primary_key_column
+        {
+            return Err(Error::message(
+                "cursor does not match the requested table and sort columns",
+            ));
         }
-        self
+
+        Ok(CursorBoundary {
+            sort_value: token.sort_value.into_db_value(self.sort_type)?,
+            primary_key_value: token
+                .primary_key_value
+                .into_db_value(self.primary_key_type)?,
+        })
+    }
+}
+
+impl From<&DbValue> for CursorTokenValue {
+    fn from(value: &DbValue) -> Self {
+        match value {
+            DbValue::Null(value) => Self::Null(*value),
+            DbValue::Int16(value) => Self::Int16(*value),
+            DbValue::Int32(value) => Self::Int32(*value),
+            DbValue::Int64(value) => Self::Int64(*value),
+            DbValue::Bool(value) => Self::Bool(*value),
+            DbValue::Float32(value) => Self::Float32(value.to_bits()),
+            DbValue::Float64(value) => Self::Float64(value.to_bits()),
+            DbValue::Numeric(value) => Self::Numeric(value.clone()),
+            DbValue::Text(value) => Self::Text(value.clone()),
+            DbValue::Json(value) => Self::Json(value.clone()),
+            DbValue::Uuid(value) => Self::Uuid(*value),
+            DbValue::TimestampTz(value) => Self::TimestampTz(*value),
+            DbValue::Timestamp(value) => Self::Timestamp(*value),
+            DbValue::Date(value) => Self::Date(*value),
+            DbValue::Time(value) => Self::Time(*value),
+            DbValue::Bytea(value) => Self::Bytea(value.clone()),
+            DbValue::Int16Array(value) => Self::Int16Array(value.clone()),
+            DbValue::Int32Array(value) => Self::Int32Array(value.clone()),
+            DbValue::Int64Array(value) => Self::Int64Array(value.clone()),
+            DbValue::BoolArray(value) => Self::BoolArray(value.clone()),
+            DbValue::Float32Array(value) => {
+                Self::Float32Array(value.iter().map(|value| value.to_bits()).collect())
+            }
+            DbValue::Float64Array(value) => {
+                Self::Float64Array(value.iter().map(|value| value.to_bits()).collect())
+            }
+            DbValue::NumericArray(value) => Self::NumericArray(value.clone()),
+            DbValue::TextArray(value) => Self::TextArray(value.clone()),
+            DbValue::JsonArray(value) => Self::JsonArray(value.clone()),
+            DbValue::UuidArray(value) => Self::UuidArray(value.clone()),
+            DbValue::TimestampTzArray(value) => Self::TimestampTzArray(value.clone()),
+            DbValue::TimestampArray(value) => Self::TimestampArray(value.clone()),
+            DbValue::DateArray(value) => Self::DateArray(value.clone()),
+            DbValue::TimeArray(value) => Self::TimeArray(value.clone()),
+            DbValue::ByteaArray(value) => Self::ByteaArray(value.clone()),
+        }
+    }
+}
+
+impl CursorTokenValue {
+    fn into_db_value(self, expected_type: DbType) -> Result<DbValue> {
+        let actual_type = self.db_type();
+        if actual_type != expected_type {
+            return Err(Error::message(format!(
+                "cursor value type mismatch: expected {expected_type:?}, found {:?}",
+                actual_type
+            )));
+        }
+
+        Ok(match self {
+            Self::Null(value) => DbValue::Null(value),
+            Self::Int16(value) => DbValue::Int16(value),
+            Self::Int32(value) => DbValue::Int32(value),
+            Self::Int64(value) => DbValue::Int64(value),
+            Self::Bool(value) => DbValue::Bool(value),
+            Self::Float32(value) => DbValue::Float32(f32::from_bits(value)),
+            Self::Float64(value) => DbValue::Float64(f64::from_bits(value)),
+            Self::Numeric(value) => DbValue::Numeric(super::ast::Numeric::new(value.to_string())?),
+            Self::Text(value) => DbValue::Text(value),
+            Self::Json(value) => DbValue::Json(value),
+            Self::Uuid(value) => DbValue::Uuid(value),
+            Self::TimestampTz(value) => DbValue::TimestampTz(value),
+            Self::Timestamp(value) => DbValue::Timestamp(value),
+            Self::Date(value) => DbValue::Date(value),
+            Self::Time(value) => DbValue::Time(value),
+            Self::Bytea(value) => DbValue::Bytea(value),
+            Self::Int16Array(value) => DbValue::Int16Array(value),
+            Self::Int32Array(value) => DbValue::Int32Array(value),
+            Self::Int64Array(value) => DbValue::Int64Array(value),
+            Self::BoolArray(value) => DbValue::BoolArray(value),
+            Self::Float32Array(value) => {
+                DbValue::Float32Array(value.into_iter().map(f32::from_bits).collect())
+            }
+            Self::Float64Array(value) => {
+                DbValue::Float64Array(value.into_iter().map(f64::from_bits).collect())
+            }
+            Self::NumericArray(value) => DbValue::NumericArray(
+                value
+                    .into_iter()
+                    .map(|value| super::ast::Numeric::new(value.to_string()))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            Self::TextArray(value) => DbValue::TextArray(value),
+            Self::JsonArray(value) => DbValue::JsonArray(value),
+            Self::UuidArray(value) => DbValue::UuidArray(value),
+            Self::TimestampTzArray(value) => DbValue::TimestampTzArray(value),
+            Self::TimestampArray(value) => DbValue::TimestampArray(value),
+            Self::DateArray(value) => DbValue::DateArray(value),
+            Self::TimeArray(value) => DbValue::TimeArray(value),
+            Self::ByteaArray(value) => DbValue::ByteaArray(value),
+        })
+    }
+
+    fn db_type(&self) -> DbType {
+        match self {
+            Self::Null(value) => *value,
+            Self::Int16(_) => DbType::Int16,
+            Self::Int32(_) => DbType::Int32,
+            Self::Int64(_) => DbType::Int64,
+            Self::Bool(_) => DbType::Bool,
+            Self::Float32(_) => DbType::Float32,
+            Self::Float64(_) => DbType::Float64,
+            Self::Numeric(_) => DbType::Numeric,
+            Self::Text(_) => DbType::Text,
+            Self::Json(_) => DbType::Json,
+            Self::Uuid(_) => DbType::Uuid,
+            Self::TimestampTz(_) => DbType::TimestampTz,
+            Self::Timestamp(_) => DbType::Timestamp,
+            Self::Date(_) => DbType::Date,
+            Self::Time(_) => DbType::Time,
+            Self::Bytea(_) => DbType::Bytea,
+            Self::Int16Array(_) => DbType::Int16Array,
+            Self::Int32Array(_) => DbType::Int32Array,
+            Self::Int64Array(_) => DbType::Int64Array,
+            Self::BoolArray(_) => DbType::BoolArray,
+            Self::Float32Array(_) => DbType::Float32Array,
+            Self::Float64Array(_) => DbType::Float64Array,
+            Self::NumericArray(_) => DbType::NumericArray,
+            Self::TextArray(_) => DbType::TextArray,
+            Self::JsonArray(_) => DbType::JsonArray,
+            Self::UuidArray(_) => DbType::UuidArray,
+            Self::TimestampTzArray(_) => DbType::TimestampTzArray,
+            Self::TimestampArray(_) => DbType::TimestampArray,
+            Self::DateArray(_) => DbType::DateArray,
+            Self::TimeArray(_) => DbType::TimeArray,
+            Self::ByteaArray(_) => DbType::ByteaArray,
+        }
+    }
+}
+
+fn encode_cursor_token(token: CursorToken) -> Result<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    let payload = serde_json::to_vec(&token)
+        .map_err(|error| Error::message(format!("failed to encode cursor: {error}")))?;
+    Ok(URL_SAFE_NO_PAD.encode(payload))
+}
+
+fn decode_cursor_token(raw: &str) -> Result<CursorToken> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    let payload = URL_SAFE_NO_PAD
+        .decode(raw.as_bytes())
+        .map_err(|error| Error::message(format!("invalid cursor encoding: {error}")))?;
+    serde_json::from_slice(&payload)
+        .map_err(|error| Error::message(format!("invalid cursor payload: {error}")))
+}
+
+fn cursor_record_value<'a>(
+    record: &'a DbRecord,
+    column: &str,
+    expected_type: DbType,
+) -> Result<&'a DbValue> {
+    let value = record.get(column).ok_or_else(|| {
+        Error::message(format!(
+            "cursor pagination result is missing column `{column}`"
+        ))
+    })?;
+    if value.db_type() != expected_type {
+        return Err(Error::message(format!(
+            "cursor pagination column `{column}` has type {:?}, expected {expected_type:?}",
+            value.db_type()
+        )));
+    }
+    Ok(value)
+}
+
+fn cursor_boundary_condition(
+    sort_column: &ColumnRef,
+    primary_key: &ColumnRef,
+    boundary: CursorBoundary,
+    direction: CursorDirection,
+) -> Condition {
+    let comparison = match direction {
+        CursorDirection::Forward => ComparisonOp::Gt,
+        CursorDirection::Backward => ComparisonOp::Lt,
+    };
+
+    if sort_column == primary_key {
+        return primary_key.compare_value(comparison, boundary.primary_key_value);
+    }
+
+    let primary_key_boundary = primary_key.compare_value(comparison, boundary.primary_key_value);
+    if matches!(boundary.sort_value, DbValue::Null(_)) {
+        let same_null_group = Condition::and([
+            Condition::is_null(sort_column.clone()),
+            primary_key_boundary,
+        ]);
+        return match direction {
+            CursorDirection::Forward => same_null_group,
+            CursorDirection::Backward => {
+                Condition::or([Condition::is_not_null(sort_column.clone()), same_null_group])
+            }
+        };
+    }
+
+    let same_sort_value = Condition::and([
+        sort_column.eq_value(boundary.sort_value.clone()),
+        primary_key_boundary,
+    ]);
+    let strict_sort_boundary = sort_column.compare_value(comparison, boundary.sort_value);
+    match direction {
+        CursorDirection::Forward => Condition::or([
+            strict_sort_boundary,
+            same_sort_value,
+            Condition::is_null(sort_column.clone()),
+        ]),
+        CursorDirection::Backward => Condition::or([strict_sort_boundary, same_sort_value]),
+    }
+}
+
+fn apply_cursor_order<M>(
+    query: &mut ModelQuery<M>,
+    sort_column: &ColumnRef,
+    primary_key: &ColumnRef,
+    direction: CursorDirection,
+) {
+    query.select.order_by.clear();
+    query.select.offset = None;
+
+    let (sort_order, primary_key_order) = match direction {
+        CursorDirection::Forward => (
+            OrderBy::asc(sort_column.clone()),
+            OrderBy::asc(primary_key.clone()),
+        ),
+        CursorDirection::Backward => (
+            OrderBy::desc(sort_column.clone()),
+            OrderBy::desc(primary_key.clone()),
+        ),
+    };
+    query.select.order_by.push(sort_order);
+    if sort_column != primary_key {
+        query.select.order_by.push(primary_key_order);
     }
 }
 
@@ -1990,7 +2327,6 @@ pub struct ModelQuery<M: 'static> {
     soft_delete_scope: SoftDeleteScope,
     stream_batch_size: usize,
     options: QueryExecutionOptions,
-    skip_defaults: bool,
     deferred_error: Option<String>,
 }
 
@@ -2023,15 +2359,8 @@ where
             soft_delete_scope: SoftDeleteScope::ActiveOnly,
             stream_batch_size: 256,
             options: QueryExecutionOptions::default(),
-            skip_defaults: false,
             deferred_error: None,
         }
-    }
-
-    /// Skip auto-eager-loading of default relations (set via `always_with` derive attribute).
-    pub fn without_defaults(mut self) -> Self {
-        self.skip_defaults = true;
-        self
     }
 
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
@@ -2177,6 +2506,28 @@ where
         self.model_extensions
             .push(crate::attachments::attachment_extension_loader(
                 collection.into(),
+            ));
+        self
+    }
+
+    pub fn with_meta(mut self, key: impl Into<String>) -> Self
+    where
+        M: crate::metadata::HasMetadata,
+    {
+        self.model_extensions
+            .push(crate::metadata::metadata_extension_loader(
+                MetadataCacheShape::Key(key.into()),
+            ));
+        self
+    }
+
+    pub fn with_metadata(mut self) -> Self
+    where
+        M: crate::metadata::HasMetadata,
+    {
+        self.model_extensions
+            .push(crate::metadata::metadata_extension_loader(
+                MetadataCacheShape::All,
             ));
         self
     }
@@ -2696,12 +3047,9 @@ where
 
     /// Cursor-based pagination for large datasets.
     ///
-    /// Uses the given column as cursor. The cursor value is the base64url-encoded
-    /// string representation of the column value for the boundary item.
-    ///
-    /// Returns `CursorPaginated` with `has_next`/`has_prev` metadata. Use
-    /// `CursorPaginated::with_cursors` to attach encoded cursor values from
-    /// the first/last items in the result.
+    /// Uses the given column plus the model primary key as a deterministic
+    /// cursor position. Returned cursors are opaque, versioned tokens and are
+    /// populated automatically from the first and last result rows.
     pub async fn cursor_paginate<E, V>(
         self,
         executor: &E,
@@ -2710,58 +3058,91 @@ where
     ) -> Result<CursorPaginated<M>>
     where
         E: QueryExecutor,
-        V: ToDbValue + FromDbValue + std::fmt::Display + std::str::FromStr,
-        M: Serialize,
     {
-        let per_page = cursor.per_page;
-        let mut query = self;
-        let is_forward = cursor.before.is_none();
-
-        if let Some(ref after_cursor) = cursor.after {
-            let value: V = decode_cursor(after_cursor)?;
-            query = query.where_(column.gt(value));
-            query = query.order_by(column.asc());
-        } else if let Some(ref before_cursor) = cursor.before {
-            let value: V = decode_cursor(before_cursor)?;
-            query = query.where_(column.lt(value));
-            query = query.order_by(column.desc());
-        } else {
-            query = query.order_by(column.asc());
+        if cursor.after.is_some() && cursor.before.is_some() {
+            return Err(Error::message(
+                "cursor pagination cannot use both `after` and `before`",
+            ));
         }
 
-        let mut items: Vec<M> = query
-            .limit(per_page + 1)
-            .get(executor)
-            .await?
-            .into_iter()
-            .collect();
-        let has_more = items.len() as u64 > per_page;
-        if has_more {
-            items.pop();
-        }
-
-        // If we queried backwards, reverse to restore natural order
-        if !is_forward {
-            items.reverse();
-        }
-
-        let (has_next, has_prev) = if is_forward {
-            (has_more, cursor.after.is_some())
-        } else {
-            (cursor.before.is_some(), has_more)
+        let primary_key_info = self.table.primary_key_column_info().ok_or_else(|| {
+            Error::message(format!(
+                "cursor pagination requires primary key column `{}` on table `{}`",
+                self.table.primary_key_name(),
+                self.table.name()
+            ))
+        })?;
+        let descriptor = CursorDescriptor {
+            table: self.table.name(),
+            sort_column: column.name(),
+            sort_type: column.db_type(),
+            primary_key_column: primary_key_info.name,
+            primary_key_type: primary_key_info.db_type,
+        };
+        let (direction, boundary) = match (cursor.after.as_deref(), cursor.before.as_deref()) {
+            (Some(raw), None) => (CursorDirection::Forward, Some(descriptor.decode(raw)?)),
+            (None, Some(raw)) => (CursorDirection::Backward, Some(descriptor.decode(raw)?)),
+            (None, None) => (CursorDirection::Forward, None),
+            (Some(_), Some(_)) => unreachable!("conflicting cursors rejected above"),
         };
 
+        let per_page = cursor.per_page.max(1);
+        let mut query = self;
+        let sort_column = column.column_ref();
+        let primary_key = query.primary_key_column_ref()?;
+        apply_cursor_order(&mut query, &sort_column, &primary_key, direction);
+        if let Some(boundary) = boundary {
+            query = query.where_(cursor_boundary_condition(
+                &sort_column,
+                &primary_key,
+                boundary,
+                direction,
+            ));
+        }
+
+        let mut entries = query
+            .limit(per_page.saturating_add(1))
+            .fetch_entries_dyn(executor)
+            .await?;
+        let has_more = entries.len() as u64 > per_page;
+        if has_more {
+            entries.pop();
+        }
+
+        if direction == CursorDirection::Backward {
+            entries.reverse();
+        }
+
+        let (has_next, has_prev) = match direction {
+            CursorDirection::Forward => (has_more, cursor.after.is_some()),
+            CursorDirection::Backward => (cursor.before.is_some(), has_more),
+        };
+        let prev = if has_prev {
+            entries
+                .first()
+                .map(|(record, _)| descriptor.encode_record(record))
+                .transpose()?
+        } else {
+            None
+        };
+        let next = if has_next {
+            entries
+                .last()
+                .map(|(record, _)| descriptor.encode_record(record))
+                .transpose()?
+        } else {
+            None
+        };
+        let data = entries.into_iter().map(|(_, model)| model).collect();
+
         Ok(CursorPaginated {
-            data: items,
+            data,
             meta: CursorMeta {
                 has_next,
                 has_prev,
                 per_page,
             },
-            cursors: CursorInfo {
-                next: None,
-                prev: None,
-            },
+            cursors: CursorInfo { next, prev },
         })
     }
 
@@ -5355,18 +5736,6 @@ fn wrap_model_stream_error(options: &QueryExecutionOptions, action: &str, error:
     ))
 }
 
-fn decode_cursor<V: std::str::FromStr>(raw: &str) -> Result<V> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    let decoded = URL_SAFE_NO_PAD
-        .decode(raw.as_bytes())
-        .map_err(|e| Error::message(format!("invalid cursor: {e}")))?;
-    let value_str = String::from_utf8(decoded)
-        .map_err(|e| Error::message(format!("invalid cursor encoding: {e}")))?;
-    value_str
-        .parse()
-        .map_err(|_| Error::message("invalid cursor value"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -5377,8 +5746,8 @@ mod tests {
         Query, QueryBody, Sql,
     };
     use crate::database::{
-        has_many, ColumnRef, Condition, DbRecord, DbValue, Expr, Loaded, QueryExecutionOptions,
-        QueryExecutor, RelationDef,
+        has_many, ColumnRef, Condition, DbRecord, DbType, DbValue, Expr, Loaded,
+        QueryExecutionOptions, QueryExecutor, RelationDef,
     };
     use crate::foundation::{Error, Result};
     use crate::support::sync::lock_unpoisoned;
@@ -5442,6 +5811,14 @@ mod tests {
     struct IterationChild {
         id: i64,
         user_id: i64,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, PartialEq, crate::Model)]
+    #[foundry(table = "cursor_users", primary_key_strategy = "manual")]
+    struct CursorUser {
+        id: i64,
+        rank: Option<i64>,
     }
 
     #[derive(Clone, Debug, PartialEq, crate::Projection)]
@@ -5523,6 +5900,192 @@ mod tests {
             PostgresCompiler::compile(exclude.ast()).unwrap().sql,
             "SELECT \"id\" FROM \"users\" WHERE NOT (\"status\" IN ($1::text, $2::text))"
         );
+    }
+
+    fn cursor_descriptor() -> super::CursorDescriptor<'static> {
+        super::CursorDescriptor {
+            table: "cursor_users",
+            sort_column: "rank",
+            sort_type: DbType::Int64,
+            primary_key_column: "id",
+            primary_key_type: DbType::Int64,
+        }
+    }
+
+    fn cursor_record(id: i64, rank: Option<i64>) -> DbRecord {
+        let mut record = DbRecord::new();
+        record.insert("id", DbValue::Int64(id));
+        record.insert(
+            "rank",
+            rank.map_or(DbValue::Null(DbType::Int64), DbValue::Int64),
+        );
+        record
+    }
+
+    #[test]
+    fn cursor_tokens_are_versioned_typed_and_include_the_primary_key() {
+        let descriptor = cursor_descriptor();
+        let encoded = descriptor
+            .encode_record(&cursor_record(42, Some(7)))
+            .unwrap();
+        assert!(!encoded.contains("cursor_users"));
+
+        let token = super::decode_cursor_token(&encoded).unwrap();
+        assert_eq!(token.version, super::CURSOR_TOKEN_VERSION);
+        assert_eq!(token.sort_column, "rank");
+        assert_eq!(token.primary_key_column, "id");
+
+        let boundary = descriptor.decode(&encoded).unwrap();
+        assert_eq!(boundary.sort_value, DbValue::Int64(7));
+        assert_eq!(boundary.primary_key_value, DbValue::Int64(42));
+
+        let nullable = descriptor
+            .decode(&descriptor.encode_record(&cursor_record(43, None)).unwrap())
+            .unwrap();
+        assert_eq!(nullable.sort_value, DbValue::Null(DbType::Int64));
+        assert_eq!(nullable.primary_key_value, DbValue::Int64(43));
+    }
+
+    #[test]
+    fn cursor_token_values_roundtrip_supported_null_json_and_nonfinite_float_values() {
+        let values = [
+            DbValue::Null(DbType::Json),
+            DbValue::Json(serde_json::Value::Null),
+            DbValue::Text("value".to_string()),
+            DbValue::Bytea(vec![0, 1, 255]),
+            DbValue::Int64Array(vec![1, 2, 3]),
+        ];
+        for value in values {
+            let decoded = super::CursorTokenValue::from(&value)
+                .into_db_value(value.db_type())
+                .unwrap();
+            assert_eq!(decoded, value);
+        }
+
+        let decoded = super::CursorTokenValue::from(&DbValue::Float64(f64::NAN))
+            .into_db_value(DbType::Float64)
+            .unwrap();
+        let DbValue::Float64(value) = decoded else {
+            panic!("expected float64 cursor value");
+        };
+        assert!(value.is_nan());
+    }
+
+    #[test]
+    fn cursor_order_and_boundaries_override_conflicting_query_state() {
+        let sort_column = CursorUser::RANK.column_ref();
+        let primary_key = CursorUser::ID.column_ref();
+        let mut forward = CursorUser::model_query()
+            .order_by(CursorUser::ID.desc())
+            .offset(99);
+        super::apply_cursor_order(
+            &mut forward,
+            &sort_column,
+            &primary_key,
+            super::CursorDirection::Forward,
+        );
+        let forward = forward.where_(super::cursor_boundary_condition(
+            &sort_column,
+            &primary_key,
+            super::CursorBoundary {
+                sort_value: DbValue::Int64(10),
+                primary_key_value: DbValue::Int64(2),
+            },
+            super::CursorDirection::Forward,
+        ));
+        let compiled = forward.to_compiled_sql().unwrap();
+        assert!(compiled
+            .sql
+            .contains("ORDER BY \"cursor_users\".\"rank\" ASC, \"cursor_users\".\"id\" ASC"));
+        assert!(compiled.sql.contains("\"cursor_users\".\"rank\" IS NULL"));
+        assert!(!compiled.sql.contains("OFFSET"));
+        assert_eq!(
+            compiled.bindings,
+            vec![DbValue::Int64(10), DbValue::Int64(10), DbValue::Int64(2)]
+        );
+
+        let mut backward = CursorUser::model_query();
+        super::apply_cursor_order(
+            &mut backward,
+            &sort_column,
+            &primary_key,
+            super::CursorDirection::Backward,
+        );
+        let backward = backward.where_(super::cursor_boundary_condition(
+            &sort_column,
+            &primary_key,
+            super::CursorBoundary {
+                sort_value: DbValue::Null(DbType::Int64),
+                primary_key_value: DbValue::Int64(8),
+            },
+            super::CursorDirection::Backward,
+        ));
+        let compiled = backward.to_compiled_sql().unwrap();
+        assert!(compiled
+            .sql
+            .contains("ORDER BY \"cursor_users\".\"rank\" DESC, \"cursor_users\".\"id\" DESC"));
+        assert!(compiled
+            .sql
+            .contains("\"cursor_users\".\"rank\" IS NOT NULL"));
+        assert_eq!(compiled.bindings, vec![DbValue::Int64(8)]);
+    }
+
+    #[tokio::test]
+    async fn cursor_paginate_rejects_conflicting_malformed_and_version_mismatched_tokens() {
+        let executor = IterationExecutor::new([]);
+        let conflicting = CursorUser::model_query()
+            .cursor_paginate(
+                &executor,
+                CursorUser::RANK,
+                super::CursorPagination::new(2)
+                    .after("after")
+                    .before("before"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            conflicting.to_string(),
+            "cursor pagination cannot use both `after` and `before`"
+        );
+
+        let malformed = CursorUser::model_query()
+            .cursor_paginate(
+                &executor,
+                CursorUser::RANK,
+                super::CursorPagination::new(2).after("not-a-cursor"),
+            )
+            .await
+            .unwrap_err();
+        assert!(malformed.to_string().contains("invalid cursor"));
+
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let legacy_raw = URL_SAFE_NO_PAD.encode("1");
+        let legacy = CursorUser::model_query()
+            .cursor_paginate(
+                &executor,
+                CursorUser::RANK,
+                super::CursorPagination::new(2).after(legacy_raw),
+            )
+            .await
+            .unwrap_err();
+        assert!(legacy.to_string().contains("invalid cursor payload"));
+
+        let descriptor = cursor_descriptor();
+        let encoded = descriptor
+            .encode_record(&cursor_record(1, Some(1)))
+            .unwrap();
+        let mut token = super::decode_cursor_token(&encoded).unwrap();
+        token.version = super::CURSOR_TOKEN_VERSION + 1;
+        let wrong_version = super::encode_cursor_token(token).unwrap();
+        let mismatch = CursorUser::model_query()
+            .cursor_paginate(
+                &executor,
+                CursorUser::RANK,
+                super::CursorPagination::new(2).after(wrong_version),
+            )
+            .await
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("unsupported cursor version"));
     }
 
     #[test]

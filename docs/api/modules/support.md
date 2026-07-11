@@ -103,6 +103,7 @@ struct HashManager
   fn from_config(config: &HashingConfig) -> Result<Self>
   fn hash(&self, password: &str) -> Result<String>
   fn check(&self, password: &str, hash: &str) -> Result<bool>
+  fn needs_rehash(&self, hash: &str) -> Result<bool>
   fn random_string(length: usize) -> Result<String>
 struct JobId
   const fn new(value: &'static str) -> Self
@@ -216,4 +217,4 @@ struct LockHeartbeat
 ## Notes
 
 - `run_blocking(label, work)` isolates CPU-heavy or blocking synchronous work on Tokio's blocking pool and maps task panics into Foundry errors.
-- `HashManager::hash()` and `HashManager::check()` remain synchronous; wrap password hashing or checking in `run_blocking` inside async handlers or model mutators.
+- `HashManager::hash()`, `HashManager::check()`, and `HashManager::needs_rehash()` remain synchronous; wrap password hashing or checking in `run_blocking` inside async handlers or model mutators.

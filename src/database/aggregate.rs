@@ -2,7 +2,9 @@ use std::marker::PhantomData;
 
 use crate::foundation::{Error, Result};
 
-use super::ast::{AggregateNode, DbType, Expr, FromItem, QueryAst, QueryBody, SelectNode};
+use super::ast::{
+    AggregateNode, DbType, DbValue, Expr, FromItem, Numeric, QueryAst, QueryBody, SelectNode,
+};
 use super::compiler::PostgresCompiler;
 use super::model::FromDbValue;
 use super::runtime::{DbRecord, QueryExecutor};
@@ -43,8 +45,25 @@ where
     T: FromDbValue,
 {
     pub fn decode(&self, record: &DbRecord) -> Result<T> {
-        record.decode(self.alias())
+        decode_aggregate_value(record, self.alias())
     }
+}
+
+pub(crate) fn decode_aggregate_value<T>(record: &DbRecord, alias: &str) -> Result<T>
+where
+    T: FromDbValue,
+{
+    let value = record
+        .get(alias)
+        .ok_or_else(|| Error::message(format!("missing column `{alias}` in record")))?;
+    if let DbValue::Text(text) = value {
+        if let Ok(numeric) = Numeric::new(text.clone()) {
+            if let Ok(decoded) = T::from_db_value(&DbValue::Numeric(numeric)) {
+                return Ok(decoded);
+            }
+        }
+    }
+    T::from_db_value(value)
 }
 
 impl AggregateProjection<i64> {
@@ -252,4 +271,33 @@ fn without_outer_order_limit_offset(ast: &QueryAst) -> QueryAst {
         QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => {}
     }
     ast
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_decode_converts_compiler_numeric_text_before_typed_hydration() {
+        let projection = AggregateProjection::<Option<i64>>::sum(
+            super::super::ast::ColumnRef::bare("amount").typed(DbType::Int64),
+            "total",
+        );
+        let mut record = DbRecord::new();
+        record.insert("total", DbValue::Text("2500.0000".to_string()));
+
+        assert_eq!(projection.decode(&record).unwrap(), Some(2500));
+    }
+
+    #[test]
+    fn aggregate_decode_falls_back_to_real_text_values() {
+        let projection = AggregateProjection::<Option<String>>::min(
+            super::super::ast::ColumnRef::bare("label").typed(DbType::Text),
+            "minimum",
+        );
+        let mut record = DbRecord::new();
+        record.insert("minimum", DbValue::Text("123".to_string()));
+
+        assert_eq!(projection.decode(&record).unwrap(), Some("123".to_string()));
+    }
 }

@@ -1,0 +1,5 @@
+error: serde serialize name `displayName` and deserialize name `display_name` differ; Foundry wire contracts require one shared name
+ --> tests/ui/derive/fail_asymmetric_serde_wire_names.rs:6:5
+  |
+6 |     display_name: String,
+  |     ^^^^^^^^^^^^^^^^^^^^

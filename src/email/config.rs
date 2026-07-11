@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::foundation::{Error, Result};
+use crate::support::QueueId;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
@@ -29,6 +30,16 @@ impl Default for EmailConfig {
             from: EmailFromConfig::default(),
             mailers: BTreeMap::new(),
         }
+    }
+}
+
+impl EmailConfig {
+    pub fn queue_id(&self) -> Result<QueueId> {
+        let queue = self.queue.trim();
+        if queue.is_empty() {
+            return Err(Error::message("email.queue cannot be empty"));
+        }
+        Ok(QueueId::owned(queue))
     }
 }
 

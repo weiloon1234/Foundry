@@ -13,7 +13,9 @@ use crate::database::{
 use crate::foundation::{AppContext, Error, Result};
 use crate::support::{sha256_hex_str, CommandId, DateTime, GuardId, PermissionId, Token};
 
-use super::{Actor, AuthError, AuthErrorCode, Authenticatable, BearerAuthenticator};
+use super::{
+    Actor, ActorHydratorRegistry, AuthError, AuthErrorCode, Authenticatable, BearerAuthenticator,
+};
 
 const TOKEN_PRUNE_COMMAND: CommandId = CommandId::new("token:prune");
 pub const MFA_PENDING_ABILITY: &str = "auth:mfa_pending";
@@ -119,13 +121,25 @@ impl From<&str> for WsTokenResponse {
 ///
 /// Stored as a singleton in the container, accessible via `app.tokens()`.
 pub struct TokenManager {
+    app: AppContext,
     db: Arc<DatabaseManager>,
     config: TokenConfig,
+    actor_hydrators: Arc<ActorHydratorRegistry>,
 }
 
 impl TokenManager {
-    pub(crate) fn new(db: Arc<DatabaseManager>, config: TokenConfig) -> Self {
-        Self { db, config }
+    pub(crate) fn new(
+        app: AppContext,
+        db: Arc<DatabaseManager>,
+        config: TokenConfig,
+        actor_hydrators: Arc<ActorHydratorRegistry>,
+    ) -> Self {
+        Self {
+            app,
+            db,
+            config,
+            actor_hydrators,
+        }
     }
 
     /// Issue a new access + refresh token pair for the given actor.
@@ -208,6 +222,24 @@ impl TokenManager {
     /// Read-only — does not write on every request. Use [`Self::touch`] to update
     /// `last_used_at` if needed for auditing.
     pub async fn validate(&self, access_token: &str) -> Result<Option<Actor>> {
+        let actor = self.validate_credential(access_token).await?;
+        let Some(actor) = actor else {
+            return Ok(None);
+        };
+        let scoped_permissions = (!actor.permissions.is_empty() && !actor_has_mfa_pending(&actor))
+            .then(|| actor.permissions.clone());
+        let Some(mut hydrated) = self.actor_hydrators.hydrate(actor, &self.app).await? else {
+            return Ok(None);
+        };
+        if let Some(scoped_permissions) = scoped_permissions {
+            hydrated
+                .permissions
+                .retain(|permission| scoped_permissions.contains(permission));
+        }
+        Ok(Some(hydrated))
+    }
+
+    async fn validate_credential(&self, access_token: &str) -> Result<Option<Actor>> {
         let hash = sha256_hex_str(access_token);
 
         let rows = Query::table(PERSONAL_ACCESS_TOKENS_TABLE)

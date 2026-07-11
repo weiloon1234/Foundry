@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use crate::config::ConfigRepository;
 use crate::foundation::{AppContext, Error, Result};
 use crate::support::sync::lock_unpoisoned;
+use crate::support::QueueId;
 
 // Public re-exports — also available for internal use within this module
 pub use address::EmailAddress;
@@ -84,6 +85,8 @@ impl EmailDriverRegistryBuilder {
 #[derive(Clone)]
 pub struct EmailManager {
     default: String,
+    queue: QueueId,
+    template_path: String,
     from_config: EmailFromConfig,
     attachment_limits: config::EmailAttachmentLimits,
     drivers: Arc<HashMap<String, Arc<dyn EmailDriver>>>,
@@ -94,6 +97,8 @@ impl std::fmt::Debug for EmailManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EmailManager")
             .field("default", &self.default)
+            .field("queue", &self.queue)
+            .field("template_path", &self.template_path)
             .field("mailers", &self.drivers.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -107,11 +112,15 @@ impl EmailManager {
         app: AppContext,
     ) -> Result<Self> {
         let email_config = config.email()?;
+        let queue = email_config.queue_id()?;
+        let template_path = email_config.template_path.clone();
 
         if email_config.mailers.is_empty() {
             let attachment_limits = config::EmailAttachmentLimits::from(&email_config);
             return Ok(Self {
                 default: email_config.default,
+                queue,
+                template_path,
                 from_config: email_config.from,
                 attachment_limits,
                 drivers: Arc::new(HashMap::new()),
@@ -173,6 +182,8 @@ impl EmailManager {
         let attachment_limits = config::EmailAttachmentLimits::from(&email_config);
         Ok(Self {
             default: email_config.default,
+            queue,
+            template_path,
             from_config: email_config.from,
             attachment_limits,
             drivers: Arc::new(drivers),
@@ -193,6 +204,26 @@ impl EmailManager {
 
     pub fn default_mailer_name(&self) -> &str {
         &self.default
+    }
+
+    pub fn queue_id(&self) -> &QueueId {
+        &self.queue
+    }
+
+    pub fn template_path(&self) -> &str {
+        &self.template_path
+    }
+
+    /// Render a message using `[email].template_path`.
+    pub async fn render_template(
+        &self,
+        message: EmailMessage,
+        template_name: &str,
+        variables: serde_json::Value,
+    ) -> Result<EmailMessage> {
+        let renderer = TemplateRenderer::new(&self.template_path);
+        let rendered = renderer.render_async(template_name, &variables).await?;
+        Ok(message.with_rendered_template(rendered))
     }
 
     pub fn from_address(&self) -> &EmailFromConfig {
@@ -216,6 +247,31 @@ impl EmailManager {
             .get(key)
             .cloned()
             .ok_or_else(|| Error::message(format!("mailer `{}` is not configured", key)))
+    }
+
+    pub(crate) fn with_test_driver(&self, driver: Arc<dyn EmailDriver>) -> Self {
+        let default = if self.default.trim().is_empty() {
+            "fake".to_string()
+        } else {
+            self.default.clone()
+        };
+        let mut drivers = self
+            .drivers
+            .keys()
+            .cloned()
+            .map(|name| (name, driver.clone()))
+            .collect::<HashMap<_, _>>();
+        drivers.entry(default.clone()).or_insert(driver);
+
+        Self {
+            default,
+            queue: self.queue.clone(),
+            template_path: self.template_path.clone(),
+            from_config: self.from_config.clone(),
+            attachment_limits: self.attachment_limits,
+            drivers: Arc::new(drivers),
+            app: self.app.clone(),
+        }
     }
 
     // Convenience methods — delegate to default mailer
@@ -340,7 +396,104 @@ mod tests {
             .expect("resend mailer should infer driver from mailer name");
 
         assert_eq!(manager.default_mailer_name(), "resend");
+        assert_eq!(manager.queue_id().as_str(), "default");
         assert_eq!(manager.configured_mailers(), vec!["resend"]);
+    }
+
+    #[tokio::test]
+    async fn email_manager_renders_from_configured_template_path() {
+        let templates = tempfile::tempdir().unwrap();
+        std::fs::write(
+            templates.path().join("welcome.html"),
+            "<p>Hello {{name}}</p>",
+        )
+        .unwrap();
+        std::fs::write(templates.path().join("welcome.txt"), "Hello {{name}}").unwrap();
+        let config = config_from_toml(&format!(
+            r#"
+            [email]
+            queue = "mail-critical"
+            template_path = "{}"
+            "#,
+            templates.path().display()
+        ));
+        let manager = EmailManager::from_config(&config, HashMap::new(), test_app()).unwrap();
+
+        assert_eq!(manager.queue_id().as_str(), "mail-critical");
+        assert_eq!(manager.template_path(), templates.path().to_str().unwrap());
+        let message = manager
+            .render_template(
+                EmailMessage::new("Welcome").to("user@example.com"),
+                "welcome",
+                serde_json::json!({"name": "<Ada>"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            message.html_body.as_deref(),
+            Some("<p>Hello &lt;Ada&gt;</p>")
+        );
+        assert_eq!(message.text_body.as_deref(), Some("Hello <Ada>"));
+    }
+
+    #[test]
+    fn email_manager_rejects_an_empty_queue_name() {
+        let config = config_from_toml(
+            r#"
+            [email]
+            queue = "  "
+            "#,
+        );
+
+        let error = EmailManager::from_config(&config, HashMap::new(), test_app()).unwrap_err();
+        assert!(error.to_string().contains("email.queue cannot be empty"));
+    }
+
+    #[tokio::test]
+    async fn queued_email_uses_the_configured_queue_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let namespace = format!("email-queue-test-{}", uuid::Uuid::now_v7());
+        std::fs::write(
+            directory.path().join("runtime.toml"),
+            format!(
+                r#"
+                [redis]
+                url = ""
+                namespace = "{namespace}"
+
+                [email]
+                queue = "mail-critical"
+                "#
+            ),
+        )
+        .unwrap();
+        let kernel = crate::foundation::App::builder()
+            .load_config_dir(directory.path())
+            .build_cli_kernel()
+            .await
+            .unwrap();
+        let app = kernel.app().clone();
+
+        app.email()
+            .unwrap()
+            .queue(EmailMessage::new("Queued").text_body("body"))
+            .await
+            .unwrap();
+
+        let backend = crate::support::runtime::RuntimeBackend::from_config(app.config()).unwrap();
+        let queue = QueueId::new("mail-critical");
+        let lease = backend
+            .claim_job(
+                std::slice::from_ref(&queue),
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.queue, queue);
+        assert!(lease.payload.contains("foundry.send_queued_email"));
+
+        app.shutdown().await.unwrap();
     }
 
     #[test]

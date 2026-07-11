@@ -122,6 +122,24 @@ impl Container {
             .and_then(|entries| entries.get(&TypeId::of::<T>()).cloned())
             .is_some()
     }
+
+    pub(crate) fn replace_singleton_arc<T>(&self, value: Arc<T>) -> Result<()>
+    where
+        T: Send + Sync + 'static,
+    {
+        let mut entries = write_unpoisoned(&self.entries, "container");
+        let type_id = TypeId::of::<T>();
+        if !entries.contains_key(&type_id) {
+            return Err(Error::message(format!(
+                "test service `{}` is not registered and cannot be replaced",
+                std::any::type_name::<T>()
+            )));
+        }
+
+        let shared: SharedService = value;
+        entries.insert(type_id, ServiceEntry::Singleton(shared));
+        Ok(())
+    }
 }
 
 fn resolve_factory<T>(factory: &ServiceFactory, container: &Container) -> Result<SharedService>
@@ -180,6 +198,24 @@ mod tests {
             .singleton::<String>("duplicate".to_string())
             .unwrap_err();
         assert!(error.to_string().contains("already registered"));
+    }
+
+    #[test]
+    fn test_replacement_requires_an_existing_registration() {
+        let container = Container::new();
+        let error = container
+            .replace_singleton_arc(Arc::new(String::from("replacement")))
+            .unwrap_err();
+        assert!(error.to_string().contains("is not registered"));
+
+        container.singleton(String::from("original")).unwrap();
+        container
+            .replace_singleton_arc(Arc::new(String::from("replacement")))
+            .unwrap();
+        assert_eq!(
+            container.resolve::<String>().unwrap().as_str(),
+            "replacement"
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::foundation::{Error, Result};
+use crate::imaging::ImageDecodeLimits;
 
 use super::adapter::StorageVisibility;
 
@@ -34,8 +35,20 @@ pub struct StorageConfig {
     pub disks: BTreeMap<String, toml::Table>,
 }
 
+impl StorageConfig {
+    pub(crate) fn image_decode_limits(&self) -> ImageDecodeLimits {
+        ImageDecodeLimits {
+            max_input_bytes: self.image_max_input_bytes,
+            max_pixels: self.image_max_pixels,
+            max_width: self.image_max_width,
+            max_height: self.image_max_height,
+        }
+    }
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
+        let image_limits = ImageDecodeLimits::default();
         Self {
             default: "local".to_string(),
             max_upload_size_bytes: DEFAULT_MAX_UPLOAD_SIZE_BYTES,
@@ -44,10 +57,10 @@ impl Default for StorageConfig {
             upload_temp_retention_seconds: 3600,
             upload_temp_prune_interval_ms: 3_600_000,
             upload_temp_prune_batch_size: 1000,
-            image_max_input_bytes: 52_428_800,
-            image_max_pixels: 50_000_000,
-            image_max_width: 12_000,
-            image_max_height: 12_000,
+            image_max_input_bytes: image_limits.max_input_bytes,
+            image_max_pixels: image_limits.max_pixels,
+            image_max_width: image_limits.max_width,
+            image_max_height: image_limits.max_height,
             attachment_orphan_audit_enabled: true,
             attachment_orphan_delete_enabled: false,
             attachment_orphan_retention_seconds: 604_800,
@@ -74,10 +87,7 @@ impl ResolvedLocalConfig {
             .ok_or_else(|| Error::message("Missing required field 'root' for local disk config"))?
             .to_string();
 
-        let url = table
-            .get("url")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let url = optional_non_empty_string(table, "url");
 
         let visibility = visibility_from_table(table);
 
@@ -94,8 +104,9 @@ pub struct ResolvedS3Config {
     pub bucket: String,
     pub region: String,
     pub endpoint: Option<String>,
-    pub key: String,
-    pub secret: String,
+    pub key: Option<String>,
+    pub secret: Option<String>,
+    pub session_token: Option<String>,
     pub url: Option<String>,
     pub use_path_style: bool,
     pub visibility: StorageVisibility,
@@ -108,7 +119,20 @@ impl std::fmt::Debug for ResolvedS3Config {
             .field("region", &self.region)
             .field("endpoint", &self.endpoint)
             .field("key", &self.key)
-            .field("secret", &crate::support::redaction::REDACTED)
+            .field(
+                "secret",
+                &self
+                    .secret
+                    .as_ref()
+                    .map(|_| crate::support::redaction::REDACTED),
+            )
+            .field(
+                "session_token",
+                &self
+                    .session_token
+                    .as_ref()
+                    .map(|_| crate::support::redaction::REDACTED),
+            )
             .field("url", &self.url)
             .field("use_path_style", &self.use_path_style)
             .field("visibility", &self.visibility)
@@ -130,26 +154,30 @@ impl ResolvedS3Config {
             .ok_or_else(|| Error::message("Missing required field 'region' for S3 disk config"))?
             .to_string();
 
-        let key = table
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::message("Missing required field 'key' for S3 disk config"))?
-            .to_string();
+        let key = optional_non_empty_string(table, "key");
+        let secret = optional_non_empty_string(table, "secret");
+        let session_token = optional_non_empty_string(table, "session_token");
+        match (&key, &secret) {
+            (Some(_), None) => {
+                return Err(Error::message(
+                    "S3 disk config field 'key' requires field 'secret'",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(Error::message(
+                    "S3 disk config field 'secret' requires field 'key'",
+                ));
+            }
+            _ => {}
+        }
+        if session_token.is_some() && key.is_none() {
+            return Err(Error::message(
+                "S3 disk config field 'session_token' requires explicit 'key' and 'secret'",
+            ));
+        }
 
-        let secret = table
-            .get("secret")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::message("Missing required field 'secret' for S3 disk config"))?
-            .to_string();
-
-        let endpoint = table
-            .get("endpoint")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let url = table
-            .get("url")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let endpoint = optional_non_empty_string(table, "endpoint");
+        let url = optional_non_empty_string(table, "url");
         let use_path_style = table
             .get("use_path_style")
             .and_then(|v| v.as_bool())
@@ -162,11 +190,20 @@ impl ResolvedS3Config {
             endpoint,
             key,
             secret,
+            session_token,
             url,
             use_path_style,
             visibility,
         })
     }
+}
+
+fn optional_non_empty_string(table: &toml::Table, key: &str) -> Option<String> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 pub(crate) fn visibility_from_table(table: &toml::Table) -> StorageVisibility {
@@ -271,6 +308,7 @@ mod tests {
             region = "us-east-1"
             key = "AKIAIOSFODNN7EXAMPLE"
             secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            session_token = "temporary-session-token"
             endpoint = "https://s3.example.com"
             url = "https://cdn.example.com"
             use_path_style = true
@@ -284,8 +322,15 @@ mod tests {
         let resolved = ResolvedS3Config::from_table(s3_table).unwrap();
         assert_eq!(resolved.bucket, "my-bucket");
         assert_eq!(resolved.region, "us-east-1");
-        assert_eq!(resolved.key, "AKIAIOSFODNN7EXAMPLE");
-        assert_eq!(resolved.secret, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        assert_eq!(resolved.key.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
+        assert_eq!(
+            resolved.secret.as_deref(),
+            Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+        );
+        assert_eq!(
+            resolved.session_token.as_deref(),
+            Some("temporary-session-token")
+        );
         assert_eq!(resolved.endpoint.as_deref(), Some("https://s3.example.com"));
         assert_eq!(resolved.url.as_deref(), Some("https://cdn.example.com"));
         assert!(resolved.use_path_style);
@@ -350,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_s3_config_missing_key_returns_error() {
+    fn resolved_s3_config_rejects_secret_without_key() {
         let mut table = toml::Table::new();
         table.insert(
             "bucket".to_string(),
@@ -367,11 +412,14 @@ mod tests {
 
         let result = ResolvedS3Config::from_table(&table);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("key"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires field 'key'"));
     }
 
     #[test]
-    fn resolved_s3_config_missing_secret_returns_error() {
+    fn resolved_s3_config_rejects_key_without_secret() {
         let mut table = toml::Table::new();
         table.insert(
             "bucket".to_string(),
@@ -385,11 +433,14 @@ mod tests {
 
         let result = ResolvedS3Config::from_table(&table);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("secret"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires field 'secret'"));
     }
 
     #[test]
-    fn resolved_s3_config_defaults() {
+    fn resolved_s3_config_defaults_to_aws_credential_provider_chain() {
         let mut table = toml::Table::new();
         table.insert(
             "bucket".to_string(),
@@ -399,17 +450,87 @@ mod tests {
             "region".to_string(),
             toml::Value::String("us-east-1".to_string()),
         );
-        table.insert("key".to_string(), toml::Value::String("key".to_string()));
-        table.insert(
-            "secret".to_string(),
-            toml::Value::String("secret".to_string()),
-        );
-
         let resolved = ResolvedS3Config::from_table(&table).unwrap();
         assert!(resolved.endpoint.is_none());
+        assert!(resolved.key.is_none());
+        assert!(resolved.secret.is_none());
+        assert!(resolved.session_token.is_none());
         assert!(resolved.url.is_none());
         assert!(!resolved.use_path_style);
         assert_eq!(resolved.visibility, StorageVisibility::Private);
+    }
+
+    #[test]
+    fn resolved_s3_config_rejects_session_token_without_explicit_credentials() {
+        let table = toml::Table::from_iter([
+            (
+                "bucket".to_string(),
+                toml::Value::String("my-bucket".to_string()),
+            ),
+            (
+                "region".to_string(),
+                toml::Value::String("us-east-1".to_string()),
+            ),
+            (
+                "session_token".to_string(),
+                toml::Value::String("token".to_string()),
+            ),
+        ]);
+
+        let error = ResolvedS3Config::from_table(&table).unwrap_err();
+
+        assert!(error.to_string().contains("session_token"));
+        assert!(error.to_string().contains("explicit 'key' and 'secret'"));
+    }
+
+    #[test]
+    fn resolved_s3_config_treats_blank_optional_credentials_as_absent() {
+        let table = toml::Table::from_iter([
+            (
+                "bucket".to_string(),
+                toml::Value::String("my-bucket".to_string()),
+            ),
+            (
+                "region".to_string(),
+                toml::Value::String("us-east-1".to_string()),
+            ),
+            ("key".to_string(), toml::Value::String(String::new())),
+            ("secret".to_string(), toml::Value::String(String::new())),
+        ]);
+
+        let resolved = ResolvedS3Config::from_table(&table).unwrap();
+
+        assert!(resolved.key.is_none());
+        assert!(resolved.secret.is_none());
+    }
+
+    #[test]
+    fn resolved_s3_config_debug_redacts_secret_and_session_token() {
+        let table = toml::Table::from_iter([
+            (
+                "bucket".to_string(),
+                toml::Value::String("my-bucket".to_string()),
+            ),
+            (
+                "region".to_string(),
+                toml::Value::String("us-east-1".to_string()),
+            ),
+            ("key".to_string(), toml::Value::String("key".to_string())),
+            (
+                "secret".to_string(),
+                toml::Value::String("visible-secret".to_string()),
+            ),
+            (
+                "session_token".to_string(),
+                toml::Value::String("visible-token".to_string()),
+            ),
+        ]);
+
+        let debug = format!("{:?}", ResolvedS3Config::from_table(&table).unwrap());
+
+        assert!(!debug.contains("visible-secret"));
+        assert!(!debug.contains("visible-token"));
+        assert!(debug.contains(crate::support::redaction::REDACTED));
     }
 
     #[test]

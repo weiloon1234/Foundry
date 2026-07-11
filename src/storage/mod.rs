@@ -185,8 +185,26 @@ impl StorageManager {
             .await
     }
 
+    pub async fn put_stream<R>(
+        &self,
+        path: &str,
+        stream: R,
+        content_type: Option<&str>,
+    ) -> Result<stored_file::StoredFile>
+    where
+        R: tokio::io::AsyncRead + Send + 'static,
+    {
+        self.default_disk()?
+            .put_stream(path, stream, content_type)
+            .await
+    }
+
     pub async fn get(&self, path: &str) -> Result<Vec<u8>> {
         self.default_disk()?.get(path).await
+    }
+
+    pub async fn get_stream(&self, path: &str) -> Result<adapter::StorageReadStream> {
+        self.default_disk()?.get_stream(path).await
     }
 
     pub async fn delete(&self, path: &str) -> Result<()> {
@@ -224,9 +242,20 @@ impl StorageManager {
     ) -> Result<Vec<stored_file::StorageObject>> {
         self.default_disk()?.list_prefix(prefix, limit).await
     }
+
+    pub async fn list_prefix_after(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<stored_file::StorageObject>> {
+        self.default_disk()?
+            .list_prefix_after(prefix, after, limit)
+            .await
+    }
 }
 
-pub use adapter::{StorageAdapter, StorageVisibility};
+pub use adapter::{StorageAdapter, StorageReadStream, StorageVisibility, StorageWriteStream};
 pub use config::{ResolvedLocalConfig, ResolvedS3Config, StorageConfig};
 pub use disk::StorageDisk;
 pub use local::LocalStorageAdapter;

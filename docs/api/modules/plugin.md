@@ -49,6 +49,7 @@ struct PluginRegistrar
   fn register_assets<I>(&mut self, assets: I) -> Result<&mut Self>
   fn register_scaffolds<I>(&mut self, scaffolds: I) -> Result<&mut Self>
   fn register_guard<I, G>(&mut self, id: I, guard: G) -> &mut Self
+  fn register_actor_hydrator<I, H>( &mut self, guard: I, hydrator: H, ) -> &mut Self
   fn register_policy<I, P>(&mut self, id: I, policy: P) -> &mut Self
   fn register_authenticatable<M>(&mut self) -> &mut Self
   fn listen_event<E, L>(&mut self, listener: L) -> &mut Self

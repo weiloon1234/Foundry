@@ -1,5 +1,6 @@
 use std::fmt;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use chrono::{
     DateTime as ChronoDateTime, Duration as ChronoDuration, FixedOffset, NaiveDate as ChronoDate,
@@ -10,6 +11,7 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::foundation::{Error, Result};
+use crate::support::sync::lock_unpoisoned;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DateTime(ChronoDateTime<ChronoUtc>);
@@ -34,6 +36,13 @@ pub enum Timezone {
 #[derive(Clone, Debug)]
 pub struct Clock {
     timezone: Timezone,
+    source: ClockSource,
+}
+
+#[derive(Clone, Debug)]
+enum ClockSource {
+    System,
+    Controlled(Arc<Mutex<DateTime>>),
 }
 
 impl DateTime {
@@ -476,11 +485,28 @@ impl<'de> Deserialize<'de> for Timezone {
 
 impl Clock {
     pub fn new(timezone: Timezone) -> Self {
-        Self { timezone }
+        Self {
+            timezone,
+            source: ClockSource::System,
+        }
+    }
+
+    pub(crate) fn controlled(timezone: Timezone, now: DateTime) -> (Self, Arc<Mutex<DateTime>>) {
+        let control = Arc::new(Mutex::new(now));
+        (
+            Self {
+                timezone,
+                source: ClockSource::Controlled(control.clone()),
+            },
+            control,
+        )
     }
 
     pub fn now(&self) -> DateTime {
-        DateTime::now()
+        match &self.source {
+            ClockSource::System => DateTime::now(),
+            ClockSource::Controlled(now) => *lock_unpoisoned(now, "controlled clock"),
+        }
     }
 
     pub fn today(&self) -> Date {

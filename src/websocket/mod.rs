@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{AccessScope, Actor, Authenticatable};
@@ -17,6 +19,14 @@ use crate::support::{ChannelEventId, ChannelId, GuardId, PermissionId};
 
 pub(crate) fn presence_key(channel: &ChannelId) -> String {
     format!("ws:presence:{}", channel.as_str())
+}
+
+pub(crate) const DISCONNECT_ACTOR_TOPIC: &str = "__system:disconnect";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DisconnectActorCommand {
+    pub(crate) guard: GuardId,
+    pub(crate) actor_id: String,
 }
 
 pub(crate) fn presence_scope_key(channel: &ChannelId, room: Option<&str>) -> String {
@@ -252,6 +262,57 @@ pub trait ChannelHandler: Send + Sync + 'static {
     async fn handle(&self, context: WebSocketContext, payload: serde_json::Value) -> Result<()>;
 }
 
+/// A WebSocket channel handler whose inbound `message` payload is decoded to `T`.
+#[async_trait]
+pub trait TypedChannelHandler<T>: Send + Sync + 'static {
+    async fn handle(&self, context: WebSocketContext, payload: T) -> Result<()>;
+}
+
+#[async_trait]
+impl<T, F, Fut> TypedChannelHandler<T> for F
+where
+    T: Send + 'static,
+    F: Fn(WebSocketContext, T) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    async fn handle(&self, context: WebSocketContext, payload: T) -> Result<()> {
+        (self)(context, payload).await
+    }
+}
+
+struct TypedChannelHandlerAdapter<T, H> {
+    handler: H,
+    _payload: PhantomData<fn() -> T>,
+}
+
+#[async_trait]
+impl<T, H> ChannelHandler for TypedChannelHandlerAdapter<T, H>
+where
+    T: ApiSchema + DeserializeOwned + Send + 'static,
+    H: TypedChannelHandler<T>,
+{
+    async fn handle(&self, context: WebSocketContext, payload: serde_json::Value) -> Result<()> {
+        let decoded = serde_json::from_value(payload).map_err(|error| {
+            tracing::debug!(
+                target: "foundry.websocket",
+                channel = %context.channel(),
+                payload_type = %T::schema_name(),
+                error = %error,
+                "failed to decode typed WebSocket payload"
+            );
+            Error::http(
+                422,
+                format!(
+                    "invalid WebSocket payload for channel `{}`; expected `{}`",
+                    context.channel(),
+                    T::schema_name()
+                ),
+            )
+        })?;
+        self.handler.handle(context, decoded).await
+    }
+}
+
 #[async_trait]
 impl<F, Fut> ChannelHandler for F
 where
@@ -330,14 +391,18 @@ impl WebSocketPublisher {
         Ok(())
     }
 
-    /// Force disconnect all connections for a specific user (across all instances).
-    pub async fn disconnect_user(&self, actor_id: &str) -> Result<()> {
-        let command = serde_json::json!({
-            "type": "disconnect_user",
-            "actor_id": actor_id,
-        });
+    /// Force-disconnect an actor's connections for one guard across all instances.
+    pub async fn disconnect_actor<G>(&self, guard: G, actor_id: &str) -> Result<()>
+    where
+        G: Into<GuardId>,
+    {
+        let command = DisconnectActorCommand {
+            guard: guard.into(),
+            actor_id: actor_id.to_owned(),
+        };
+        let payload = serde_json::to_string(&command).map_err(Error::other)?;
         self.backend
-            .publish_ws("__system:disconnect", &command.to_string())
+            .publish_ws(DISCONNECT_ACTOR_TOPIC, &payload)
             .await
     }
 }
@@ -400,6 +465,7 @@ pub struct WebSocketChannelOptions {
     pub(crate) on_join: Option<LifecycleCallback>,
     pub(crate) on_leave: Option<LifecycleCallback>,
     pub(crate) replay_count: u32,
+    pub(crate) message_payload: Option<SchemaRef>,
     pub(crate) event_contracts: Vec<WebSocketChannelEventContract>,
 }
 
@@ -634,7 +700,7 @@ impl WebSocketRegistrar {
         I: Into<ChannelId>,
         H: ChannelHandler,
     {
-        self.channel_with_options(id, handler, WebSocketChannelOptions::default())
+        self.raw_channel(id, handler)
     }
 
     pub fn channel_with_options<I, H>(
@@ -647,7 +713,71 @@ impl WebSocketRegistrar {
         I: Into<ChannelId>,
         H: ChannelHandler,
     {
-        let id = id.into();
+        self.raw_channel_with_options(id, handler, options)
+    }
+
+    /// Register a typed channel handler and decode every inbound `message`
+    /// payload to `T` before invoking it.
+    pub fn typed_channel<T, H>(&mut self, id: impl Into<ChannelId>, handler: H) -> Result<&mut Self>
+    where
+        T: ApiSchema + DeserializeOwned + Send + 'static,
+        H: TypedChannelHandler<T>,
+    {
+        self.typed_channel_with_options::<T, H>(id, handler, WebSocketChannelOptions::default())
+    }
+
+    pub fn typed_channel_with_options<T, H>(
+        &mut self,
+        id: impl Into<ChannelId>,
+        handler: H,
+        mut options: WebSocketChannelOptions,
+    ) -> Result<&mut Self>
+    where
+        T: ApiSchema + DeserializeOwned + Send + 'static,
+        H: TypedChannelHandler<T>,
+    {
+        options.message_payload = Some(SchemaRef::of::<T>());
+        self.insert_channel(
+            id.into(),
+            TypedChannelHandlerAdapter::<T, H> {
+                handler,
+                _payload: PhantomData,
+            },
+            options,
+        )
+    }
+
+    /// Register a raw JSON channel handler explicitly.
+    pub fn raw_channel<I, H>(&mut self, id: I, handler: H) -> Result<&mut Self>
+    where
+        I: Into<ChannelId>,
+        H: ChannelHandler,
+    {
+        self.raw_channel_with_options(id, handler, WebSocketChannelOptions::default())
+    }
+
+    pub fn raw_channel_with_options<I, H>(
+        &mut self,
+        id: I,
+        handler: H,
+        options: WebSocketChannelOptions,
+    ) -> Result<&mut Self>
+    where
+        I: Into<ChannelId>,
+        H: ChannelHandler,
+    {
+        self.insert_channel(id.into(), handler, options)
+    }
+
+    fn insert_channel<H>(
+        &mut self,
+        id: ChannelId,
+        handler: H,
+        options: WebSocketChannelOptions,
+    ) -> Result<&mut Self>
+    where
+        H: ChannelHandler,
+    {
         if self.channels.contains_key(&id) {
             return Err(Error::message(format!(
                 "websocket channel `{id}` already registered"
@@ -692,6 +822,7 @@ pub struct WebSocketChannelDescriptor {
     pub requires_auth: bool,
     pub guard: Option<GuardId>,
     pub permissions: Vec<PermissionId>,
+    pub message_payload: Option<String>,
     pub incoming: Vec<WebSocketChannelEventDescriptor>,
     pub outgoing: Vec<WebSocketChannelEventDescriptor>,
 }
@@ -715,6 +846,11 @@ impl From<&RegisteredChannel> for WebSocketChannelDescriptor {
             requires_auth: channel.options.requires_auth(),
             guard: channel.options.guard_id().cloned(),
             permissions: channel.options.permissions_set().into_iter().collect(),
+            message_payload: channel
+                .options
+                .message_payload
+                .as_ref()
+                .map(|schema| schema.name.to_string()),
             incoming: channel
                 .options
                 .event_contracts
@@ -774,16 +910,39 @@ impl WebSocketChannelRegistry {
 #[cfg(test)]
 mod tests {
     use std::future::ready;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    use serde::Deserialize;
+    use serde_json::json;
 
     use super::{
-        ChannelEventId, ChannelId, GuardId, PermissionId, WebSocketChannelOptions,
-        WebSocketChannelRegistry, WebSocketRegistrar, WebSocketRouteRegistrar,
+        ChannelEventId, ChannelId, DisconnectActorCommand, GuardId, PermissionId,
+        WebSocketChannelOptions, WebSocketChannelRegistry, WebSocketRegistrar,
+        WebSocketRouteRegistrar,
     };
     use crate::auth::Actor;
     use crate::config::ConfigRepository;
     use crate::foundation::{AppContext, Container};
     use crate::validation::RuleRegistry;
+
+    #[derive(Deserialize)]
+    struct TypedChatPayload {
+        body: String,
+    }
+
+    impl crate::openapi::ApiSchema for TypedChatPayload {
+        fn schema() -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {"body": {"type": "string"}},
+                "required": ["body"]
+            })
+        }
+
+        fn schema_name() -> &'static str {
+            "TypedChatPayload"
+        }
+    }
 
     fn websocket_context() -> super::WebSocketContext {
         let app = AppContext::new(
@@ -831,6 +990,24 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_actor_command_carries_guard_and_actor_id() {
+        let command = DisconnectActorCommand {
+            guard: GuardId::new("admin"),
+            actor_id: "42".to_string(),
+        };
+
+        let payload = serde_json::to_string(&command).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DisconnectActorCommand>(&payload).unwrap(),
+            command
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap()["guard"],
+            "admin"
+        );
+    }
+
+    #[test]
     fn rejects_duplicate_channel_registration() {
         let mut registrar = WebSocketRegistrar::new();
         registrar
@@ -846,6 +1023,61 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("already registered"));
+    }
+
+    #[tokio::test]
+    async fn typed_channel_decodes_payload_and_rejects_invalid_shapes() {
+        let received = Arc::new(Mutex::new(None));
+        let captured = received.clone();
+        let mut registrar = WebSocketRegistrar::new();
+        registrar
+            .typed_channel::<TypedChatPayload, _>(
+                ChannelId::new("chat"),
+                move |_context, payload: TypedChatPayload| {
+                    let captured = captured.clone();
+                    async move {
+                        *captured.lock().unwrap() = Some(payload.body);
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+        let registry = WebSocketChannelRegistry::from_registrar(registrar);
+        let channel = &registry.registered_channels()[0];
+
+        channel
+            .handler
+            .handle(websocket_context(), json!({"body": "hello"}))
+            .await
+            .unwrap();
+        assert_eq!(received.lock().unwrap().as_deref(), Some("hello"));
+
+        let error = channel
+            .handler
+            .handle(websocket_context(), json!({"wrong": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.payload()["status"], 422);
+        assert!(error.to_string().contains("TypedChatPayload"));
+
+        let descriptor = registry.descriptors().remove(0);
+        assert_eq!(
+            descriptor.message_payload.as_deref(),
+            Some("TypedChatPayload")
+        );
+    }
+
+    #[test]
+    fn raw_channel_is_an_explicit_untyped_escape_hatch() {
+        let mut registrar = WebSocketRegistrar::new();
+        registrar
+            .raw_channel(ChannelId::new("raw"), |_context, _payload| async { Ok(()) })
+            .unwrap();
+
+        let descriptor = WebSocketChannelRegistry::from_registrar(registrar)
+            .descriptors()
+            .remove(0);
+        assert_eq!(descriptor.message_payload, None);
     }
 
     #[test]
@@ -971,6 +1203,7 @@ mod tests {
         assert!(descriptor.requires_auth);
         assert_eq!(descriptor.guard.as_ref(), Some(&GuardId::new("api")));
         assert_eq!(descriptor.permissions, vec![PermissionId::new("chat:read")]);
+        assert_eq!(descriptor.message_payload, None);
         assert_eq!(descriptor.incoming.len(), 2);
         assert_eq!(descriptor.incoming[0].event, ChannelEventId::new("send"));
         assert_eq!(descriptor.incoming[0].payload, Some("String".to_string()));

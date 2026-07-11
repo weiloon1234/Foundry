@@ -6,7 +6,7 @@ use std::{
 use crate::foundation::{Error, Result};
 use crate::logging::{catch_sync_panic, panic_payload_message};
 
-use super::ast::{ColumnRef, DbType, Expr, FromItem, SelectItem};
+use super::ast::{ColumnRef, DbType, DbValue, Expr, FromItem, Numeric, SelectItem};
 use super::model::FromDbValue;
 use super::runtime::DbRecord;
 
@@ -141,7 +141,20 @@ impl<P> ProjectionMeta<P> {
     }
 
     pub fn hydrate_record(&self, record: &DbRecord) -> Result<P> {
-        match catch_sync_panic(|| (self.hydrate)(record)) {
+        let mut normalized = record.clone();
+        for field in self.fields {
+            if field.db_type != DbType::Int64 {
+                continue;
+            }
+            let Some(DbValue::Text(value)) = record.get(field.alias) else {
+                continue;
+            };
+            if let Ok(value) = Numeric::new(value.clone()) {
+                normalized.insert(field.alias, DbValue::Numeric(value));
+            }
+        }
+
+        match catch_sync_panic(|| (self.hydrate)(&normalized)) {
             Ok(result) => result,
             Err(panic) => Err(projection_hydration_panic_error::<P>(panic)),
         }
@@ -207,6 +220,11 @@ mod tests {
         value: PanickingHydrationText,
     }
 
+    #[derive(Clone, Debug, PartialEq, crate::Projection)]
+    struct NumericAggregateProjection {
+        total: i64,
+    }
+
     #[test]
     fn projection_meta_hydration_panic_becomes_error() {
         let mut record = DbRecord::new();
@@ -218,5 +236,16 @@ mod tests {
         assert!(error
             .to_string()
             .contains("hydration panicked: projection hydrate boom"));
+    }
+
+    #[test]
+    fn projection_hydration_normalizes_compiler_numeric_text_for_int64_fields() {
+        let mut record = DbRecord::new();
+        record.insert("total", DbValue::Text("2500.0000".to_string()));
+
+        assert_eq!(
+            NumericAggregateProjection::from_record(&record).unwrap(),
+            NumericAggregateProjection { total: 2500 }
+        );
     }
 }

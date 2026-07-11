@@ -1,5 +1,6 @@
 pub(crate) mod callback;
 mod channel;
+mod database;
 pub(crate) mod job;
 
 use std::collections::HashMap;
@@ -17,9 +18,15 @@ pub use channel::{
     BroadcastNotificationChannel, DatabaseNotificationChannel, EmailNotificationChannel,
     NotificationChannel,
 };
+pub use database::{
+    DatabaseNotification, DatabaseNotificationRepository, DatabaseNotificationScope,
+};
 pub use job::SendNotificationJob;
 
-const NOTIFICATIONS_TABLE: &str = "notifications";
+pub(crate) const NOTIFICATIONS_TABLE: &str = "notifications";
+/// Compatibility morph type assigned to notifications created before typed
+/// notifiable scopes are configured.
+pub const DEFAULT_NOTIFIABLE_TYPE: &str = "default";
 
 pub const NOTIFICATION_BROADCAST_CHANNEL: ChannelId = ChannelId::new("notifications");
 pub const NOTIFICATION_BROADCAST_EVENT: ChannelEventId = ChannelEventId::new("notification");
@@ -67,14 +74,21 @@ fn authorize_notification_room(actor: &Actor, room: Option<&str>) -> Result<()> 
 
 pub(crate) async fn store_database_notification(
     app: &AppContext,
-    notifiable_id: String,
+    scope: &DatabaseNotificationScope,
     notification_type: String,
     data: serde_json::Value,
 ) -> Result<()> {
     let db = app.database()?;
     Query::insert_into(NOTIFICATIONS_TABLE)
         .values([
-            ("notifiable_id", DbValue::Text(notifiable_id)),
+            (
+                "notifiable_type",
+                DbValue::Text(scope.notifiable_type().to_string()),
+            ),
+            (
+                "notifiable_id",
+                DbValue::Text(scope.notifiable_id().to_string()),
+            ),
             ("type", DbValue::Text(notification_type)),
             ("data", DbValue::Json(data)),
         ])
@@ -149,6 +163,15 @@ pub trait Notification: Send + Sync {
 /// }
 /// ```
 pub trait Notifiable: Send + Sync {
+    /// Stable morph type used to isolate database notifications whose IDs can
+    /// overlap across different notifiable domains.
+    ///
+    /// The compatibility default matches rows created before typed scopes were
+    /// introduced. Override this before using more than one notifiable type.
+    fn notifiable_type(&self) -> &str {
+        DEFAULT_NOTIFIABLE_TYPE
+    }
+
     /// Unique identifier for this notifiable entity (e.g., user ID).
     fn notification_id(&self) -> String;
 
@@ -219,9 +242,92 @@ pub const NOTIFY_EMAIL: NotificationChannelId = NotificationChannelId::new("emai
 pub const NOTIFY_DATABASE: NotificationChannelId = NotificationChannelId::new("database");
 pub const NOTIFY_BROADCAST: NotificationChannelId = NotificationChannelId::new("broadcast");
 
+pub(crate) fn require_notification_route(
+    route: Option<String>,
+    channel: &NotificationChannelId,
+) -> Result<String> {
+    route
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::message(format!("notification channel `{channel}` requires a route")))
+}
+
+pub(crate) fn require_builtin_notification_payload<T>(
+    payload: Option<T>,
+    channel: &NotificationChannelId,
+) -> Result<T> {
+    let description = if channel == &NOTIFY_EMAIL {
+        "an email message"
+    } else {
+        "a payload"
+    };
+    payload.ok_or_else(|| {
+        Error::message(format!(
+            "notification channel `{channel}` requires {description}"
+        ))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch Functions
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NotificationDispatchKind {
+    Immediate,
+    Queued,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RecordedNotificationDispatch {
+    pub(crate) notifiable_type: String,
+    pub(crate) notifiable_id: String,
+    pub(crate) notification_type: String,
+    pub(crate) channels: Vec<NotificationChannelId>,
+    pub(crate) kind: NotificationDispatchKind,
+}
+
+pub(crate) trait NotificationDispatchSink: Send + Sync {
+    fn record(&self, dispatch: RecordedNotificationDispatch) -> Result<()>;
+}
+
+pub(crate) struct NotificationDispatchHook {
+    sink: Arc<dyn NotificationDispatchSink>,
+}
+
+impl NotificationDispatchHook {
+    pub(crate) fn new(sink: Arc<dyn NotificationDispatchSink>) -> Self {
+        Self { sink }
+    }
+
+    fn record(
+        &self,
+        notifiable: &dyn Notifiable,
+        notification: &dyn Notification,
+        kind: NotificationDispatchKind,
+    ) -> Result<()> {
+        let scope = DatabaseNotificationScope::for_notifiable(notifiable)?;
+        self.sink.record(RecordedNotificationDispatch {
+            notifiable_type: scope.notifiable_type().to_string(),
+            notifiable_id: scope.notifiable_id().to_string(),
+            notification_type: callback::notification_type(notification)?,
+            channels: callback::notification_channels(notification)?,
+            kind,
+        })
+    }
+}
+
+fn record_fake_notification(
+    app: &AppContext,
+    notifiable: &dyn Notifiable,
+    notification: &dyn Notification,
+    kind: NotificationDispatchKind,
+) -> Result<bool> {
+    let Ok(hook) = app.resolve::<NotificationDispatchHook>() else {
+        return Ok(false);
+    };
+    hook.record(notifiable, notification, kind)?;
+    Ok(true)
+}
 
 /// Send a notification synchronously, attempting every channel in sequence.
 ///
@@ -232,6 +338,15 @@ pub async fn notify(
     notifiable: &dyn Notifiable,
     notification: &dyn Notification,
 ) -> Result<()> {
+    if record_fake_notification(
+        app,
+        notifiable,
+        notification,
+        NotificationDispatchKind::Immediate,
+    )? {
+        return Ok(());
+    }
+
     let registry = app.resolve::<NotificationChannelRegistry>()?;
     let channels = callback::notification_channels(notification)?;
     let notification_type = callback::notification_type(notification)?;
@@ -277,27 +392,43 @@ pub async fn notify(
     }
 }
 
-/// Pre-render all notification payloads and wrap them in a job for async dispatch.
+/// Pre-render all notification payloads into the legacy aggregate job shape.
 ///
 /// Rendering, routing, and notification callback failures are returned without
-/// constructing a partial job.
+/// constructing a partial job. Existing serialized aggregate jobs remain
+/// supported, but new queued dispatch should use [`build_notification_jobs`] so
+/// each channel has independent retry and dead-letter state.
 pub fn build_notification_job(
     notifiable: &dyn Notifiable,
     notification: &dyn Notification,
 ) -> Result<SendNotificationJob> {
     let channels = callback::notification_channels(notification)?;
+    let notifiable_scope = DatabaseNotificationScope::for_notifiable(notifiable)?;
     let email_payload = if has_notification_channel(&channels, &NOTIFY_EMAIL) {
-        callback::notification_email(notification, notifiable)?
+        require_notification_route(
+            callback::route_notification_for(notifiable, NOTIFY_EMAIL.as_ref())?,
+            &NOTIFY_EMAIL,
+        )?;
+        Some(require_builtin_notification_payload(
+            callback::notification_email(notification, notifiable)?,
+            &NOTIFY_EMAIL,
+        )?)
     } else {
         None
     };
     let database_payload = if has_notification_channel(&channels, &NOTIFY_DATABASE) {
-        callback::notification_database(notification)?
+        Some(require_builtin_notification_payload(
+            callback::notification_database(notification)?,
+            &NOTIFY_DATABASE,
+        )?)
     } else {
         None
     };
     let broadcast_payload = if has_notification_channel(&channels, &NOTIFY_BROADCAST) {
-        callback::notification_broadcast(notification)?
+        Some(require_builtin_notification_payload(
+            callback::notification_broadcast(notification)?,
+            &NOTIFY_BROADCAST,
+        )?)
     } else {
         None
     };
@@ -320,7 +451,8 @@ pub fn build_notification_job(
     }
 
     Ok(SendNotificationJob {
-        notifiable_id: callback::notifiable_id(notifiable)?,
+        notifiable_type: notifiable_scope.notifiable_type().to_string(),
+        notifiable_id: notifiable_scope.notifiable_id().to_string(),
         notification_type: callback::notification_type(notification)?,
         channels,
         email_payload,
@@ -329,6 +461,22 @@ pub fn build_notification_job(
         custom_payloads,
         custom_routes,
     })
+}
+
+/// Pre-render a notification into one independently retryable job per channel.
+///
+/// Each returned job deliberately retains the existing `SendNotificationJob`
+/// ID and wire shape, allowing older workers to consume jobs produced during a
+/// rolling deployment. New workers also continue to accept legacy aggregate
+/// jobs that were already queued. Deploy custom channel adapters to every
+/// worker before producers select them. During a mixed-version rollout, keep
+/// [`Notifiable::notifiable_type`] at [`DEFAULT_NOTIFIABLE_TYPE`]; enable custom
+/// types after all workers understand the new field.
+pub fn build_notification_jobs(
+    notifiable: &dyn Notifiable,
+    notification: &dyn Notification,
+) -> Result<Vec<SendNotificationJob>> {
+    Ok(build_notification_job(notifiable, notification)?.into_channel_jobs())
 }
 
 fn has_notification_channel(
@@ -355,8 +503,43 @@ pub async fn notify_queued(
     notifiable: &dyn Notifiable,
     notification: &dyn Notification,
 ) -> Result<()> {
-    let job = build_notification_job(notifiable, notification)?;
-    app.jobs()?.dispatch(job).await
+    if record_fake_notification(
+        app,
+        notifiable,
+        notification,
+        NotificationDispatchKind::Queued,
+    )? {
+        return Ok(());
+    }
+
+    let jobs = build_notification_jobs(notifiable, notification)?;
+    dispatch_notification_jobs(app, jobs).await
+}
+
+pub(crate) async fn dispatch_notification_jobs(
+    app: &AppContext,
+    jobs: Vec<SendNotificationJob>,
+) -> Result<()> {
+    let dispatcher = app.jobs()?;
+    let mut failures = Vec::new();
+    for job in jobs {
+        let channel = job
+            .selected_channel()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "legacy-aggregate".to_string());
+        if let Err(error) = dispatcher.dispatch(job).await {
+            failures.push(format!("channel `{channel}`: {error}"));
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::message(format!(
+            "queued notification dispatch failed: {}",
+            failures.join("; ")
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -365,6 +548,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use serde::Deserialize;
     use serde_json::json;
 
     use super::*;
@@ -390,6 +574,7 @@ mod tests {
 
     fn queued_job(channel: NotificationChannelId) -> SendNotificationJob {
         SendNotificationJob {
+            notifiable_type: DEFAULT_NOTIFIABLE_TYPE.to_string(),
             notifiable_id: "user-1".to_string(),
             notification_type: "test.notification".to_string(),
             channels: vec![channel],
@@ -457,6 +642,18 @@ mod tests {
         }
     }
 
+    struct PanickingTypeNotifiable;
+
+    impl Notifiable for PanickingTypeNotifiable {
+        fn notifiable_type(&self) -> &str {
+            panic!("notifiable type exploded")
+        }
+
+        fn notification_id(&self) -> String {
+            "user-1".to_string()
+        }
+    }
+
     struct PanickingRouteNotifiable;
 
     impl Notifiable for PanickingRouteNotifiable {
@@ -498,6 +695,42 @@ mod tests {
             _notifiable: &dyn Notifiable,
         ) -> Option<serde_json::Value> {
             Some(json!({ "channel": channel }))
+        }
+    }
+
+    struct EmptyBuiltinNotification {
+        channel: NotificationChannelId,
+    }
+
+    impl EmptyBuiltinNotification {
+        fn new(channel: NotificationChannelId) -> Self {
+            Self { channel }
+        }
+    }
+
+    impl Notification for EmptyBuiltinNotification {
+        fn notification_type(&self) -> &str {
+            "test.empty_builtin"
+        }
+
+        fn via(&self) -> Vec<NotificationChannelId> {
+            vec![self.channel.clone()]
+        }
+    }
+
+    struct EmailPayloadNotification;
+
+    impl Notification for EmailPayloadNotification {
+        fn notification_type(&self) -> &str {
+            "test.email_payload"
+        }
+
+        fn via(&self) -> Vec<NotificationChannelId> {
+            vec![NOTIFY_EMAIL]
+        }
+
+        fn to_email(&self, _notifiable: &dyn Notifiable) -> Option<EmailMessage> {
+            Some(EmailMessage::new("Test notification"))
         }
     }
 
@@ -896,6 +1129,85 @@ mod tests {
             .contains("notification database renderer panicked: database renderer exploded"));
     }
 
+    #[tokio::test]
+    async fn built_in_channels_reject_missing_route_or_payload() {
+        let app = test_app(Vec::new());
+
+        let error = EmailNotificationChannel
+            .send(&app, &RoutedNotifiable, &EmailPayloadNotification)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "notification channel `email` requires a route"
+        );
+
+        let error = EmailNotificationChannel
+            .send(
+                &app,
+                &TestNotifiable,
+                &EmptyBuiltinNotification::new(NOTIFY_EMAIL),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "notification channel `email` requires an email message"
+        );
+
+        let error = DatabaseNotificationChannel
+            .send(
+                &app,
+                &TestNotifiable,
+                &EmptyBuiltinNotification::new(NOTIFY_DATABASE),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "notification channel `database` requires a payload"
+        );
+
+        let error = BroadcastNotificationChannel
+            .send(
+                &app,
+                &TestNotifiable,
+                &EmptyBuiltinNotification::new(NOTIFY_BROADCAST),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "notification channel `broadcast` requires a payload"
+        );
+    }
+
+    #[test]
+    fn queued_builder_rejects_missing_selected_builtin_route_or_payload() {
+        let error = build_notification_job(&RoutedNotifiable, &EmailPayloadNotification)
+            .expect_err("selected email channel requires a route");
+        assert_eq!(
+            error.to_string(),
+            "notification channel `email` requires a route"
+        );
+
+        for (channel, expected) in [
+            (NOTIFY_EMAIL, "an email message"),
+            (NOTIFY_DATABASE, "a payload"),
+            (NOTIFY_BROADCAST, "a payload"),
+        ] {
+            let error = build_notification_job(
+                &TestNotifiable,
+                &EmptyBuiltinNotification::new(channel.clone()),
+            )
+            .expect_err("selected built-in channel requires its payload");
+            assert_eq!(
+                error.to_string(),
+                format!("notification channel `{channel}` requires {expected}")
+            );
+        }
+    }
+
     #[test]
     fn queued_builder_only_renders_selected_builtin_channels() {
         let job =
@@ -912,6 +1224,37 @@ mod tests {
     }
 
     #[test]
+    fn queued_builder_creates_one_wire_compatible_job_per_selected_channel() {
+        #[derive(Deserialize)]
+        struct LegacyJobView {
+            channels: Vec<NotificationChannelId>,
+        }
+
+        let sms = NotificationChannelId::new("sms");
+        let jobs = build_notification_jobs(
+            &RoutedNotifiable,
+            &TestNotification::new(vec![NOTIFY_DATABASE, sms.clone()]),
+        )
+        .unwrap();
+
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].channels, vec![NOTIFY_DATABASE]);
+        assert!(jobs[0].database_payload.is_some());
+        assert!(jobs[0].custom_payloads.is_empty());
+        assert_eq!(jobs[1].channels, vec![sms.clone()]);
+        assert!(jobs[1].database_payload.is_none());
+        assert_eq!(jobs[1].custom_payloads[0].0, sms);
+
+        for job in jobs {
+            let serialized = serde_json::to_value(&job).unwrap();
+            let legacy: LegacyJobView = serde_json::from_value(serialized.clone()).unwrap();
+            assert_eq!(legacy.channels.len(), 1);
+            let current: SendNotificationJob = serde_json::from_value(serialized).unwrap();
+            assert_eq!(current.channels, legacy.channels);
+        }
+    }
+
+    #[test]
     fn queued_builder_propagates_custom_route_panic() {
         let notification = TestNotification::new(vec![NotificationChannelId::new("sms")]);
 
@@ -920,6 +1263,19 @@ mod tests {
         assert!(error
             .to_string()
             .contains("notification notifiable route callback for `sms` panicked: route exploded"));
+    }
+
+    #[test]
+    fn queued_builder_isolates_notifiable_type_panic() {
+        let error = build_notification_jobs(
+            &PanickingTypeNotifiable,
+            &TestNotification::new(vec![NOTIFY_DATABASE]),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("notification notifiable type callback panicked: notifiable type exploded"));
     }
 
     #[tokio::test]
@@ -953,10 +1309,51 @@ mod tests {
     fn queued_job_deserializes_payloads_created_before_custom_routes() {
         let mut serialized = serde_json::to_value(queued_job(NOTIFY_DATABASE)).unwrap();
         serialized.as_object_mut().unwrap().remove("custom_routes");
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("notifiable_type");
 
         let job: SendNotificationJob = serde_json::from_value(serialized).unwrap();
 
         assert!(job.custom_routes.is_empty());
+        assert_eq!(job.notifiable_type, DEFAULT_NOTIFIABLE_TYPE);
+    }
+
+    #[tokio::test]
+    async fn per_channel_retry_does_not_replay_a_successful_custom_channel() {
+        let successful = NotificationChannelId::new("successful");
+        let failing = NotificationChannelId::new("failing");
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let app = test_app(vec![
+            (
+                successful.clone(),
+                Arc::new(RecordingChannel {
+                    log: deliveries.clone(),
+                }),
+            ),
+            (failing.clone(), Arc::new(FailingChannel)),
+        ]);
+        let jobs = build_notification_jobs(
+            &TestNotifiable,
+            &TestNotification::new(vec![successful.clone(), failing.clone()]),
+        )
+        .unwrap();
+        let successful_job = jobs
+            .iter()
+            .find(|job| job.selected_channel() == Some(&successful))
+            .unwrap();
+        let failing_job = jobs
+            .iter()
+            .find(|job| job.selected_channel() == Some(&failing))
+            .unwrap();
+
+        successful_job.deliver(&app).await.unwrap();
+        for _attempt in 0..2 {
+            assert!(failing_job.deliver(&app).await.is_err());
+        }
+
+        assert_eq!(deliveries.lock().unwrap().as_slice(), &["sent"]);
     }
 
     #[tokio::test]
@@ -980,6 +1377,25 @@ mod tests {
                 error
                     .to_string()
                     .contains(&format!("channel `{channel}` delivery failed")),
+                "unexpected {channel} error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_builtin_delivery_rejects_missing_selected_payload() {
+        let app = test_app(Vec::new());
+
+        for (channel, expected) in [
+            (NOTIFY_EMAIL, "an email message"),
+            (NOTIFY_DATABASE, "a payload"),
+            (NOTIFY_BROADCAST, "a payload"),
+        ] {
+            let error = queued_job(channel.clone()).deliver(&app).await.unwrap_err();
+            assert!(
+                error.to_string().contains(&format!(
+                    "channel `{channel}` delivery failed: notification channel `{channel}` requires {expected}"
+                )),
                 "unexpected {channel} error: {error}"
             );
         }

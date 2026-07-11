@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -48,9 +49,25 @@ pub const CLOUDFLARE_TRUSTED_CIDRS: &[&str] = &[
     "2c0f:f248::/32",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ConfigRepository {
     root: Arc<Value>,
+    diagnostics: Arc<ConfigDiagnostics>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ConfigDiagnostics {
+    unknown_config_keys: Vec<String>,
+    unknown_prefixed_env_overlays: Vec<String>,
+    legacy_unprefixed_env_overlays: Vec<String>,
+}
+
+impl std::fmt::Debug for ConfigRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigRepository")
+            .field("root", &crate::support::redaction::REDACTED)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -90,6 +107,10 @@ impl Environment {
         matches!(self, Self::Production)
     }
 
+    /// Classify the descriptive label only.
+    ///
+    /// Security-sensitive code should use [`AppConfig::resolved_security_tier`]
+    /// so explicit overrides and custom-label fail-closed behavior are honored.
     pub fn is_production_like(&self) -> bool {
         matches!(self, Self::Production | Self::Staging)
     }
@@ -123,11 +144,41 @@ impl std::fmt::Display for Environment {
     }
 }
 
+/// Security posture applied independently from the descriptive environment label.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityTier {
+    Relaxed,
+    Strict,
+}
+
+impl SecurityTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Relaxed => "relaxed",
+            Self::Strict => "strict",
+        }
+    }
+
+    pub const fn is_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
+
+impl std::fmt::Display for SecurityTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub name: String,
     pub environment: Environment,
+    /// Optional explicit security posture. Built-in environment labels derive
+    /// a tier when omitted; custom labels fail closed to strict.
+    pub security_tier: Option<SecurityTier>,
     pub timezone: Timezone,
     #[serde(default)]
     pub signing_key: String,
@@ -139,6 +190,7 @@ impl std::fmt::Debug for AppConfig {
         f.debug_struct("AppConfig")
             .field("name", &self.name)
             .field("environment", &self.environment)
+            .field("security_tier", &self.security_tier)
             .field("timezone", &self.timezone)
             .field("signing_key", &crate::support::redaction::REDACTED)
             .field(
@@ -154,6 +206,7 @@ impl Default for AppConfig {
         Self {
             name: "foundry".to_string(),
             environment: Environment::default(),
+            security_tier: None,
             timezone: Timezone::utc(),
             signing_key: String::new(),
             background_shutdown_timeout_ms: 30_000,
@@ -162,6 +215,22 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Resolve the security posture from an explicit override or the built-in
+    /// environment mapping. Unknown labels fail closed to [`SecurityTier::Strict`].
+    pub fn resolved_security_tier(&self) -> SecurityTier {
+        self.security_tier.unwrap_or(match &self.environment {
+            Environment::Development | Environment::Testing => SecurityTier::Relaxed,
+            Environment::Production | Environment::Staging | Environment::Custom(_) => {
+                SecurityTier::Strict
+            }
+        })
+    }
+
+    /// Whether a custom environment label still relies on the fail-closed tier.
+    pub fn custom_security_tier_requires_confirmation(&self) -> bool {
+        matches!(&self.environment, Environment::Custom(_)) && self.security_tier.is_none()
+    }
+
     /// Decode the base64-encoded signing key into raw bytes.
     ///
     /// Returns an error if the key is not configured, contains invalid base64,
@@ -366,6 +435,8 @@ impl Default for HttpRateLimitConfig {
 pub struct RedisConfig {
     pub url: String,
     pub namespace: String,
+    pub connect_timeout_ms: u64,
+    pub command_timeout_ms: u64,
 }
 
 impl std::fmt::Debug for RedisConfig {
@@ -376,7 +447,19 @@ impl std::fmt::Debug for RedisConfig {
                 &crate::support::redaction::redact_url_credentials(&self.url),
             )
             .field("namespace", &self.namespace)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("command_timeout_ms", &self.command_timeout_ms)
             .finish()
+    }
+}
+
+impl RedisConfig {
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_millis(self.connect_timeout_ms)
+    }
+
+    pub fn command_timeout(&self) -> Duration {
+        Duration::from_millis(self.command_timeout_ms)
     }
 }
 
@@ -385,6 +468,8 @@ impl Default for RedisConfig {
         Self {
             url: String::new(),
             namespace: "foundry".to_string(),
+            connect_timeout_ms: 5_000,
+            command_timeout_ms: 5_000,
         }
     }
 }
@@ -742,6 +827,8 @@ impl Default for AuthConfig {
 pub struct AuditConfig {
     pub redact_sensitive_fields: bool,
     pub sensitive_fields: Vec<String>,
+    /// Retention window consumed by built-in pruning. Zero keeps rows forever.
+    pub retention_days: u32,
 }
 
 impl Default for AuditConfig {
@@ -770,6 +857,7 @@ impl Default for AuditConfig {
                 "recovery_code".to_string(),
                 "recovery_codes".to_string(),
             ],
+            retention_days: 0,
         }
     }
 }
@@ -952,6 +1040,9 @@ pub struct LoggingConfig {
     pub format: LogFormat,
     pub log_dir: String,
     pub retention_days: u32,
+    pub file_queue_capacity: usize,
+    pub file_max_record_bytes: usize,
+    pub file_flush_timeout_ms: u64,
 }
 
 impl Default for LoggingConfig {
@@ -961,6 +1052,9 @@ impl Default for LoggingConfig {
             format: LogFormat::default(),
             log_dir: "logs".to_string(),
             retention_days: 30,
+            file_queue_capacity: 8_192,
+            file_max_record_bytes: 65_536,
+            file_flush_timeout_ms: 5_000,
         }
     }
 }
@@ -1061,12 +1155,15 @@ impl Default for HashingConfig {
 #[serde(default)]
 pub struct CryptConfig {
     pub key: String,
+    /// Older encryption keys accepted for decryption only, in newest-first order.
+    pub previous_keys: Vec<String>,
 }
 
 impl std::fmt::Debug for CryptConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CryptConfig")
             .field("key", &crate::support::redaction::REDACTED)
+            .field("previous_keys", &crate::support::redaction::REDACTED)
             .finish()
     }
 }
@@ -1159,6 +1256,7 @@ impl ConfigRepository {
     pub fn empty() -> Self {
         Self {
             root: Arc::new(Value::Table(Default::default())),
+            diagnostics: Arc::new(ConfigDiagnostics::default()),
         }
     }
 
@@ -1199,10 +1297,16 @@ impl ConfigRepository {
             merge_value(&mut root, value);
         }
 
-        overlay_env_vars(&mut root)?;
+        let unknown_config_keys = published::unknown_framework_config_keys(&root);
+        let overlay_diagnostics = overlay_env_vars(&mut root)?;
 
         Ok(Self {
             root: Arc::new(root),
+            diagnostics: Arc::new(ConfigDiagnostics {
+                unknown_config_keys,
+                unknown_prefixed_env_overlays: overlay_diagnostics.unknown_prefixed,
+                legacy_unprefixed_env_overlays: overlay_diagnostics.legacy_unprefixed,
+            }),
         })
     }
 
@@ -1215,14 +1319,32 @@ impl ConfigRepository {
         I: IntoIterator<Item = Value>,
     {
         let mut root = root_with_defaults(defaults);
-        overlay_env_vars(&mut root)?;
+        let unknown_config_keys = published::unknown_framework_config_keys(&root);
+        let overlay_diagnostics = overlay_env_vars(&mut root)?;
         Ok(Self {
             root: Arc::new(root),
+            diagnostics: Arc::new(ConfigDiagnostics {
+                unknown_config_keys,
+                unknown_prefixed_env_overlays: overlay_diagnostics.unknown_prefixed,
+                legacy_unprefixed_env_overlays: overlay_diagnostics.legacy_unprefixed,
+            }),
         })
     }
 
     pub fn root(&self) -> Arc<Value> {
         self.root.clone()
+    }
+
+    pub(crate) fn unknown_config_keys(&self) -> &[String] {
+        &self.diagnostics.unknown_config_keys
+    }
+
+    pub(crate) fn unknown_prefixed_env_overlays(&self) -> &[String] {
+        &self.diagnostics.unknown_prefixed_env_overlays
+    }
+
+    pub(crate) fn legacy_unprefixed_env_overlays(&self) -> &[String] {
+        &self.diagnostics.legacy_unprefixed_env_overlays
     }
 
     pub fn value(&self, path: &str) -> Option<Value> {
@@ -1373,16 +1495,35 @@ fn merge_value(target: &mut Value, source: Value) {
 /// the prefix is the collision-proof form and wins when both are set.
 const ENV_OVERLAY_PREFIX: &str = "FOUNDRY__";
 
-fn overlay_env_vars(root: &mut Value) -> Result<()> {
+#[derive(Default)]
+struct EnvOverlayDiagnostics {
+    unknown_prefixed: Vec<String>,
+    legacy_unprefixed: Vec<String>,
+}
+
+fn overlay_env_vars(root: &mut Value) -> Result<EnvOverlayDiagnostics> {
+    overlay_env_vars_from(root, std::env::vars())
+}
+
+fn overlay_env_vars_from<I>(root: &mut Value, variables: I) -> Result<EnvOverlayDiagnostics>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
     let mut prefixed = Vec::new();
-    for (key, raw_value) in std::env::vars() {
+    let mut diagnostics = EnvOverlayDiagnostics::default();
+    for (key, raw_value) in variables {
         if let Some(stripped) = key.strip_prefix(ENV_OVERLAY_PREFIX) {
+            let path = env_overlay_path(stripped);
+            if !path.is_empty() && !published::is_known_framework_config_path(&path) {
+                diagnostics.unknown_prefixed.push(key.clone());
+            }
             prefixed.push((stripped.to_string(), raw_value));
             continue;
         }
         if !key.contains("__") {
             continue;
         }
+        diagnostics.legacy_unprefixed.push(key.clone());
         apply_env_overlay(root, &key, &raw_value)?;
     }
 
@@ -1391,15 +1532,15 @@ fn overlay_env_vars(root: &mut Value) -> Result<()> {
         apply_env_overlay(root, &key, &raw_value)?;
     }
 
-    Ok(())
+    diagnostics.unknown_prefixed.sort();
+    diagnostics.unknown_prefixed.dedup();
+    diagnostics.legacy_unprefixed.sort();
+    diagnostics.legacy_unprefixed.dedup();
+    Ok(diagnostics)
 }
 
 fn apply_env_overlay(root: &mut Value, key: &str, raw_value: &str) -> Result<()> {
-    let segments = key
-        .split("__")
-        .filter(|segment| !segment.is_empty())
-        .map(|segment| segment.to_ascii_lowercase())
-        .collect::<Vec<_>>();
+    let segments = env_overlay_path(key);
 
     if segments.is_empty() {
         return Ok(());
@@ -1408,6 +1549,13 @@ fn apply_env_overlay(root: &mut Value, key: &str, raw_value: &str) -> Result<()>
     let value = parse_env_value(raw_value)?;
     set_value(root, &segments, value);
     Ok(())
+}
+
+fn env_overlay_path(key: &str) -> Vec<String> {
+    key.split("__")
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect()
 }
 
 fn parse_env_value(raw: &str) -> Result<Value> {
@@ -1453,14 +1601,16 @@ fn set_value(root: &mut Value, path: &[String], value: Value) {
 mod tests {
     use std::fs;
     use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
 
     use tempfile::tempdir;
+    use toml::Value;
 
     use super::{
         AppConfig, AuditConfig, AuthConfig, CacheConfig, CacheDriver, CacheErrorMode,
         ConfigRepository, CryptConfig, DatabaseConfig, DatatableConfig, Environment, HttpConfig,
         HttpRateLimitByConfig, JobsConfig, LoggingConfig, ObservabilityConfig, RedisConfig,
-        RuntimeConfig, SchedulerConfig, TypeScriptConfig, WebSocketConfig,
+        RuntimeConfig, SchedulerConfig, SecurityTier, TypeScriptConfig, WebSocketConfig,
         CLOUDFLARE_TRUSTED_CIDRS,
     };
     use crate::logging::{LogFormat, LogLevel};
@@ -1469,6 +1619,30 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn repository_debug_never_exposes_raw_config_values() {
+        let _guard = env_lock().lock().unwrap();
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("secrets.toml"),
+            r#"
+                [app]
+                signing_key = "signing-secret"
+
+                [custom]
+                nested_token = "arbitrary-secret"
+            "#,
+        )
+        .unwrap();
+
+        let config = ConfigRepository::from_dir(directory.path()).unwrap();
+        let debug = format!("{config:?}");
+
+        assert_eq!(debug, "ConfigRepository { root: \"[redacted]\" }");
+        assert!(!debug.contains("signing-secret"));
+        assert!(!debug.contains("arbitrary-secret"));
     }
 
     #[test]
@@ -1675,11 +1849,13 @@ mod tests {
     fn secret_config_debug_output_is_redacted() {
         let crypt = CryptConfig {
             key: "encryption-key-that-must-not-leak".to_string(),
+            previous_keys: vec!["previous-key-that-must-not-leak".to_string()],
         };
         let output = format!("{crypt:?}");
 
         assert!(output.contains("[redacted]"));
         assert!(!output.contains("encryption-key-that-must-not-leak"));
+        assert!(!output.contains("previous-key-that-must-not-leak"));
     }
 
     #[test]
@@ -1717,6 +1893,7 @@ mod tests {
         assert!(app.environment.is_staging());
         assert!(app.environment.is_production_like());
         assert!(!app.environment.is_production());
+        assert_eq!(app.resolved_security_tier(), SecurityTier::Strict);
     }
 
     #[test]
@@ -1732,6 +1909,91 @@ mod tests {
         assert_eq!(app.environment, Environment::Custom("eu-prod".to_string()));
         assert_eq!(app.environment.to_string(), "eu-prod");
         assert!(!app.environment.is_production_like());
+        assert_eq!(app.resolved_security_tier(), SecurityTier::Strict);
+        assert!(app.custom_security_tier_requires_confirmation());
+    }
+
+    #[test]
+    fn explicit_security_tier_overrides_builtin_and_custom_environment_defaults() {
+        let _guard = env_lock().lock().unwrap();
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("00-app.toml"),
+            r#"
+                [app]
+                environment = "development"
+                security_tier = "strict"
+            "#,
+        )
+        .unwrap();
+
+        let strict = ConfigRepository::from_dir(directory.path())
+            .unwrap()
+            .app()
+            .unwrap();
+        assert_eq!(strict.resolved_security_tier(), SecurityTier::Strict);
+        assert!(!strict.custom_security_tier_requires_confirmation());
+
+        fs::write(
+            directory.path().join("00-app.toml"),
+            r#"
+                [app]
+                environment = "eu-prod"
+                security_tier = "relaxed"
+            "#,
+        )
+        .unwrap();
+        let relaxed = ConfigRepository::from_dir(directory.path())
+            .unwrap()
+            .app()
+            .unwrap();
+        assert_eq!(relaxed.resolved_security_tier(), SecurityTier::Relaxed);
+        assert!(!relaxed.custom_security_tier_requires_confirmation());
+    }
+
+    #[test]
+    fn diagnostics_find_framework_table_and_field_typos_but_allow_custom_sections() {
+        let _guard = env_lock().lock().unwrap();
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("00-app.toml"),
+            r#"
+                [app]
+                enviroment = "production"
+
+                [databse]
+                url = "postgres://localhost/foundry"
+
+                [payments]
+                provider = "custom"
+            "#,
+        )
+        .unwrap();
+
+        let config = ConfigRepository::from_dir(directory.path()).unwrap();
+
+        assert_eq!(
+            config.unknown_config_keys(),
+            &["app.enviroment".to_string(), "databse.url".to_string()]
+        );
+    }
+
+    #[test]
+    fn overlay_diagnostics_find_prefixed_typos_and_legacy_unprefixed_names() {
+        let mut root = Value::Table(Default::default());
+        let diagnostics = super::overlay_env_vars_from(
+            &mut root,
+            [
+                ("SERVER__PORT".to_string(), "4000".to_string()),
+                ("FOUNDRY__SERVRE__PORT".to_string(), "5000".to_string()),
+                ("FOUNDRY__SERVER__PORT".to_string(), "6000".to_string()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(diagnostics.legacy_unprefixed, ["SERVER__PORT"]);
+        assert_eq!(diagnostics.unknown_prefixed, ["FOUNDRY__SERVRE__PORT"]);
+        assert_eq!(root["server"]["port"].as_integer(), Some(6000));
     }
 
     #[test]
@@ -1813,6 +2075,8 @@ mod tests {
                 [redis]
                 url = "redis://127.0.0.1/"
                 namespace = "foundry-tests"
+                connect_timeout_ms = 1750
+                command_timeout_ms = 2250
 
                 [websocket]
                 port = 4100
@@ -1889,6 +2153,10 @@ mod tests {
         assert!(!database.models.soft_deletes_default);
         assert_eq!(redis.url, "redis://127.0.0.1/");
         assert_eq!(redis.namespace, "foundry-tests");
+        assert_eq!(redis.connect_timeout_ms, 1_750);
+        assert_eq!(redis.command_timeout_ms, 2_250);
+        assert_eq!(redis.connect_timeout(), Duration::from_millis(1_750));
+        assert_eq!(redis.command_timeout(), Duration::from_millis(2_250));
         assert_eq!(websocket.path, "/realtime");
         assert_eq!(websocket.port, 4100);
         assert_eq!(websocket.max_message_size_bytes, 2_048);
@@ -1967,6 +2235,16 @@ mod tests {
         assert_eq!(cache.remember_lock_ttl_ms, 30_000);
         assert_eq!(cache.remember_lock_wait_timeout_ms, 5_000);
         assert_eq!(cache.remember_lock_poll_ms, 100);
+    }
+
+    #[test]
+    fn redis_config_defaults_bound_connection_and_command_waits() {
+        let redis = RedisConfig::default();
+
+        assert_eq!(redis.connect_timeout_ms, 5_000);
+        assert_eq!(redis.command_timeout_ms, 5_000);
+        assert_eq!(redis.connect_timeout(), Duration::from_secs(5));
+        assert_eq!(redis.command_timeout(), Duration::from_secs(5));
     }
 
     #[test]
@@ -2540,6 +2818,9 @@ mod tests {
                 level = "debug"
                 format = "json"
                 log_dir = "var/log"
+                file_queue_capacity = 256
+                file_max_record_bytes = 8192
+                file_flush_timeout_ms = 750
             "#,
         )
         .unwrap();
@@ -2550,6 +2831,9 @@ mod tests {
         assert_eq!(logging.level, LogLevel::Debug);
         assert_eq!(logging.format, LogFormat::Json);
         assert_eq!(logging.log_dir, "var/log");
+        assert_eq!(logging.file_queue_capacity, 256);
+        assert_eq!(logging.file_max_record_bytes, 8_192);
+        assert_eq!(logging.file_flush_timeout_ms, 750);
     }
 
     #[test]
@@ -2562,5 +2846,8 @@ mod tests {
         assert_eq!(logging.level, LogLevel::Info);
         assert_eq!(logging.format, LogFormat::Json);
         assert_eq!(logging.log_dir, "logs");
+        assert_eq!(logging.file_queue_capacity, 8_192);
+        assert_eq!(logging.file_max_record_bytes, 65_536);
+        assert_eq!(logging.file_flush_timeout_ms, 5_000);
     }
 }

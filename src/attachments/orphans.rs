@@ -14,6 +14,7 @@ use crate::support::{CommandId, DateTime};
 const ATTACHMENT_ORPHANS_COMMAND: CommandId = CommandId::new("attachment:orphans");
 const ATTACHMENT_ORPHANS_LOCK: &str = "attachments:orphan_audit";
 const LIST_PREFIX_UNSUPPORTED: &str = "storage adapter does not support prefix listing";
+const LIST_PAGINATION_UNSUPPORTED: &str = "storage adapter does not support prefix pagination";
 
 #[derive(Clone, Debug)]
 pub(crate) struct AttachmentOrphanOptions {
@@ -29,6 +30,8 @@ pub(crate) struct AttachmentOrphanReport {
     pub prefix: String,
     pub older_than_seconds: u64,
     pub limit: usize,
+    pub pages_scanned: usize,
+    pub objects_scanned: usize,
     pub delete: bool,
     pub candidate_count: usize,
     pub deleted_count: usize,
@@ -39,6 +42,8 @@ pub(crate) struct AttachmentOrphanReport {
 pub(crate) struct AttachmentOrphanDiskReport {
     pub disk: String,
     pub supported: bool,
+    pub pages_scanned: usize,
+    pub objects_scanned: usize,
     pub candidate_count: usize,
     pub deleted_count: usize,
     pub candidates: Vec<AttachmentOrphanCandidate>,
@@ -76,7 +81,7 @@ pub(crate) fn builtin_cli_registrar() -> CommandRegistrar {
                     Arg::new("limit")
                         .long("limit")
                         .value_name("N")
-                        .help("Max listed objects checked per disk"),
+                        .help("Storage objects fetched per scan page"),
                 )
                 .arg(
                     Arg::new("older_than_seconds")
@@ -143,6 +148,11 @@ pub(crate) async fn audit_attachment_orphans(
         prefix: normalize_prefix(&options.prefix)?,
         ..options
     };
+    if options.limit == 0 {
+        return Err(Error::message(
+            "attachment orphan scan page size must be greater than zero",
+        ));
+    }
 
     let disk_names = match options.disk.as_deref() {
         Some(name) => vec![name.to_string()],
@@ -150,6 +160,8 @@ pub(crate) async fn audit_attachment_orphans(
     };
     let now = DateTime::now();
     let mut disks = Vec::new();
+    let mut pages_scanned = 0;
+    let mut objects_scanned = 0;
     let mut candidate_count = 0;
     let mut deleted_count = 0;
 
@@ -158,64 +170,90 @@ pub(crate) async fn audit_attachment_orphans(
         let mut disk_report = AttachmentOrphanDiskReport {
             disk: disk_name.clone(),
             supported: true,
+            pages_scanned: 0,
+            objects_scanned: 0,
             candidate_count: 0,
             deleted_count: 0,
             candidates: Vec::new(),
             errors: Vec::new(),
         };
 
-        let objects = match disk.list_prefix(&options.prefix, options.limit).await {
-            Ok(objects) => objects,
-            Err(error) if is_listing_unsupported(&error) => {
-                disk_report.supported = false;
-                disk_report.errors.push(error.to_string());
-                disks.push(disk_report);
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-
         let referenced = referenced_attachment_paths(app, &disk_name, &options.prefix).await?;
-        let candidates = orphan_candidates_from_objects(
-            &disk_name,
-            objects,
-            &referenced,
-            options.older_than_seconds,
-            now,
-        );
+        let mut after = None;
+        loop {
+            let objects = match disk
+                .list_prefix_after(&options.prefix, after.as_deref(), options.limit)
+                .await
+            {
+                Ok(objects) => objects,
+                Err(error) if is_listing_unsupported(&error) => {
+                    disk_report.supported = false;
+                    disk_report.errors.push(error.to_string());
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if objects.is_empty() {
+                break;
+            }
+            validate_storage_page(&objects, after.as_deref())?;
 
-        for candidate in &candidates {
-            tracing::warn!(
-                target: "foundry.attachments",
-                disk = %candidate.disk,
-                path = %candidate.path,
-                age_seconds = candidate.age_seconds,
-                size = candidate.size,
-                "attachment orphan candidate found"
+            let page_len = objects.len();
+            let next_after = objects
+                .last()
+                .map(|object| object.path.clone())
+                .ok_or_else(|| Error::message("attachment orphan scan returned an empty page"))?;
+            disk_report.pages_scanned += 1;
+            disk_report.objects_scanned += page_len;
+
+            let candidates = orphan_candidates_from_objects(
+                &disk_name,
+                objects,
+                &referenced,
+                options.older_than_seconds,
+                now,
             );
-            if options.delete {
-                match disk.delete(&candidate.path).await {
-                    Ok(()) => {
-                        disk_report.deleted_count += 1;
-                        deleted_count += 1;
-                    }
-                    Err(error) => {
-                        let message = format!("failed to delete `{}`: {error}", candidate.path);
-                        tracing::warn!(
-                            target: "foundry.attachments",
-                            disk = %candidate.disk,
-                            path = %candidate.path,
-                            error = %error,
-                            "failed to delete attachment orphan candidate"
-                        );
-                        disk_report.errors.push(message);
+
+            for candidate in &candidates {
+                tracing::warn!(
+                    target: "foundry.attachments",
+                    disk = %candidate.disk,
+                    path = %candidate.path,
+                    age_seconds = candidate.age_seconds,
+                    size = candidate.size,
+                    "attachment orphan candidate found"
+                );
+                if options.delete {
+                    match disk.delete(&candidate.path).await {
+                        Ok(()) => {
+                            disk_report.deleted_count += 1;
+                            deleted_count += 1;
+                        }
+                        Err(error) => {
+                            let message = format!("failed to delete `{}`: {error}", candidate.path);
+                            tracing::warn!(
+                                target: "foundry.attachments",
+                                disk = %candidate.disk,
+                                path = %candidate.path,
+                                error = %error,
+                                "failed to delete attachment orphan candidate"
+                            );
+                            disk_report.errors.push(message);
+                        }
                     }
                 }
             }
+            disk_report.candidates.extend(candidates);
+
+            if page_len < options.limit {
+                break;
+            }
+            after = Some(next_after);
         }
 
-        disk_report.candidate_count = candidates.len();
-        disk_report.candidates = candidates;
+        disk_report.candidate_count = disk_report.candidates.len();
+        pages_scanned += disk_report.pages_scanned;
+        objects_scanned += disk_report.objects_scanned;
         candidate_count += disk_report.candidate_count;
         disks.push(disk_report);
     }
@@ -224,6 +262,8 @@ pub(crate) async fn audit_attachment_orphans(
         prefix: options.prefix,
         older_than_seconds: options.older_than_seconds,
         limit: options.limit,
+        pages_scanned,
+        objects_scanned,
         delete: options.delete,
         candidate_count,
         deleted_count,
@@ -274,12 +314,11 @@ async fn attachment_orphans_command(invocation: CommandInvocation) -> Result<()>
     let json = invocation.matches().get_flag("json");
     let report = audit_attachment_orphans(invocation.app(), options).await?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).map_err(Error::other)?
-        );
+        invocation.line(serde_json::to_string_pretty(&report).map_err(Error::other)?)?;
     } else {
-        print_text_report(&report);
+        for line in text_report_lines(&report) {
+            invocation.line(line)?;
+        }
     }
     Ok(())
 }
@@ -322,7 +361,23 @@ fn escaped_like_prefix(prefix: &str) -> String {
 }
 
 fn is_listing_unsupported(error: &Error) -> bool {
-    error.to_string().contains(LIST_PREFIX_UNSUPPORTED)
+    let message = error.to_string();
+    message.contains(LIST_PREFIX_UNSUPPORTED) || message.contains(LIST_PAGINATION_UNSUPPORTED)
+}
+
+fn validate_storage_page(objects: &[StorageObject], after: Option<&str>) -> Result<()> {
+    let mut previous = after;
+    for object in objects {
+        if previous.is_some_and(|previous| object.path.as_str() <= previous) {
+            return Err(Error::message(format!(
+                "storage prefix pagination must return strictly increasing paths; received `{}` after `{}`",
+                object.path,
+                previous.unwrap_or_default()
+            )));
+        }
+        previous = Some(&object.path);
+    }
+    Ok(())
 }
 
 fn parse_optional_usize(invocation: &CommandInvocation, name: &str) -> Result<Option<usize>> {
@@ -359,30 +414,38 @@ fn flag_name(name: &str) -> String {
     name.replace('_', "-")
 }
 
-fn print_text_report(report: &AttachmentOrphanReport) {
-    println!(
-        "attachment orphan audit: {} candidate(s), {} deleted",
-        report.candidate_count, report.deleted_count
-    );
+fn text_report_lines(report: &AttachmentOrphanReport) -> Vec<String> {
+    let mut lines = vec![format!(
+        "attachment orphan audit: {} object(s) across {} page(s), {} candidate(s), {} deleted",
+        report.objects_scanned, report.pages_scanned, report.candidate_count, report.deleted_count
+    )];
     for disk in &report.disks {
         if !disk.supported {
-            println!("  {}: skipped (prefix listing unsupported)", disk.disk);
+            lines.push(format!(
+                "  {}: incomplete (prefix pagination unsupported)",
+                disk.disk
+            ));
             continue;
         }
-        println!(
-            "  {}: {} candidate(s), {} deleted",
-            disk.disk, disk.candidate_count, disk.deleted_count
-        );
+        lines.push(format!(
+            "  {}: {} object(s) across {} page(s), {} candidate(s), {} deleted",
+            disk.disk,
+            disk.objects_scanned,
+            disk.pages_scanned,
+            disk.candidate_count,
+            disk.deleted_count
+        ));
         for candidate in &disk.candidates {
-            println!(
+            lines.push(format!(
                 "    {} ({} bytes, age {}s)",
                 candidate.path, candidate.size, candidate.age_seconds
-            );
+            ));
         }
         for error in &disk.errors {
-            println!("    error: {error}");
+            lines.push(format!("    error: {error}"));
         }
     }
+    lines
 }
 
 #[cfg(test)]
@@ -426,5 +489,26 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].path, "attachments/a.jpg");
         assert_eq!(candidates[0].disk, "local");
+    }
+
+    #[test]
+    fn storage_page_validation_requires_strict_cursor_progress() {
+        let now = DateTime::now();
+        let page = vec![
+            StorageObject {
+                path: "attachments/b.jpg".to_string(),
+                size: 1,
+                modified_at: now,
+            },
+            StorageObject {
+                path: "attachments/c.jpg".to_string(),
+                size: 1,
+                modified_at: now,
+            },
+        ];
+        validate_storage_page(&page, Some("attachments/a.jpg")).unwrap();
+
+        let error = validate_storage_page(&page, Some("attachments/b.jpg")).unwrap_err();
+        assert!(error.to_string().contains("strictly increasing"));
     }
 }

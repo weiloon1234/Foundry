@@ -420,7 +420,7 @@ let product = Product::query().without_defaults().first(&app).await?;
 | Phase | Item | Depends On | Complexity | Status |
 |-------|------|-----------|-----------|--------|
 | 1 | Image module | — | M | ✅ Done — `src/imaging/mod.rs`, 13 tests |
-| 2 | always_with derive prep | — | S | ✅ Done — `without_defaults()` on ModelQuery |
+| 2 | always_with derive prep | — | S | Deferred — inert `without_defaults()` removed by completeness audit |
 | 3 | Attachments | Phase 1 | L | ✅ Done — `src/attachments/mod.rs`, HasAttachments, upload pipeline |
 | 4 | Metadata | — | S | ✅ Done — `src/metadata/mod.rs`, HasMetadata |
 | 5 | Translations | — | M | ✅ Done — `src/translations/mod.rs`, HasTranslations, CURRENT_LOCALE task_local |
@@ -491,5 +491,5 @@ foundry seed:countries    # seeds 250 countries (upsert, safe to re-run)
 - `HasAttachments`, `HasMetadata`, `HasTranslations` are async traits the consumer implements
 - Attachment file cleanup on `detach()` is default — use `detach_keep_file()` to opt out
 - `tokio::task_local!` propagates request locale to translation eager-loading automatically
-- `always_with` derive attribute deferred to future — `without_defaults()` prepared on ModelQuery
+- `always_with` derive attribute remains deferred; its unused `without_defaults()` preparatory switch was removed until the feature has a complete typed contract
 - Image module uses `image` crate only (no `imageproc`) — watermark text deferred

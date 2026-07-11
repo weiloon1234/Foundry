@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::database::{DbType, DbValue, Expr, OrderBy, Query, Sql};
-use crate::foundation::{AppContext, Result};
+use crate::foundation::{AppContext, Error, Result};
 
 const SETTINGS_TABLE: &str = "settings";
 
@@ -237,14 +237,22 @@ impl Setting {
     }
 
     /// Update only the value of an existing setting.
+    ///
+    /// Returns an error when the key does not exist. Use [`Setting::upsert`] when
+    /// creating a missing setting is intended.
     pub async fn set(app: &AppContext, key: &str, value: serde_json::Value) -> Result<()> {
         let db = app.database()?;
-        Query::update_table(SETTINGS_TABLE)
+        let affected = Query::update_table(SETTINGS_TABLE)
             .value("value", DbValue::Json(value))
             .set_expr("updated_at", Sql::now())
             .where_eq("key", key.to_string())
             .execute(db.as_ref())
             .await?;
+        if affected == 0 {
+            return Err(Error::message(format!(
+                "setting `{key}` does not exist; use Setting::upsert to create it"
+            )));
+        }
         Ok(())
     }
 
@@ -389,15 +397,22 @@ impl Setting {
 }
 
 fn row_to_setting(row: &crate::database::DbRecord) -> Result<Setting> {
+    let key = row.try_text("key")?;
+    let stored_type = row.try_text("setting_type")?;
+    let setting_type = SettingType::parse(&stored_type).ok_or_else(|| {
+        Error::message(format!(
+            "setting `{key}` has unknown setting type `{stored_type}`"
+        ))
+    })?;
+
     Ok(Setting {
         id: row.try_text_or_uuid("id")?,
-        key: row.try_text("key")?,
+        key,
         value: match row.get("value") {
             Some(DbValue::Json(v)) => Some(v.clone()),
             _ => None,
         },
-        setting_type: SettingType::parse(&row.try_text("setting_type")?)
-            .unwrap_or(SettingType::Text),
+        setting_type,
         parameters: match row.get("parameters") {
             Some(DbValue::Json(v)) => v.clone(),
             _ => serde_json::json!({}),
@@ -419,6 +434,7 @@ fn row_to_setting(row: &crate::database::DbRecord) -> Result<Setting> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::DbRecord;
 
     #[test]
     fn setting_type_roundtrip() {
@@ -455,5 +471,20 @@ mod tests {
         assert_eq!(s.group_name, "general");
         assert_eq!(s.sort_order, 1);
         assert!(s.is_public);
+    }
+
+    #[test]
+    fn setting_hydration_rejects_unknown_stored_type() {
+        let mut row = DbRecord::new();
+        row.insert("key", DbValue::Text("feature.alpha".to_string()));
+        row.insert(
+            "setting_type",
+            DbValue::Text("unsupported-widget".to_string()),
+        );
+
+        let error = row_to_setting(&row).unwrap_err();
+
+        assert!(error.to_string().contains("setting `feature.alpha`"));
+        assert!(error.to_string().contains("`unsupported-widget`"));
     }
 }

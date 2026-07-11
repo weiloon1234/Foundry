@@ -32,6 +32,7 @@
   - [http/cookie](#httpcookie)
   - [http/resource](#httpresource)
   - [http/routes](#httproutes)
+- [http_client/](#http_client)
 - [websocket/](#websocket)
 - [validation/](#validation)
 - [email/](#email)
@@ -43,6 +44,7 @@
 - [cache/](#cache)
 - [redis/](#redis)
 - [logging/](#logging)
+- [audit/](#audit)
 - [plugin/](#plugin)
 - [datatable/](#datatable)
 - [i18n/](#i18n)
@@ -111,6 +113,7 @@ Error::other<E: Into<anyhow::Error>>(error: E) -> Self         // 500
 ```rust
 fn new() -> Self
 fn load_env(self) -> Self
+fn use_external_tracing_subscriber(self) -> Self
 fn load_config_dir(self, path: impl Into<PathBuf>) -> Self
 fn serve_spa(self, dir: impl Into<PathBuf>) -> Self
 
@@ -165,11 +168,13 @@ fn events(&self) -> Result<Arc<EventBus>>
 fn auth(&self) -> Result<Arc<AuthManager>>
 fn authorizer(&self) -> Result<Arc<Authorizer>>
 fn jobs(&self) -> Result<Arc<JobDispatcher>>
+fn audit(&self) -> Result<Arc<AuditManager>>
 fn websocket(&self) -> Result<Arc<WebSocketPublisher>>
 fn database(&self) -> Result<Arc<DatabaseManager>>
 fn redis(&self) -> Result<Arc<RedisManager>>
 fn storage(&self) -> Result<Arc<StorageManager>>
 fn email(&self) -> Result<Arc<EmailManager>>
+fn http_client(&self) -> Result<Arc<HttpClient>>
 fn hash(&self) -> Result<Arc<HashManager>>
 fn crypt(&self) -> Result<Arc<CryptManager>>
 fn diagnostics(&self) -> Result<Arc<RuntimeDiagnostics>>
@@ -198,6 +203,7 @@ fn signed_route_url<I: Into<RouteId>>(name: I, params: &[(&str, &str)], expires_
 fn verify_signed_url(url: &str) -> Result<()>
 
 // Plugin lifecycle
+async fn shutdown(&self) -> Result<()>
 async fn shutdown_plugins(&self) -> Result<()>
 ```
 
@@ -209,6 +215,7 @@ fn transaction(&self) -> &DatabaseTransaction
 fn set_actor(&mut self, actor: Actor)
 fn actor(&self) -> Option<&Actor>
 fn dispatch_after_commit<J: Job>(&self, job: J)
+fn dispatch_event_after_commit<E: Event>(&self, event: E)
 fn notify_after_commit(&self, notifiable: &dyn Notifiable, notification: &dyn Notification) -> Result<()>
 fn after_commit<F, Fut>(&self, callback: F)
 async fn commit(self) -> Result<()>
@@ -240,6 +247,7 @@ fn listen_event<E: Event, L: EventListener<E>>(listener: L) -> Result<()>
 fn register_job<J: Job>() -> Result<()>
 fn register_job_middleware<M: JobMiddleware>(middleware: M) -> Result<()>
 fn register_guard<I, G>(id: I, guard: G) -> Result<()>
+fn register_actor_hydrator<I, H>(guard: I, hydrator: H) -> Result<()>
 fn register_policy<I, P>(id: I, policy: P) -> Result<()>
 fn register_authenticatable<M: Authenticatable>() -> Result<()>
 fn register_readiness_check<I, C>(id: I, check: C) -> Result<()>
@@ -281,10 +289,13 @@ async fn serve(self) -> Result<()>
 
 ```rust
 fn new(app, registrars) -> Self
+fn with_io<I: CommandIo>(self, io: I) -> Self
 fn app(&self) -> &AppContext
 fn build_registry(&self) -> Result<CommandRegistry>
 async fn run(self) -> Result<()>
+async fn run_status(self) -> Result<CommandExit>
 async fn run_with_args<I, T>(self, args: I) -> Result<()>
+async fn run_with_args_status<I, T>(self, args: I) -> Result<CommandExit>
 ```
 
 ### SchedulerKernel
@@ -331,29 +342,30 @@ TOML-based configuration with environment overlay.
 | Name | Summary |
 |------|---------|
 | `ConfigRepository` | Loads and queries TOML config |
-| `AppConfig` | `name`, `environment`, `timezone`, `signing_key`, `background_shutdown_timeout_ms` |
+| `AppConfig` | `name`, `environment`, optional `security_tier`, `timezone`, `signing_key`, `background_shutdown_timeout_ms` |
 | `ServerConfig` | `host`, `port` |
 | `DatabaseConfig` | `url`, `read_url`, `schema`, migration lock timeout, pool settings, lazy connection, SQL observability retention |
 | `DatabasePoolConfig` | Optional per-pool overrides for read/write pools |
 | `ResolvedDatabasePoolConfig` | Effective pool settings after flat defaults and per-pool overrides |
 | `DatabaseModelConfig` | `timestamps_default`, `soft_deletes_default` |
-| `RedisConfig` | `url` (`redis://` or TLS `rediss://`), `namespace` |
+| `RedisConfig` | `url`, `namespace`, bounded connect/command timeouts |
 | `WebSocketConfig` | `host`, `port`, `path`, heartbeat, rate limits, origin allow-list, outbound buffer, history buffer/TTL |
 | `JobsConfig` | `queue`, `max_retries`, `polling`, `concurrency`, `shutdown_timeout_ms`, `job_history` retention |
 | `SchedulerConfig` | `tick_interval_ms`, `leader_lease_ttl_ms`, `shutdown_timeout_ms` |
 | `AuthConfig` | `guards`, `tokens`, `sessions`, credential lifecycle, `bearer_prefix` |
+| `AuditConfig` | recursive redaction fields and `retention_days` (`0` keeps forever) |
 | `TokenConfig` | TTLs, rotation, length, pruning, per-guard TTL overrides |
 | `TokenGuardConfig` | optional per-guard token TTL overrides |
 | `SessionConfig` | TTL, cookie settings, sliding expiry |
 | `PasswordResetConfig` | expiry and worker pruning for password reset tokens |
 | `EmailVerificationConfig` | expiry and worker pruning for email verification tokens |
 | `GuardDriverConfig` | Individual guard driver config |
-| `LoggingConfig` | `level`, `format`, `directory`, `retention` |
+| `LoggingConfig` | `level`, `format`, `log_dir`, `retention_days`, bounded file-writer capacity/record/deadline settings |
 | `I18nConfig` | `locales`, `resource_path` |
 | `ObservabilityConfig` | route/capture switches, sample retention, tracing, OTLP |
 | `RuntimeConfig` | Tokio worker/blocking thread sizing for Foundry-owned sync runners |
 | `HashingConfig` | `driver`, memory/time costs, parallelism |
-| `CryptConfig` | `key` |
+| `CryptConfig` | `key`, decrypt-only `previous_keys` |
 | `CacheConfig` | `driver`, `error_mode`, key bounds, TTL, memory size, `remember()` stampede controls |
 
 ### Enums
@@ -361,6 +373,7 @@ TOML-based configuration with environment overlay.
 | Name | Variants |
 |------|----------|
 | `Environment` | `Development`, `Production`, `Testing` |
+| `SecurityTier` | `Relaxed`, `Strict` |
 | `GuardDriver` | `Token`, `Session`, `Custom` |
 | `CacheDriver` | `Redis`, `Memory` |
 
@@ -407,7 +420,17 @@ fn is_staging(&self) -> bool
 fn is_testing(&self) -> bool
 ```
 
-`Environment` accepts `development`, `production`, `staging`, `testing`, and custom labels. Use `is_production_like` for checks where staging should follow production behavior.
+`Environment` accepts `development`, `production`, `staging`, `testing`, and
+custom labels. Security-sensitive application code should use
+`AppConfig::resolved_security_tier()`; custom labels default to strict until
+explicitly confirmed.
+
+### AppConfig security methods
+
+```rust
+fn resolved_security_tier(&self) -> SecurityTier
+fn custom_security_tier_requires_confirmation(&self) -> bool
+```
 
 `RuntimeConfig.worker_threads` and `max_blocking_threads` default to `0`, which keeps Tokio defaults. Nonzero values apply only to Foundry-created sync runners such as `run_http`, `run_worker`, `run_scheduler`, `run_websocket`, and `run_cli`; async runners keep using the caller-owned runtime.
 
@@ -567,10 +590,13 @@ fn decrypt_string(&self, encoded: &str) -> Result<String>
 fn from_config(config: &HashingConfig) -> Result<Self>
 fn hash(&self, password: &str) -> Result<String>
 fn check(&self, password: &str, hash: &str) -> Result<bool>
+fn needs_rehash(&self, hash: &str) -> Result<bool>
 fn random_string(length: usize) -> Result<String>  // static
 ```
 
 `HashManager::hash()` and `HashManager::check()` stay synchronous for compatibility. In async handlers or model mutators, wrap password hashing/checking with `run_blocking` so Argon2 work does not occupy Tokio worker threads.
+After a successful password check, use `needs_rehash()` to detect an older
+Argon2 algorithm/version/work factor and replace the stored hash.
 
 ### Token
 
@@ -838,6 +864,24 @@ post-commit listener fails, Foundry logs the failure and leaves the already comm
 | `JsonExprBuilder` | JSON path builder |
 | `Cte` | CTE builder |
 
+#### Cursor pagination
+
+```rust
+fn CursorPagination::new(per_page: u64) -> Self
+fn CursorPagination::after(self, cursor: impl Into<String>) -> Self
+fn CursorPagination::before(self, cursor: impl Into<String>) -> Self
+
+struct CursorPaginated<T> {
+    data: Vec<T>,
+    meta: CursorMeta,
+    cursors: CursorInfo,
+}
+```
+
+`ModelQuery::cursor_paginate` orders by the selected column and primary-key
+tiebreaker, returns opaque versioned typed tokens, and rejects simultaneous
+`after` and `before` cursors.
+
 #### Type Aliases
 
 ```rust
@@ -860,6 +904,7 @@ async fn value<E, T>(&self, executor: &E, column: Column<M, T>) -> Result<Option
 async fn chunk<E, F, Fut>(&self, executor: &E, size: u64, handler: F) -> Result<()>
 async fn chunk_by_id<E, T, F, Fut>(&self, executor: &E, column: Column<M, T>, size: u64, handler: F) -> Result<()>
 async fn each_by_id<E, T, F, Fut>(&self, executor: &E, column: Column<M, T>, size: u64, handler: F) -> Result<()>
+async fn cursor_paginate<E, V>(self, executor: &E, column: Column<M, V>, cursor: CursorPagination) -> Result<CursorPaginated<M>>
 ```
 
 #### ModelQuery — relation and extension loading
@@ -869,6 +914,8 @@ fn with<To>(self, relation: RelationDef<M, To>) -> Self
 fn with_many_to_many<To, Pivot>(self, relation: ManyToManyDef<M, To, Pivot>) -> Self
 fn with_aggregate<Value>(self, aggregate: RelationAggregateDef<M, Value>) -> Self
 fn with_attachments(self, collection: impl Into<String>) -> Self
+fn with_meta(self, key: impl Into<String>) -> Self
+fn with_metadata(self) -> Self
 fn with_translated_field(self, field: impl Into<String>) -> Self
 fn with_translations_for(self, locale: impl Into<String>) -> Self
 fn with_all_translations(self) -> Self
@@ -912,6 +959,8 @@ fn many_to_many<From, To, Pivot, LocalKey, TargetKey>() -> ManyToManyDef<From, T
 fn with<Child>(self, child: RelationDef<To, Child>) -> Self
 fn with_many_to_many<Child, Pivot>(self, child: ManyToManyDef<To, Child, Pivot>) -> Self
 fn with_attachments(self, collection: impl Into<String>) -> Self
+fn with_meta(self, key: impl Into<String>) -> Self
+fn with_metadata(self) -> Self
 fn with_translated_field(self, field: impl Into<String>) -> Self
 fn with_translations_for(self, locale: impl Into<String>) -> Self
 fn with_all_translations(self) -> Self
@@ -920,6 +969,8 @@ fn with_all_translations(self) -> Self
 fn with<Child>(self, child: RelationDef<To, Child>) -> Self
 fn with_many_to_many<Child, ChildPivot>(self, child: ManyToManyDef<To, Child, ChildPivot>) -> Self
 fn with_attachments(self, collection: impl Into<String>) -> Self
+fn with_meta(self, key: impl Into<String>) -> Self
+fn with_metadata(self) -> Self
 fn with_translated_field(self, field: impl Into<String>) -> Self
 fn with_translations_for(self, locale: impl Into<String>) -> Self
 fn with_all_translations(self) -> Self
@@ -1111,6 +1162,10 @@ trait BearerAuthenticator: Send + Sync + 'static {
     async fn authenticate(&self, token: &str) -> Result<Option<Actor>>;
 }
 
+trait ActorHydrator: Send + Sync + 'static {
+    async fn hydrate(&self, actor: &Actor, app: &AppContext) -> Result<Option<Actor>>;
+}
+
 trait Policy: Send + Sync + 'static {
     async fn evaluate(&self, actor: &Actor, app: &AppContext) -> Result<bool>;
 }
@@ -1252,7 +1307,10 @@ Routes, middleware, cookies, resources, SPA.
 |------|---------|
 | `HttpRegistrar` | Route registration builder |
 | `HttpRouteOptions` | Per-route config: access, middleware, rate limit, docs |
-| `RouteManifestEntry` | Named route metadata exported to TypeScript |
+| `ModelPath<M>` | Typed route-model extractor; malformed key is 400, missing model is 404 |
+| `RouteManifestEntry` | Frozen named-route contract metadata, including request media type |
+| `RouteManifestParameter` | Typed action parameter with location/schema/requiredness |
+| `RouteManifestError` | Action-specific error status/code/schema metadata |
 | `RouteManifestResponse` | Route response schema metadata exported to TypeScript |
 
 ### Type Aliases
@@ -1260,6 +1318,12 @@ Routes, middleware, cookies, resources, SPA.
 ```rust
 type RouteRegistrar = Arc<dyn Fn(&mut HttpRegistrar) -> Result<()> + Send + Sync>;
 type HttpRouter = Router<AppContext>;
+```
+
+### ModelPath\<M\>
+
+```rust
+fn into_inner(self) -> M
 ```
 
 ### HttpRegistrar — methods
@@ -1316,6 +1380,16 @@ fn permissions<I, P>(self, permissions: I) -> Self
 fn middleware(self, config: MiddlewareConfig) -> Self
 fn middleware_group<I: Into<MiddlewareGroupId>>(self, id: I) -> Self
 fn rate_limit(self, rate_limit: RateLimit) -> Self
+fn action_name(self, action_name: impl Into<String>) -> Self
+fn request<T: ApiSchema>(self) -> Self
+fn request_content_type(self, content_type: impl Into<String>) -> Self
+fn path_parameter<T: ApiSchema>(self, name: impl Into<String>) -> Self
+fn query_parameter<T: ApiSchema>(self, name: impl Into<String>, required: bool) -> Self
+fn header_parameter<T: ApiSchema>(self, name: impl Into<String>, required: bool) -> Self
+fn cookie_parameter<T: ApiSchema>(self, name: impl Into<String>, required: bool) -> Self
+fn response<T: ApiSchema>(self, status: u16) -> Self
+fn error<T: ApiSchema>(self, status: u16, code: impl Into<String>) -> Self
+fn error_without_schema(self, status: u16, code: impl Into<String>) -> Self
 fn document(self, doc: RouteDoc) -> Self
 ```
 
@@ -1331,9 +1405,17 @@ fn middleware_group<I: Into<MiddlewareGroupId>>(&mut self, id: I) -> &mut Self
 fn rate_limit(&mut self, rate_limit: RateLimit) -> &mut Self
 fn tag(&mut self, tag: &str) -> &mut Self
 fn summary(&mut self, summary: &str) -> &mut Self
+fn action_name(&mut self, action_name: impl Into<String>) -> &mut Self
 fn description(&mut self, description: &str) -> &mut Self
 fn request<T: ApiSchema>(&mut self) -> &mut Self
+fn request_content_type(&mut self, content_type: impl Into<String>) -> &mut Self
+fn path_parameter<T: ApiSchema>(&mut self, name: impl Into<String>) -> &mut Self
+fn query_parameter<T: ApiSchema>(&mut self, name: impl Into<String>, required: bool) -> &mut Self
+fn header_parameter<T: ApiSchema>(&mut self, name: impl Into<String>, required: bool) -> &mut Self
+fn cookie_parameter<T: ApiSchema>(&mut self, name: impl Into<String>, required: bool) -> &mut Self
 fn response<T: ApiSchema>(&mut self, status: u16) -> &mut Self
+fn error<T: ApiSchema>(&mut self, status: u16, code: impl Into<String>) -> &mut Self
+fn error_without_schema(&mut self, status: u16, code: impl Into<String>) -> &mut Self
 fn deprecated(&mut self) -> &mut Self
 ```
 
@@ -1488,6 +1570,142 @@ signature.
 
 ---
 
+## http_client/
+
+Pooled outbound HTTP with typed requests/responses/errors, bounded concurrency,
+safe retries, redacted tracing, and pluggable transports.
+
+### Types
+
+```rust
+type HttpClientResult<T> = Result<T, HttpClientError>;
+type RawHttpClient = reqwest::Client;
+type HttpMethod = reqwest::Method;
+type HttpStatus = reqwest::StatusCode;
+type HttpUrl = reqwest::Url;
+type HttpHeaderMap = reqwest::header::HeaderMap;
+type HttpHeaderName = reqwest::header::HeaderName;
+type HttpHeaderValue = reqwest::header::HeaderValue;
+```
+
+### HttpClient
+
+```rust
+fn new() -> HttpClientResult<Self>
+fn builder() -> HttpClientBuilder
+fn from_transport<T: HttpTransport>(transport: T) -> HttpClientResult<Self>
+fn request(&self, method: Method, target: impl Into<String>) -> HttpRequestBuilder
+fn get(&self, target: impl Into<String>) -> HttpRequestBuilder
+fn head(&self, target: impl Into<String>) -> HttpRequestBuilder
+fn post(&self, target: impl Into<String>) -> HttpRequestBuilder
+fn put(&self, target: impl Into<String>) -> HttpRequestBuilder
+fn patch(&self, target: impl Into<String>) -> HttpRequestBuilder
+fn delete(&self, target: impl Into<String>) -> HttpRequestBuilder
+async fn send(&self, request: HttpRequest) -> HttpClientResult<HttpResponse>
+async fn send_with_retry(&self, request: HttpRequest, retry_policy: RetryPolicy) -> HttpClientResult<HttpResponse>
+fn raw(&self) -> Option<&reqwest::Client>
+fn base_url(&self) -> Option<&Url>
+fn default_headers(&self) -> &HeaderMap
+fn connect_timeout(&self) -> Option<Duration>
+fn request_timeout(&self) -> Option<Duration>
+fn max_concurrency(&self) -> usize
+fn retry_policy(&self) -> &RetryPolicy
+```
+
+### HttpClientBuilder
+
+```rust
+fn new() -> Self
+fn base_url(self, base_url: impl AsRef<str>) -> HttpClientResult<Self>
+fn default_header(self, name: impl AsRef<str>, value: impl AsRef<str>) -> HttpClientResult<Self>
+fn default_headers(self, headers: HeaderMap) -> Self
+fn connect_timeout(self, timeout: Option<Duration>) -> Self
+fn request_timeout(self, timeout: Option<Duration>) -> Self
+fn max_concurrency(self, max_concurrency: usize) -> Self
+fn retry_policy(self, retry_policy: RetryPolicy) -> Self
+fn transport<T: HttpTransport>(self, transport: T) -> Self
+fn shared_transport(self, transport: Arc<dyn HttpTransport>) -> Self
+fn build(self) -> HttpClientResult<HttpClient>
+```
+
+### HttpRequestBuilder
+
+```rust
+fn header(self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self
+fn bearer_auth(self, token: impl AsRef<str>) -> Self
+fn query<T: Serialize + ?Sized>(self, query: &T) -> Self
+fn query_pair(self, key: impl Into<String>, value: impl ToString) -> Self
+fn json<T: Serialize + ?Sized>(self, value: &T) -> Self
+fn body(self, body: impl Into<Vec<u8>>) -> Self
+fn retry_policy(self, policy: RetryPolicy) -> Self
+fn timeout(self, timeout: Option<Duration>) -> Self
+fn build(self) -> HttpClientResult<HttpRequest>
+async fn send(self) -> HttpClientResult<HttpResponse>
+```
+
+### HttpRequest / HttpResponse
+
+```rust
+fn HttpRequest::new(method: Method, url: Url) -> Self
+fn HttpRequest::with_headers(self, headers: HeaderMap) -> Self
+fn HttpRequest::with_header(self, name: HeaderName, value: HeaderValue) -> Self
+fn HttpRequest::with_body(self, body: impl Into<Vec<u8>>) -> Self
+fn HttpRequest::method(&self) -> &Method
+fn HttpRequest::url(&self) -> &Url
+fn HttpRequest::redacted_url(&self) -> String
+fn HttpRequest::headers(&self) -> &HeaderMap
+fn HttpRequest::header(&self, name: &str) -> Option<&str>
+fn HttpRequest::body(&self) -> Option<&[u8]>
+fn HttpRequest::json_body<T: DeserializeOwned>(&self) -> HttpClientResult<T>
+fn HttpRequest::query_pairs(&self) -> Vec<(String, String)>
+
+fn HttpResponse::new(status: StatusCode) -> Self
+fn HttpResponse::from_json<T: Serialize + ?Sized>(status: StatusCode, value: &T) -> HttpClientResult<Self>
+fn HttpResponse::with_body(self, body: impl Into<Vec<u8>>) -> Self
+fn HttpResponse::with_headers(self, headers: HeaderMap) -> Self
+fn HttpResponse::with_header(self, name: HeaderName, value: HeaderValue) -> Self
+fn HttpResponse::status(&self) -> StatusCode
+fn HttpResponse::is_success(&self) -> bool
+fn HttpResponse::headers(&self) -> &HeaderMap
+fn HttpResponse::header(&self, name: &str) -> Option<&str>
+fn HttpResponse::bytes(&self) -> &[u8]
+fn HttpResponse::into_bytes(self) -> Vec<u8>
+fn HttpResponse::text(&self) -> HttpClientResult<&str>
+fn HttpResponse::json<T: DeserializeOwned>(&self) -> HttpClientResult<T>
+fn HttpResponse::ensure_success(&self) -> HttpClientResult<()>
+fn HttpResponse::error_for_status(self) -> HttpClientResult<Self>
+```
+
+### RetryPolicy / transport
+
+```rust
+fn RetryPolicy::idempotent() -> Self
+fn RetryPolicy::none() -> Self
+fn max_attempts(self, max_attempts: usize) -> Self
+fn backoff(self, initial: Duration, maximum: Duration) -> Self
+fn retry_method(self, method: Method) -> Self
+fn do_not_retry_method(self, method: &Method) -> Self
+fn retry_status(self, status: StatusCode) -> Self
+fn do_not_retry_status(self, status: &StatusCode) -> Self
+fn retry_transport_errors(self, retry: bool) -> Self
+fn attempts(&self) -> usize
+fn retries_method(&self, method: &Method) -> bool
+fn retries_status(&self, status: StatusCode) -> bool
+
+trait HttpTransport: Send + Sync + 'static {
+    async fn send(&self, request: HttpRequest) -> HttpClientResult<HttpResponse>;
+}
+
+fn ReqwestTransport::new(client: reqwest::Client) -> Self
+fn ReqwestTransport::raw(&self) -> &reqwest::Client
+```
+
+`HttpClientErrorKind` distinguishes invalid URL/header, build, encode,
+transport, timeout, concurrency closure, decode, status, and fake exhaustion.
+`HttpClientError` exposes `kind`, `transport`, `status`, and `timeout_duration`.
+
+---
+
 ## websocket/
 
 Channel-based typed WebSocket with presence.
@@ -1551,7 +1769,7 @@ async fn presence_count(&self) -> Result<usize>
 ```rust
 async fn publish<C, E>(&self, channel: C, event: E, room: Option<&str>, payload: impl Serialize) -> Result<()>
 async fn publish_message(&self, message: ServerMessage) -> Result<()>
-async fn disconnect_user(&self, actor_id: &str) -> Result<()>
+async fn disconnect_actor<G: Into<GuardId>>(&self, guard: G, actor_id: &str) -> Result<()>
 ```
 
 ### WebSocketChannelOptions — builder
@@ -1615,7 +1833,7 @@ Protocol guarantees:
 
 ```rust
 trait ValidationRule: Send + Sync + 'static {
-    async fn validate(&self, context: &RuleContext, value: &str) -> Result<Option<String>>;
+    async fn validate(&self, context: &RuleContext, value: &str) -> std::result::Result<(), ValidationError>;
 }
 
 trait RequestValidator: Send + Sync {
@@ -1625,9 +1843,33 @@ trait RequestValidator: Send + Sync {
 }
 
 trait FromMultipart: Sized {
-    async fn from_multipart(multipart: Multipart) -> Result<Self>;
+    async fn from_multipart(multipart: &mut Multipart) -> Result<Self>;
+    async fn from_multipart_with_presence(multipart: &mut Multipart) -> Result<(Self, Option<HashSet<String>>)>;
 }
 ```
+
+### Presence, conditional, boolean, and collection rules
+
+```rust
+// FieldValidator / EachValidator where applicable
+fn required_if(self, other_field, other_value, expected_values) -> Self
+fn required_unless(self, other_field, other_value, expected_values) -> Self
+fn required_with(self, other_fields: impl IntoIterator<Item = (name, value)>) -> Self
+fn present(self) -> Self
+fn sometimes(self) -> Self
+fn prohibited(self) -> Self
+fn boolean(self) -> Self
+fn distinct(self) -> Self
+
+// Validator
+fn field_with_presence(&mut self, name, value, present: bool) -> FieldValidator<'_>
+fn optional_field<T: ToString>(&mut self, name, value: Option<T>) -> FieldValidator<'_>
+```
+
+Built-in JSON and generated multipart extractors retain raw top-level presence,
+so `present` distinguishes an explicit null/empty field from an absent field.
+`sometimes` skips the chain only when absent. `distinct` is an exact,
+case-sensitive collection check and emits one collection-level error.
 
 ### File Validation Functions
 
@@ -1704,7 +1946,7 @@ fn bcc(self, addr: impl Into<EmailAddress>) -> Self
 fn reply_to(self, addr: impl Into<EmailAddress>) -> Self
 fn text_body(self, body: impl Into<String>) -> Self
 fn html_body(self, body: impl Into<String>) -> Self
-fn template(self, template_name: &str, template_path: &str, variables: Value) -> Result<Self>
+async fn template(self, template_name: &str, template_path: &str, variables: Value) -> Result<Self>
 fn header(self, key: impl Into<String>, value: impl Into<String>) -> Self
 fn attach(self, attachment: EmailAttachment) -> Self
 ```
@@ -1716,6 +1958,9 @@ fn from_config(config, custom_drivers, app) -> Result<Self>
 fn mailer(&self, name: &str) -> Result<EmailMailer>
 fn default_mailer(&self) -> Result<EmailMailer>
 fn default_mailer_name(&self) -> &str
+fn queue_id(&self) -> &QueueId
+fn template_path(&self) -> &str
+async fn render_template(&self, message: EmailMessage, template_name: &str, variables: Value) -> Result<EmailMessage>
 fn from_address(&self) -> &EmailFromConfig
 fn configured_mailers(&self) -> Vec<String>
 ```
@@ -1744,6 +1989,7 @@ Local + S3 file storage with multipart uploads.
 | `S3StorageAdapter` | S3-compatible adapter |
 | `StorageObject` | Listed object metadata: `path`, `size`, `modified_at` |
 | `StoredFile` | `disk`, `path`, `name`, `size`, `content_type`, `url` |
+| `ResolvedS3Config` | S3 bucket/region, optional explicit credentials/session token, endpoint/URL, visibility |
 | `UploadedFile` | `field_name`, `original_name`, `content_type`, `size`, `temp_path` |
 | `MultipartForm` | Parsed multipart form |
 | `UploadLimits` | Storage-level multipart upload caps |
@@ -1761,7 +2007,9 @@ Local + S3 file storage with multipart uploads.
 trait StorageAdapter: Send + Sync + 'static {
     async fn put_bytes(&self, path: &str, bytes: &[u8], content_type: Option<&str>, visibility: StorageVisibility) -> Result<StoredFile>;
     async fn put_file(&self, path: &str, temp_path: &Path, content_type: Option<&str>, visibility: StorageVisibility) -> Result<StoredFile>;
+    async fn put_stream(&self, path: &str, stream: StorageWriteStream, content_type: Option<&str>, visibility: StorageVisibility) -> Result<StoredFile>;
     async fn get(&self, path: &str) -> Result<Vec<u8>>;
+    async fn get_stream(&self, path: &str) -> Result<StorageReadStream>;
     async fn delete(&self, path: &str) -> Result<()>;
     async fn exists(&self, path: &str) -> Result<bool>;
     async fn copy(&self, from: &str, to: &str) -> Result<()>;
@@ -1769,15 +2017,25 @@ trait StorageAdapter: Send + Sync + 'static {
     async fn url(&self, path: &str) -> Result<String>;
     async fn temporary_url(&self, path: &str, expires_at: DateTime) -> Result<String>;
     async fn list_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<StorageObject>>;
+    async fn list_prefix_after(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<StorageObject>>;
 }
 ```
 
-S3 writes persist the supplied content type as object metadata. `StorageVisibility` is disk-level access intent and is not emitted as an `x-amz-acl` header; public access should be configured with bucket policy or provider public-bucket/CDN settings so ACL-disabled AWS buckets and S3-compatible providers remain supported.
+The streaming trait methods have buffered compatibility defaults for existing
+custom adapters. Local and S3 override them with bounded native I/O. S3 writes
+persist supplied content type as object metadata. `StorageVisibility` is
+disk-level access intent and is not emitted as an `x-amz-acl` header; public
+access should be configured with bucket policy or provider public-bucket/CDN
+settings so ACL-disabled AWS buckets and S3-compatible providers remain
+supported. Omitting both S3 key and secret selects the AWS credential provider
+chain; explicit temporary credentials may add `session_token`.
 
 ### Type Aliases
 
 ```rust
 type StorageDriverFactory = Arc<dyn Fn(&ConfigRepository, &toml::Table) -> BoxFuture<Result<Arc<dyn StorageAdapter>>> + Send + Sync>;
+type StorageWriteStream = Pin<Box<dyn AsyncRead + Send + 'static>>;
+type StorageReadStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send + 'static>>;
 ```
 
 ### StorageManager — methods
@@ -1788,8 +2046,13 @@ fn default_disk(&self) -> Result<StorageDisk>
 fn disk(&self, name: &str) -> Result<StorageDisk>
 fn default_disk_name(&self) -> &str
 fn configured_disks(&self) -> Vec<String>
-// Also delegates: put, put_bytes, put_file, get, delete, exists, copy, move_to, url, temporary_url, list_prefix
+// Also delegates: put, put_bytes, put_file, put_stream, get, get_stream,
+// delete, exists, copy, move_to, url, temporary_url, list_prefix, list_prefix_after
 ```
+
+Public writes populate `StoredFile.url` only when a stable URL exists. Private
+disks always clear it and reject `url()`; use a signed `temporary_url()` when
+the adapter supports private delivery.
 
 ### UploadedFile — methods
 
@@ -1884,8 +2147,14 @@ fn attempt(&self) -> u32
 ### JobDispatcher — methods
 
 ```rust
-fn dispatch<J: Job>(&self, job: J) -> Result<()>
-fn dispatch_later<J: Job>(&self, job: J, run_at_millis: i64) -> Result<()>
+async fn dispatch<J: Job>(&self, job: J) -> Result<()>
+async fn dispatch_on<J: Job, Q: Into<QueueId>>(&self, job: J, queue: Q) -> Result<()>
+async fn dispatch_at<J: Job>(&self, job: J, run_at: DateTime) -> Result<()>
+async fn dispatch_at_on<J: Job, Q: Into<QueueId>>(&self, job: J, run_at: DateTime, queue: Q) -> Result<()>
+async fn dispatch_after<J: Job>(&self, job: J, delay: Duration) -> Result<()>
+async fn dispatch_after_on<J: Job, Q: Into<QueueId>>(&self, job: J, delay: Duration, queue: Q) -> Result<()>
+async fn dispatch_later<J: Job>(&self, job: J, run_at_millis: i64) -> Result<()>
+async fn dispatch_later_on<J: Job, Q: Into<QueueId>>(&self, job: J, run_at_millis: i64, queue: Q) -> Result<()>
 fn batch(&self, name: &str) -> JobBatchBuilder
 fn chain(&self) -> JobChainBuilder
 ```
@@ -1895,14 +2164,14 @@ fn chain(&self) -> JobChainBuilder
 ```rust
 fn add<J: Job>(self, job: J) -> Result<Self>
 fn on_complete<J: Job>(self, job: J) -> Result<Self>
-fn dispatch(self) -> Result<String>
+async fn dispatch(self) -> Result<String>
 ```
 
 ### JobChainBuilder — methods
 
 ```rust
 fn add<J: Job>(self, job: J) -> Result<Self>
-fn dispatch(self) -> Result<()>
+async fn dispatch(self) -> Result<()>
 ```
 
 ### Functions
@@ -2044,6 +2313,7 @@ Multi-channel async notifications.
 const NOTIFY_EMAIL: NotificationChannelId;
 const NOTIFY_DATABASE: NotificationChannelId;
 const NOTIFY_BROADCAST: NotificationChannelId;
+const DEFAULT_NOTIFIABLE_TYPE: &str = "default";
 ```
 
 ### Traits
@@ -2059,6 +2329,7 @@ trait Notification: Send + Sync {
 }
 
 trait Notifiable: Send + Sync {
+    fn notifiable_type(&self) -> &str { DEFAULT_NOTIFIABLE_TYPE }
     fn notification_id(&self) -> String;
     fn route_notification_for(&self, channel: &str) -> Option<String>;
 }
@@ -2075,6 +2346,9 @@ trait NotificationChannel: Send + Sync + 'static {
 | `NotificationChannelRegistry` | Channel registry |
 | `EmailNotificationChannel` | Email delivery |
 | `DatabaseNotificationChannel` | Database storage |
+| `DatabaseNotification` | Typed persisted notification with read state |
+| `DatabaseNotificationScope` | Validated `(notifiable_type, notifiable_id)` ownership scope |
+| `DatabaseNotificationRepository` | Scoped list/paginate/unread/read/count/mark/delete operations |
 | `BroadcastNotificationChannel` | WebSocket broadcast |
 | `SendNotificationJob` | Queued notification job |
 
@@ -2084,8 +2358,34 @@ trait NotificationChannel: Send + Sync + 'static {
 async fn notify(app: &AppContext, notifiable: &dyn Notifiable, notification: &dyn Notification) -> Result<()>
 async fn notify_queued(app: &AppContext, notifiable: &dyn Notifiable, notification: &dyn Notification) -> Result<()>
 fn build_notification_job(notifiable: &dyn Notifiable, notification: &dyn Notification) -> Result<SendNotificationJob>
+fn build_notification_jobs(notifiable: &dyn Notifiable, notification: &dyn Notification) -> Result<Vec<SendNotificationJob>>
 fn register_notification_websocket_channel<G: Into<GuardId>>(registrar: &mut WebSocketRegistrar, guard: G) -> Result<()>
 ```
+
+`build_notification_job` retains the legacy aggregate wire shape for rolling
+compatibility. New dispatch uses `build_notification_jobs`, producing one
+independently retryable job per selected channel.
+
+### DatabaseNotificationRepository — methods
+
+```rust
+fn new(notifiable_type: impl Into<String>, notifiable_id: impl Into<String>) -> Result<Self>
+fn from_scope(scope: DatabaseNotificationScope) -> Self
+fn for_notifiable(notifiable: &dyn Notifiable) -> Result<Self>
+fn for_actor(actor: &Actor) -> Result<Self>
+fn for_actor_as(actor: &Actor, notifiable_type: impl Into<String>) -> Result<Self>
+async fn list(&self, app: &AppContext) -> Result<Vec<DatabaseNotification>>
+async fn paginate(&self, app: &AppContext, pagination: Pagination) -> Result<Paginated<DatabaseNotification>>
+async fn unread(&self, app: &AppContext) -> Result<Vec<DatabaseNotification>>
+async fn read(&self, app: &AppContext) -> Result<Vec<DatabaseNotification>>
+async fn unread_count(&self, app: &AppContext) -> Result<u64>
+async fn mark_read(&self, app: &AppContext, id: ModelId<DatabaseNotification>) -> Result<bool>
+async fn mark_all_read(&self, app: &AppContext) -> Result<u64>
+async fn delete(&self, app: &AppContext, id: ModelId<DatabaseNotification>) -> Result<bool>
+```
+
+Every operation also has a `*_with` variant accepting an existing
+`QueryExecutor`, including an application transaction.
 
 ---
 
@@ -2101,31 +2401,49 @@ trait CacheStore: Send + Sync + 'static {
     async fn put_raw(&self, key: &str, value: &str, ttl: Duration) -> Result<()>;
     async fn forget(&self, key: &str) -> Result<bool>;
     async fn flush(&self) -> Result<()>;
+    async fn get_control_raw(&self, key: &str) -> Result<Option<String>>;
+    async fn put_control_raw(&self, key: &str, value: &str) -> Result<()>;
 }
 ```
+
+Custom stores override both control-value methods to support cache tags. Their
+provided defaults make tag reads miss and reject tag invalidation explicitly.
 
 ### Structs
 
 | Name | Summary |
 |------|---------|
 | `CacheManager` | Main cache interface |
+| `TaggedCache<'a>` | Canonical multi-tag cache view with version-based invalidation |
 | `MemoryCacheStore` | In-memory with max entries |
 | `RedisCacheStore` | Redis-backed with prefix |
 
 ### CacheManager — methods
 
 ```rust
-fn new(store: Arc<dyn CacheStore>) -> Self
 async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>>
 async fn put<T: Serialize>(&self, key: &str, value: &T, ttl: Duration) -> Result<()>
 async fn remember<T, F, Fut>(&self, key: &str, ttl: Duration, f: F) -> Result<T>
+async fn forget(&self, key: &str) -> Result<bool>
+async fn flush(&self) -> Result<()>
+fn tags<I, S>(&self, tags: I) -> TaggedCache<'_>
+```
+
+### TaggedCache — methods
+
+```rust
+fn tag_names(&self) -> &[String]
+async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>>
+async fn put<T: Serialize>(&self, key: &str, value: &T, ttl: Duration) -> Result<()>
+async fn remember<T, F, Fut>(&self, key: &str, ttl: Duration, callback: F) -> Result<T>
 async fn forget(&self, key: &str) -> Result<bool>
 async fn flush(&self) -> Result<()>
 ```
 
 Cache keys are validated before store access. `remember()` uses local
 single-flight by default and can opt into a distributed runtime lock via cache
-config.
+config. Tag order and duplicates share one identity; flushing advances shared
+tag versions instead of scanning the backend.
 
 ---
 
@@ -2141,6 +2459,10 @@ Namespaced Redis wrapper.
 | `RedisConnection` | Multiplexed connection wrapper |
 | `RedisKey` | Namespaced key |
 | `RedisChannel` | Namespaced pub/sub channel |
+| `RedisCommandBuilder` | Non-executable command prefix until a typed key is supplied |
+| `RedisCommand` | Executable namespaced low-level command |
+| `RedisPipeline` | Ordered command pipeline or atomic transaction |
+| `RedisScript` | Lua script with typed keys separated from arguments |
 
 ### Constants
 
@@ -2155,10 +2477,16 @@ const REDIS_PING_PROBE: ProbeId;
 ```rust
 fn from_config(config: &ConfigRepository) -> Result<Self>
 fn namespace(&self) -> &str
+fn connect_timeout(&self) -> Duration
+fn command_timeout(&self) -> Duration
 fn key(&self, suffix: impl AsRef<str>) -> RedisKey
 fn key_in_namespace(&self, namespace: impl AsRef<str>, suffix: impl AsRef<str>) -> RedisKey
 fn channel(&self, suffix: impl AsRef<str>) -> RedisChannel
 fn channel_in_namespace(&self, namespace: impl AsRef<str>, suffix: impl AsRef<str>) -> RedisChannel
+fn command(&self, name: &str) -> Result<RedisCommandBuilder>
+fn pipeline(&self) -> RedisPipeline
+fn transaction(&self) -> RedisPipeline
+fn script(&self, source: impl Into<Arc<str>>, key: &RedisKey) -> RedisScript
 fn connection(&self) -> Result<RedisConnection>
 ```
 
@@ -2180,7 +2508,21 @@ async fn hset<F, V>(&mut self, key: &RedisKey, field: F, value: V) -> Result<usi
 async fn sadd<V: ToRedisArgs>(&mut self, key: &RedisKey, value: V) -> Result<usize>
 async fn srem<V: ToRedisArgs>(&mut self, key: &RedisKey, value: V) -> Result<usize>
 async fn smembers<T: FromRedisValue>(&mut self, key: &RedisKey) -> Result<Vec<T>>
+async fn execute_command<T: FromRedisValue>(&mut self, command: &RedisCommand) -> Result<T>
+async fn execute_pipeline<T: FromRedisValue>(&mut self, pipeline: &RedisPipeline) -> Result<T>
+async fn execute_script<T: FromRedisValue>(&mut self, script: &RedisScript) -> Result<T>
 ```
+
+`RedisCommandBuilder::arg(...)` supplies non-key prefix arguments and
+`.key(&RedisKey)` transitions to an executable `RedisCommand`. Executable
+commands accept further `.arg(...)` and typed `.key(...)`. `RedisPipeline`
+provides `add`, `add_ignored`, `len`, `is_empty`, and `is_transaction`;
+`RedisScript` provides typed `key` and ordinary `arg` builders.
+
+Connect, command, and pub/sub waits use `RedisConfig.connect_timeout_ms` and
+`command_timeout_ms` (5 seconds each by default). Transport/timeout failures
+invalidate the cached connection for the next operation but never replay a
+possibly applied command.
 
 ---
 
@@ -2207,6 +2549,8 @@ Structured logging, observability, health probes.
 | Name | Summary |
 |------|---------|
 | `RequestId(String)` | Request ID wrapper |
+| `RequestIdError` | Empty, oversized, or invalid-character request ID |
+| `LogWriterRuntimeSnapshot` | Bounded file-writer queue and outcome counters |
 | `RuntimeDiagnostics` | Metrics + health manager |
 | `RuntimeSnapshot` | Full runtime metrics snapshot |
 | `HttpRuntimeSnapshot` | HTTP metrics |
@@ -2233,7 +2577,21 @@ trait ReadinessCheck: Send + Sync + 'static {
 
 ```rust
 const REQUEST_ID_HEADER: &str = "x-request-id";
+const REQUEST_ID_MAX_LENGTH: usize = 128;
 ```
+
+### RequestId — methods
+
+```rust
+fn new(value: impl Into<String>) -> Self
+fn try_new(value: impl Into<String>) -> Result<Self, RequestIdError>
+fn generate() -> Self
+fn as_str(&self) -> &str
+```
+
+Request IDs must be non-empty visible ASCII no longer than 128 bytes. Invalid
+inbound `x-request-id` values are replaced with generated UUIDv7 values before
+the typed extension, tracing context, and response header are populated.
 
 ### RuntimeDiagnostics — methods
 
@@ -2265,6 +2623,12 @@ fn record_job_outcome(&self, outcome: JobOutcome)
 bounded HTTP route rankings, recent slow requests, and recent error samples for admin dashboards.
 `/_foundry/metrics` exposes runtime counter families in Prometheus text format. Foundry does not store
 Prometheus samples; scrape retention belongs to Prometheus or your metrics backend.
+
+`RuntimeSnapshot.logging` reports bounded JSON file-writer capacity, pending
+records, and accepted/written/dropped/rejected/oversized/error/timeout totals.
+`AppContext::shutdown()` flushes accepted file records within
+`LoggingConfig.file_flush_timeout_ms`; producers remain non-blocking and drop
+the newest complete record when the configured queue is full.
 
 HTTP runtime counters include observability endpoint traffic, while `/_foundry/http/stats` rankings
 retain application routes only so dashboard polling does not crowd out useful samples.
@@ -2302,6 +2666,65 @@ diagnostics, typically behind an external proxy or private network.
 ```rust
 fn init(config: &ConfigRepository) -> Result<()>
 ```
+
+---
+
+## audit/
+
+Transactional model lifecycle capture, explicit domain entries, async
+non-HTTP attribution scopes, and retention pruning.
+
+### Structs
+
+| Name | Summary |
+|------|---------|
+| `AuditLog` | Typed persisted audit row |
+| `AuditContext` | Area plus optional actor/request/IP/user-agent attribution |
+| `AuditEntry` | Builder for an explicit domain audit event |
+| `AuditManager` | Manual writer and retention service |
+
+### Functions
+
+```rust
+async fn scope_audit<F: Future>(context: AuditContext, future: F) -> F::Output
+```
+
+### AuditContext — methods
+
+```rust
+fn new(area: impl Into<String>) -> Self
+fn try_new(area: impl Into<String>) -> Result<Self>
+fn with_actor(self, actor: Actor) -> Self
+fn with_request_id(self, request_id: RequestId) -> Self
+fn with_ip(self, ip: IpAddr) -> Self
+fn with_user_agent(self, user_agent: impl Into<String>) -> Self
+fn area(&self) -> &str
+fn actor(&self) -> Option<&Actor>
+```
+
+### AuditEntry — builder
+
+```rust
+fn new(event_type: impl Into<String>, subject_table: impl Into<String>, subject_id: impl Into<String>) -> Self
+fn subject_model(self, subject_model: impl Into<String>) -> Self
+fn area(self, area: impl Into<String>) -> Self
+fn before(self, value: impl Serialize) -> Result<Self>
+fn after(self, value: impl Serialize) -> Result<Self>
+fn changes(self, value: impl Serialize) -> Result<Self>
+```
+
+### AuditManager — methods
+
+```rust
+async fn record<E: QueryExecutor + ?Sized>(&self, executor: &E, entry: AuditEntry) -> Result<()>
+async fn prune_before<E: QueryExecutor + ?Sized>(&self, executor: &E, cutoff: DateTime) -> Result<u64>
+async fn prune_retention<E: QueryExecutor + ?Sized>(&self, executor: &E, now: DateTime) -> Result<u64>
+fn retention_days(&self) -> u32
+```
+
+Manual payload JSON uses the configured recursive sensitive-field redaction.
+`audit.retention_days = 0` keeps rows forever; `audit:prune` requires either a
+positive configured window or an explicit `--days` value.
 
 ---
 
@@ -2358,6 +2781,7 @@ fn register_scaffolds<I>(&mut self, scaffolds: I) -> Result<&mut Self>
 
 // Direct registration (no ServiceProvider wrapper needed)
 fn register_guard<I: Into<GuardId>, G: BearerAuthenticator>(&mut self, id: I, guard: G) -> &mut Self
+fn register_actor_hydrator<I: Into<GuardId>, H: ActorHydrator>(&mut self, guard: I, hydrator: H) -> &mut Self
 fn register_policy<I: Into<PolicyId>, P: Policy>(&mut self, id: I, policy: P) -> &mut Self
 fn register_authenticatable<M: Authenticatable>(&mut self) -> &mut Self
 fn listen_event<E: Event, L: EventListener<E>>(&mut self, listener: L) -> &mut Self
@@ -2423,6 +2847,8 @@ trait DatatableQuery<Row>: Clone + Send + Sync + 'static {
     fn apply_where(self, condition: Condition) -> Self;
     fn apply_having(self, condition: Condition) -> Self;
     fn apply_order(self, order: OrderBy) -> Self;
+    fn apply_limit(self, limit: u64) -> Self;
+    fn stream<'a, E>(&'a self, executor: &'a E) -> Result<BoxStream<'a, Result<Row>>>;
     async fn get(&self, executor: &E) -> Result<Collection<Row>>;
     async fn paginate(&self, executor: &E, pagination: Pagination) -> Result<Paginated<Row>>;
 }
@@ -2445,8 +2871,14 @@ trait Datatable: Send + Sync + 'static {
 
 trait DatatableExportDelivery: Send + Sync + 'static {
     async fn deliver(&self, export: GeneratedDatatableExport, recipient: &str) -> Result<()>;
+    async fn deliver_file(&self, export: GeneratedDatatableExportFile, recipient: &str) -> Result<()>;
 }
 ```
+
+Both methods have defaults. Existing byte-oriented `deliver` implementations
+remain compatible; the default `deliver_file` adapter checks file metadata and
+buffers at most `LEGACY_DATATABLE_EXPORT_MAX_BYTES` (25 MiB). New delivery
+services should override `deliver_file` and stream/copy from `export.path()`.
 
 ### Structs
 
@@ -2471,15 +2903,34 @@ trait DatatableExportDelivery: Send + Sync + 'static {
 | `DatatableExportAccepted` | Export queued response |
 | `DatatableActorSnapshot` | Serializable actor for jobs |
 | `GeneratedDatatableExport` | Generated XLSX export data |
+| `GeneratedDatatableExportFile` | Temporary file-backed XLSX for bounded queued delivery |
 | `DatatableExportJob` | Background export job |
 | `DatatableRegistry` | Registry of all datatables |
-| `NoopExportDelivery` | No-op delivery |
 
 Relation filters are declared on the server with `Datatable::relation_filters()` and use the
 normal `DatatableFilterInput` request shape. Clients may send fields such as `merchant.name`,
 legacy aliases such as `merchant-name`, or declared multi-column `LikeAny` targets such as
 `merchant.name|merchant.slug`; undeclared relation paths are rejected by the normal filter
 validation flow.
+
+### GeneratedDatatableExportFile — methods
+
+```rust
+fn datatable_id(&self) -> &str
+fn filename(&self) -> &str
+fn columns(&self) -> &[String]
+fn path(&self) -> &Path
+fn size(&self) -> u64
+async fn open(&self) -> Result<tokio::fs::File>
+async fn read_bounded(&self, max_bytes: u64) -> Result<Vec<u8>>
+```
+
+The artifact is deleted when dropped, including delivery error and panic
+unwinding. Its path is valid only during `deliver_file`.
+
+```rust
+const LEGACY_DATATABLE_EXPORT_MAX_BYTES: u64 = 25 * 1024 * 1024;
+```
 
 ---
 
@@ -2577,8 +3028,21 @@ Command-line interface registration.
 
 | Name | Summary |
 |------|---------|
-| `CommandInvocation` | Context: app + arg matches |
+| `CommandExit` | Typed `u8` command exit status (`SUCCESS`, `FAILURE`, or custom code) |
+| `CommandInvocation` | Context: app, arg matches, and injectable command I/O |
+| `CommandProgress` | Deterministic line-oriented progress reporter |
 | `CommandRegistry` | Command registry |
+| `TerminalCommandIo` | Process stdin/stdout/stderr implementation |
+
+### Traits
+
+```rust
+trait CommandIo: Send + Sync + 'static {
+    fn write_stdout(&self, message: &str) -> io::Result<()>;
+    fn write_stderr(&self, message: &str) -> io::Result<()>;
+    fn read_stdin_line(&self) -> io::Result<String>;
+}
+```
 
 ### Type Aliases
 
@@ -2591,6 +3055,13 @@ type CommandRegistrar = Arc<dyn Fn(&mut CommandRegistry) -> Result<()> + Send + 
 ```rust
 fn app(&self) -> &AppContext
 fn matches(&self) -> &ArgMatches
+fn io(&self) -> &dyn CommandIo
+fn write(&self, message: impl AsRef<str>) -> Result<()>
+fn line(&self, message: impl AsRef<str>) -> Result<()>
+fn error(&self, message: impl AsRef<str>) -> Result<()>
+fn prompt(&self, question: impl AsRef<str>) -> Result<String>
+fn confirm(&self, question: impl AsRef<str>, default: bool) -> Result<bool>
+fn progress(&self, label: impl Into<String>, total: u64) -> Result<CommandProgress>
 ```
 
 ### CommandRegistry — methods
@@ -2598,7 +3069,30 @@ fn matches(&self) -> &ArgMatches
 ```rust
 fn new() -> Self
 fn command<I, F, Fut>(&mut self, id: I, command: Command, handler: F) -> Result<&mut Self>
+fn command_with_exit<I, F, Fut>(&mut self, id: I, command: Command, handler: F) -> Result<&mut Self>
 ```
+
+### Built-in `dev` command
+
+```text
+dev [PROCESS]... [--max-restarts <COUNT>] [--restart-backoff-ms <MILLISECONDS>]
+```
+
+The CLI boot profile registers `dev` automatically. It launches the current
+application executable for each selected `http`, `worker`, `scheduler`, or
+`websocket` process and sets the child's `PROCESS` environment value. Omitting
+the positional values selects all four. Child stdout/stderr is line-prefixed
+through `CommandInvocation` I/O.
+
+Failed processes are not restarted by default. A clean child exit stops its
+siblings and returns success, avoiding a partially running stack.
+`--max-restarts` accepts 0–100 attempts per process;
+`--restart-backoff-ms` accepts 100–60000 ms and doubles
+per attempt up to 60 seconds. Exhausting the limit stops sibling processes and
+returns `CommandExit::FAILURE`. Ctrl+C/SIGTERM requests child shutdown, waits
+for the configured runtime shutdown window, and force-stops a child only if it
+does not exit. The command depends on the application's documented `PROCESS`
+dispatcher and is not a starter-project generator or installer.
 
 ---
 
@@ -2610,6 +3104,9 @@ Test infrastructure.
 
 ```rust
 fn assert_safe_to_wipe(db_url: &str) -> Result<()>
+async fn assert_database_has<M: Model, E: QueryExecutor>(executor: &E, query: ModelQuery<M>) -> Result<()>
+async fn assert_database_missing<M: Model, E: QueryExecutor>(executor: &E, query: ModelQuery<M>) -> Result<()>
+async fn assert_database_count<M: Model, E: QueryExecutor>(executor: &E, query: ModelQuery<M>, expected: u64) -> Result<()>
 ```
 
 ### Structs
@@ -2618,16 +3115,37 @@ fn assert_safe_to_wipe(db_url: &str) -> Result<()>
 |------|---------|
 | `TestApp` | Test application bootstrapper |
 | `TestAppBuilder` | Builder for TestApp |
+| `PluginTestHarness` | Boots a primary plugin and dependencies through a real test app |
+| `PluginTestApp` | Plugin metadata, contribution summary, registry, services, and HTTP test access |
 | `TestClient` | HTTP test client |
 | `TestRequestBuilder` | Request builder |
 | `TestResponse` | Response assertions |
+| `CommandIoFake` | Captured stdout/stderr with queued prompt input and assertions |
+| `HttpClientFake` | Queued outbound responses/errors with recorded request assertions |
+| `EventFake` | Typed event records; suppresses installed listeners |
+| `JobFake` | Typed job records and queue/schedule metadata; suppresses queue writes |
+| `MailFake` | Fully resolved outbound email records; suppresses transport delivery |
+| `NotificationFake` | Immediate/queued notification intent records; suppresses channels/jobs |
+| `StorageFake` | In-memory `StorageAdapter` with content/existence/write assertions |
+| `ClockFake` | Controllable clock installed for `AppContext::clock()` |
+| `DatabaseTestTransaction` | Model-write/query transaction intended for explicit rollback |
+| `RecordedJob` | Captured job ID, queue, schedule timestamp, and JSON payload |
+| `RecordedNotification` | Captured notifiable scope, type, channels, and delivery mode |
+| `StoredFakeFile` | Captured storage path, bytes, content type, and visibility |
 | `FactoryBuilder<M>` | Model factory builder |
+
+### Enums
+
+| Name | Variants |
+|------|----------|
+| `NotificationDelivery` | `Immediate`, `Queued` |
 
 ### Traits
 
 ```rust
 trait Factory: Model {
-    fn definition() -> Vec<(&'static str, DbValue)>;
+    fn definition() -> Vec<FactoryValue<Self>>;
+    fn factory() -> FactoryBuilder<Self>;
 }
 ```
 
@@ -2638,6 +3156,8 @@ fn builder() -> TestAppBuilder
 fn from_builder(builder: AppBuilder) -> TestAppBuilder
 fn app(&self) -> &AppContext
 fn client(&self) -> TestClient
+async fn begin_database_test(&self) -> Result<DatabaseTestTransaction>
+fn freeze_time(&self, now: DateTime) -> Result<ClockFake>
 async fn shutdown(self) -> Result<()>
 async fn seed_presence(&self, channel: &ChannelId, actor_id: &str, joined_at: i64) -> Result<()>
 async fn history_ttl(&self, channel: &ChannelId) -> Result<Option<u64>>
@@ -2647,6 +3167,8 @@ async fn history_ttl(&self, channel: &ChannelId) -> Result<Option<u64>>
 
 ```rust
 fn load_config_dir(self, path: impl Into<PathBuf>) -> Self
+fn register_plugin<P: Plugin>(self, plugin: P) -> Self
+fn register_plugins<I, P>(self, plugins: I) -> Self
 fn register_provider<P>(self, provider: P) -> Self
 fn register_routes<F>(self, registrar: F) -> Self
 fn register_middleware(self, config: MiddlewareConfig) -> Self
@@ -2654,12 +3176,49 @@ fn register_websocket_routes<F>(self, registrar: F) -> Self
 fn enable_observability(self) -> Self
 fn enable_public_observability(self) -> Self
 fn enable_observability_with(self, options: ObservabilityOptions) -> Self
+fn replace_service<T>(self, value: T) -> Self
+fn replace_service_arc<T>(self, value: Arc<T>) -> Self
+fn fake_events(self, fake: EventFake) -> Self
+fn fake_jobs(self, fake: JobFake) -> Self
+fn fake_mail(self, fake: MailFake) -> Self
+fn fake_notifications(self, fake: NotificationFake) -> Self
+fn fake_http(self, fake: HttpClientFake) -> Self
+fn with_clock(self, fake: ClockFake) -> Self
 async fn build(self) -> Result<TestApp>
+```
+
+### PluginTestHarness
+
+```rust
+fn new<I: Into<PluginId>, P: Plugin>(plugin_id: I, plugin: P) -> Self
+fn register_plugin<P: Plugin>(self, plugin: P) -> Self
+fn register_plugins<I, P>(self, plugins: I) -> Self
+fn load_config_dir(self, path: impl Into<PathBuf>) -> Self
+fn configure<F: FnOnce(TestAppBuilder) -> TestAppBuilder>(self, configure: F) -> Self
+async fn build(self) -> Result<PluginTestApp>
+```
+
+### PluginTestApp
+
+```rust
+fn plugin_id(&self) -> &PluginId
+fn manifest(&self) -> &PluginManifest
+fn contributions(&self) -> &PluginContributions
+fn registry(&self) -> &PluginRegistry
+fn test_app(&self) -> &TestApp
+fn app(&self) -> &AppContext
+fn resolve<T: Send + Sync + 'static>(&self) -> Result<Arc<T>>
+fn client(&self) -> TestClient
+fn into_test_app(self) -> TestApp
+async fn shutdown(self) -> Result<()>
 ```
 
 ### TestClient
 
 ```rust
+fn acting_as(self, actor: Actor) -> Self
+fn with_bearer_token(self, token: &str) -> Self
+fn with_session(self, session_id: &str) -> Self
 fn get(&self, path: &str) -> TestRequestBuilder
 fn post(&self, path: &str) -> TestRequestBuilder
 fn put(&self, path: &str) -> TestRequestBuilder
@@ -2672,6 +3231,8 @@ fn delete(&self, path: &str) -> TestRequestBuilder
 ```rust
 fn header(self, name: &str, value: &str) -> Self
 fn bearer_auth(self, token: &str) -> Self
+fn session_auth(self, session_id: &str) -> Self
+fn acting_as(self, actor: Actor) -> Self
 fn body(self, body: impl Into<Vec<u8>>) -> Self
 fn text(self, body: impl Into<String>) -> Self
 fn json(self, value: &impl Serialize) -> Result<Self>
@@ -2686,19 +3247,163 @@ fn header(&self, name: &str) -> Option<&str>
 fn json<T: DeserializeOwned>(&self) -> Result<T>
 fn text(&self) -> Result<String>
 fn bytes(&self) -> &[u8]
-fn text(&self) -> String
-fn bytes(&self) -> &[u8]
+fn assert_status(&self, expected: StatusCode) -> &Self
+fn assert_successful(&self) -> &Self
+fn assert_ok(&self) -> &Self
+fn assert_created(&self) -> &Self
+fn assert_no_content(&self) -> &Self
+fn assert_not_found(&self) -> &Self
+fn assert_unprocessable(&self) -> &Self
+fn assert_header(&self, name: &str, expected: &str) -> &Self
+fn assert_header_missing(&self, name: &str) -> &Self
+fn assert_json(&self, expected: &Value) -> &Self
+fn assert_json_path(&self, path: &str, expected: &Value) -> &Self
+fn assert_json_fragment(&self, expected: &Value) -> &Self
+fn assert_json_shape(&self, paths: &[&str]) -> &Self
+fn assert_validation_error(&self, field: &str) -> &Self
+fn assert_redirect(&self, location: &str) -> &Self
+fn assert_download(&self) -> &Self
+fn assert_download_named(&self, filename: &str) -> &Self
+```
+
+### CommandIoFake
+
+```rust
+fn new() -> Self
+fn with_input(self, value: impl Into<String>) -> Self
+fn push_input(&self, value: impl Into<String>) -> &Self
+fn stdout(&self) -> String
+fn stderr(&self) -> String
+fn clear(&self) -> &Self
+fn assert_stdout(&self, expected: &str) -> &Self
+fn assert_stdout_contains(&self, expected: &str) -> &Self
+fn assert_stderr(&self, expected: &str) -> &Self
+fn assert_stderr_contains(&self, expected: &str) -> &Self
 ```
 
 ### FactoryBuilder\<M\>
 
 ```rust
 fn new() -> Self
-fn set(self, column: &str, value: impl Into<DbValue>) -> Self
+fn set<T, V: IntoFieldValue<T>>(self, column: Column<M, T>, value: V) -> Self
+fn state<I: IntoIterator<Item = FactoryValue<M>>>(self, values: I) -> Self
+fn for_parent<T, V: IntoFieldValue<T>>(self, foreign_key: Column<M, T>, parent_key: V) -> Self
+fn sequence<F, I>(self, sequence: F) -> Self
 fn count(self, n: usize) -> Self
-async fn create<E>(self, executor: &E) -> Result<Vec<M>>
-async fn create_one<E>(self, executor: &E) -> Result<M>
+async fn create<E: ModelWriteExecutor>(&self, executor: &E) -> Result<Vec<M>>
+async fn create_one<E: ModelWriteExecutor>(&self, executor: &E) -> Result<M>
 ```
+
+### HttpClientFake
+
+```rust
+fn new() -> Self
+fn client(&self) -> HttpClient
+fn client_builder(&self) -> HttpClientBuilder
+fn respond(&self, response: HttpResponse) -> &Self
+fn respond_json<T: Serialize + ?Sized>(&self, status: StatusCode, value: &T) -> HttpClientResult<&Self>
+fn fail(&self, error: HttpClientError) -> &Self
+fn sequence<I: IntoIterator<Item = HttpClientResult<HttpResponse>>>(&self, sequence: I) -> &Self
+fn requests(&self) -> Vec<HttpRequest>
+fn pending_responses(&self) -> usize
+fn reset(&self) -> &Self
+fn assert_sent_count(&self, expected: usize) -> &Self
+fn assert_sent<F: Fn(&HttpRequest) -> bool>(&self, predicate: F) -> &Self
+fn assert_not_sent<F: Fn(&HttpRequest) -> bool>(&self, predicate: F) -> &Self
+fn assert_nothing_sent(&self) -> &Self
+```
+
+### EventFake
+
+```rust
+fn new() -> Self
+fn dispatched<E: Event>(&self) -> Vec<E>
+fn reset(&self) -> &Self
+fn assert_dispatched<E: Event>(&self) -> &Self
+fn assert_dispatched_where<E: Event, F>(&self, predicate: F) -> &Self
+fn assert_dispatched_count<E: Event>(&self, expected: usize) -> &Self
+fn assert_not_dispatched<E: Event>(&self) -> &Self
+fn assert_nothing_dispatched(&self) -> &Self
+```
+
+### JobFake
+
+```rust
+fn new() -> Self
+fn records(&self) -> Vec<RecordedJob>
+fn dispatched<J: Job>(&self) -> Vec<J>
+fn reset(&self) -> &Self
+fn assert_dispatched<J: Job>(&self) -> &Self
+fn assert_dispatched_where<J: Job, F>(&self, predicate: F) -> &Self
+fn assert_dispatched_count<J: Job>(&self, expected: usize) -> &Self
+fn assert_not_dispatched<J: Job>(&self) -> &Self
+fn assert_nothing_dispatched(&self) -> &Self
+```
+
+### MailFake
+
+```rust
+fn new() -> Self
+fn messages(&self) -> Vec<OutboundEmail>
+fn reset(&self) -> &Self
+fn assert_sent(&self) -> &Self
+fn assert_sent_where<F: Fn(&OutboundEmail) -> bool>(&self, predicate: F) -> &Self
+fn assert_sent_count(&self, expected: usize) -> &Self
+fn assert_nothing_sent(&self) -> &Self
+```
+
+### NotificationFake
+
+```rust
+fn new() -> Self
+fn notifications(&self) -> Vec<RecordedNotification>
+fn reset(&self) -> &Self
+fn assert_sent(&self, notification_type: &str) -> &Self
+fn assert_sent_where<F: Fn(&RecordedNotification) -> bool>(&self, predicate: F) -> &Self
+fn assert_sent_count(&self, expected: usize) -> &Self
+fn assert_not_sent(&self, notification_type: &str) -> &Self
+fn assert_nothing_sent(&self) -> &Self
+```
+
+### StorageFake
+
+```rust
+fn new() -> Self
+fn driver_factory(&self) -> StorageDriverFactory
+fn files(&self) -> Vec<StoredFakeFile>
+fn reset(&self) -> &Self
+fn assert_exists(&self, path: &str) -> &Self
+fn assert_missing(&self, path: &str) -> &Self
+fn assert_content(&self, path: &str, expected: impl AsRef<[u8]>) -> &Self
+fn assert_written_count(&self, expected: usize) -> &Self
+```
+
+`StorageFake` is selected through the normal custom storage-driver registration
+and test disk configuration; it is not automatically installed by `TestApp`.
+
+### ClockFake
+
+```rust
+fn new(now: DateTime, timezone: Timezone) -> Self
+fn utc(now: DateTime) -> Self
+fn now(&self) -> DateTime
+fn set(&self, now: DateTime) -> &Self
+fn advance_seconds(&self, seconds: i64) -> &Self
+fn rewind_seconds(&self, seconds: i64) -> &Self
+fn assert_now(&self, expected: DateTime) -> &Self
+```
+
+### DatabaseTestTransaction
+
+```rust
+async fn begin(app: &AppContext) -> Result<Self>
+fn app(&self) -> &AppContext
+fn transaction(&self) -> &DatabaseTransaction
+async fn rollback(self) -> Result<()>
+```
+
+The type implements `QueryExecutor`, `AfterCommitSink`, and
+`ModelWriteExecutor`. Rollback discards deferred after-commit callbacks.
 
 ---
 
@@ -2710,6 +3415,7 @@ Key-value metadata for models.
 
 ```rust
 struct ModelMeta { id, metadatable_type, metadatable_id, key, value: Option<Value> }
+struct MetadataOwner { /* validated polymorphic owner table declaration */ }
 ```
 
 ### Traits
@@ -2724,8 +3430,68 @@ trait HasMetadata {
     async fn forget_meta(&self, app: &AppContext, key: &str) -> Result<bool>;
     async fn has_meta(&self, app: &AppContext, key: &str) -> Result<bool>;
     async fn all_meta(&self, app: &AppContext) -> Result<Vec<ModelMeta>>;
+    async fn delete_all_meta(&self, app: &AppContext) -> Result<u64>;
+    async fn delete_all_meta_with<E: QueryExecutor>(&self, executor: &E) -> Result<u64>;
 }
 ```
+
+### Functions
+
+```rust
+async fn audit_metadata_orphans<E: QueryExecutor>(executor: &E, owner: &MetadataOwner) -> Result<u64>;
+async fn prune_metadata_orphans<E: QueryExecutor>(executor: &E, owner: &MetadataOwner) -> Result<u64>;
+```
+
+`ModelQuery`, `RelationDef`, and `ManyToManyDef` expose `with_meta(key)` and
+`with_metadata()` for batched extension loading. Outside HTTP request scope,
+use `AppContext::with_model_batching(...)` to enable the same lazy sibling
+batch cache.
+
+---
+
+## contract/
+
+Normalized manifest shared by OpenAPI, the generated TypeScript SDK and form
+adapter, validation metadata, and realtime metadata.
+
+### Constants
+
+```rust
+const CONTRACT_MANIFEST_VERSION: u32 = 2;
+```
+
+### Core types
+
+| Name | Summary |
+|------|---------|
+| `ContractManifest` | Versioned schemas, validation schemas, actions, realtime channels, and standard errors |
+| `ContractAction` | Business action name, transport route ID, typed parameters, auth, responses, and action errors |
+| `ContractParameter` | Parameter `name`, `location`, schema name, and requiredness |
+| `ContractParameterLocation` | `Path`, `Query`, `Header`, or `Cookie` |
+| `ContractError` | Stable error code, HTTP status, and optional typed schema |
+| `ContractSchema` / `ContractPayload` / `ContractResponse` | JSON Schema payload and response metadata |
+| `ContractTransport` | Typed HTTP or WebSocket transport metadata |
+| `ContractHttpTransport` | Method, path, body kind, and optional request content type |
+| `ContractRealtimeChannel` / `ContractRealtimeEvent` | Typed channel and incoming/outgoing message contracts |
+| `ContractValidationSchema` | Fields, rules, custom messages, and display attributes |
+
+### ContractManifest — methods
+
+```rust
+fn new() -> Self
+fn from_http_routes(routes: &[RouteManifestEntry]) -> Result<Self>
+fn with_schemas(self, schemas: Vec<ContractSchema>) -> Self
+fn merge_schemas(self, schemas: Vec<ContractSchema>) -> Result<Self>
+fn with_validation_schemas(self, schemas: Vec<ContractValidationSchema>) -> Self
+fn with_realtime_channels(self, channels: Vec<ContractRealtimeChannel>) -> Self
+fn infer_transport_body_kinds(&mut self)
+```
+
+Every client-exported HTTP route must declare an explicit, unique business
+`action_name`; its route ID remains transport metadata. Parameters retain their
+wire location and schema, errors are action-specific, and typed WebSocket
+payloads share the same schema registry. Duplicate schema names with different
+definitions fail contract construction.
 
 ---
 
@@ -2748,7 +3514,7 @@ trait ApiSchema {
 |------|---------|
 | `SchemaRef` | Type-erased schema reference |
 | `RouteDoc` | Route documentation builder |
-| `DocumentedRoute` | `method`, `path`, `doc` |
+| `DocumentedRoute` | `method`, `path`, `doc`, and resolved `auth` metadata |
 
 ### RouteDoc — builder
 
@@ -2759,8 +3525,16 @@ fn get(self) / fn post(self) / fn put(self) / fn patch(self) / fn delete(self) -
 fn summary(self, s: &str) -> Self
 fn description(self, d: &str) -> Self
 fn tag(self, t: &str) -> Self
+fn action_name(self, action_name: impl Into<String>) -> Self
 fn request<T: ApiSchema>(self) -> Self
+fn request_content_type(self, content_type: impl Into<String>) -> Self
+fn path_parameter<T: ApiSchema>(self, name: impl Into<String>) -> Self
+fn query_parameter<T: ApiSchema>(self, name: impl Into<String>, required: bool) -> Self
+fn header_parameter<T: ApiSchema>(self, name: impl Into<String>, required: bool) -> Self
+fn cookie_parameter<T: ApiSchema>(self, name: impl Into<String>, required: bool) -> Self
 fn response<T: ApiSchema>(self, status: u16) -> Self
+fn error<T: ApiSchema>(self, status: u16, code: impl Into<String>) -> Self
+fn error_without_schema(self, status: u16, code: impl Into<String>) -> Self
 fn deprecated(self) -> Self
 ```
 
@@ -2768,7 +3542,42 @@ fn deprecated(self) -> Self
 
 ```rust
 fn generate_openapi_spec(title: &str, version: &str, routes: &[DocumentedRoute]) -> Value
+fn generate_openapi_spec_from_contract(title: &str, version: &str, manifest: &ContractManifest) -> Value
 ```
+
+OpenAPI operations use the contract action name as `operationId`, emit
+`bearerAuth` security metadata for guarded routes, render typed parameters and
+custom request media types, assign canonical HTTP response descriptions, and
+attach both standard and action-specific error responses.
+
+---
+
+## typescript/
+
+Contract-first TypeScript generation.
+
+```rust
+struct TypeScriptExportContext {
+    realtime_channels: Vec<ContractRealtimeChannel>,
+    i18n: Option<I18nTypeScriptManifest>,
+    datatable_ids: Vec<String>,
+    route_form_adapter: bool,
+}
+
+fn export_all(dir: &Path) -> Result<()>
+fn export_all_with_routes(dir: &Path, routes: &[RouteManifestEntry]) -> Result<()>
+fn export_all_with_context(
+    dir: &Path,
+    routes: &[RouteManifestEntry],
+    context: TypeScriptExportContext,
+) -> Result<()>
+```
+
+The pure SDK is generated by default. Set `route_form_adapter: true`, or pass
+`types:export --route-form-adapter`, to generate compatibility
+`routes/*.ts` form adapters. After the HTTP routes are normalized, all
+route-facing generators consume `ContractManifest` rather than raw route
+metadata.
 
 ---
 
@@ -2845,6 +3654,7 @@ trait HasAttachments {
     async fn current_localized_attachment(&self, app: &AppContext, collection: &str) -> Result<Option<Attachment>>;
     async fn attachment(&self, app: &AppContext, collection: &str) -> Result<Option<Attachment>>;
     async fn attachments(&self, app: &AppContext, collection: &str) -> Result<Vec<Attachment>>;
+    async fn reorder_attachments(&self, app: &AppContext, collection: &str, ordered_ids: &[String]) -> Result<Vec<Attachment>>;
     async fn detach(&self, app: &AppContext, attachment_id: &str) -> Result<()>;
     async fn detach_keep_file(&self, app: &AppContext, attachment_id: &str) -> Result<()>;
     async fn detach_all(&self, app: &AppContext, collection: &str) -> Result<u64>;
@@ -2914,6 +3724,12 @@ Attachment reads participate in the active model extension cache. Use
 eager loading. If a helper is accessed without eager loading inside an active scope, Foundry lazily
 batch-loads that collection for known sibling models.
 
+Attachment inserts and reorders serialize per owner collection with a
+PostgreSQL advisory transaction lock. Multi-file inserts append their
+`sort_order`; `.single()` and explicit replacement atomically retain one row.
+`reorder_attachments` requires an exact permutation and updates every position
+in one transaction.
+
 ---
 
 ## countries/
@@ -2962,6 +3778,12 @@ Image processing pipeline.
 ### Structs
 
 ```rust
+struct ImageDecodeLimits {
+    max_input_bytes: u64,
+    max_pixels: u64,
+    max_width: u64,
+    max_height: u64,
+}
 struct ImageProcessor; // chainable image processor
 ```
 
@@ -2969,7 +3791,15 @@ struct ImageProcessor; // chainable image processor
 
 ```rust
 fn open<P: AsRef<Path>>(path: P) -> Result<Self>
+fn open_with_limits<P: AsRef<Path>>(path: P, limits: ImageDecodeLimits) -> Result<Self>
+fn open_unbounded<P: AsRef<Path>>(path: P) -> Result<Self>
 fn from_bytes(bytes: &[u8]) -> Result<Self>
+fn from_bytes_with_limits(bytes: &[u8], limits: ImageDecodeLimits) -> Result<Self>
+fn from_bytes_unbounded(bytes: &[u8]) -> Result<Self>
+async fn process_file<P, T, F>(path: P, process: F) -> Result<T>
+async fn process_file_with_limits<P, T, F>(path: P, limits: ImageDecodeLimits, process: F) -> Result<T>
+async fn process_bytes<T, F>(bytes: Vec<u8>, process: F) -> Result<T>
+async fn process_bytes_with_limits<T, F>(bytes: Vec<u8>, limits: ImageDecodeLimits, process: F) -> Result<T>
 fn width(&self) -> u32
 fn height(&self) -> u32
 fn format(&self) -> Option<ImageFormat>
@@ -2979,7 +3809,7 @@ fn resize(self, width: u32, height: u32) -> Self
 fn resize_to_fit(self, max_width: u32, max_height: u32) -> Self
 fn resize_to_fill(self, width: u32, height: u32) -> Self
 fn crop(self, x: u32, y: u32, width: u32, height: u32) -> Self
-fn quality(self, q: u8) -> Self
+fn quality(self, q: u8) -> Self // JPEG only; non-JPEG encode returns an error
 fn blur(self, sigma: f32) -> Self
 fn grayscale(self) -> Self
 fn rotate(self, rotation: Rotation) -> Self

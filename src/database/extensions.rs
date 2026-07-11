@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::attachments::Attachment;
 use crate::foundation::{Error, Result};
+use crate::metadata::ModelMeta;
 use crate::support::sync::lock_unpoisoned;
 use crate::translations::ModelTranslation;
 
@@ -31,6 +32,7 @@ struct ModelExtensionCache {
     model_ids: HashMap<String, BTreeSet<String>>,
     attachments: HashMap<AttachmentCacheKey, AttachmentCacheEntry>,
     translations: HashMap<TranslationCacheKey, TranslationCacheEntry>,
+    metadata: HashMap<MetadataCacheKey, MetadataCacheEntry>,
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -63,6 +65,24 @@ pub(crate) enum TranslationCacheShape {
 struct TranslationCacheEntry {
     loaded_ids: BTreeSet<String>,
     rows_by_id: HashMap<String, Vec<ModelTranslation>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum MetadataCacheShape {
+    Key(String),
+    All,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct MetadataCacheKey {
+    metadatable_type: String,
+    shape: MetadataCacheShape,
+}
+
+#[derive(Default)]
+struct MetadataCacheEntry {
+    loaded_ids: BTreeSet<String>,
+    rows_by_id: HashMap<String, Vec<ModelMeta>>,
 }
 
 tokio::task_local! {
@@ -313,6 +333,113 @@ impl ModelExtensionScope {
         }
     }
 
+    pub(crate) fn cached_metadata(
+        &self,
+        metadatable_type: &str,
+        shape: &MetadataCacheShape,
+        metadatable_id: &str,
+    ) -> Option<Vec<ModelMeta>> {
+        let cache = self.lock();
+        let key = MetadataCacheKey {
+            metadatable_type: metadatable_type.to_string(),
+            shape: shape.clone(),
+        };
+        if let Some(entry) = cache.metadata.get(&key) {
+            if entry.loaded_ids.contains(metadatable_id) {
+                return Some(
+                    entry
+                        .rows_by_id
+                        .get(metadatable_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+        }
+
+        let MetadataCacheShape::Key(requested_key) = shape else {
+            return None;
+        };
+        let all_key = MetadataCacheKey {
+            metadatable_type: metadatable_type.to_string(),
+            shape: MetadataCacheShape::All,
+        };
+        let all_entry = cache.metadata.get(&all_key)?;
+        if !all_entry.loaded_ids.contains(metadatable_id) {
+            return None;
+        }
+        Some(
+            all_entry
+                .rows_by_id
+                .get(metadatable_id)
+                .into_iter()
+                .flatten()
+                .filter(|row| row.key == *requested_key)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    pub(crate) fn missing_metadata_ids_for_known(
+        &self,
+        metadatable_type: &str,
+        shape: &MetadataCacheShape,
+        current_id: &str,
+    ) -> Vec<String> {
+        let mut cache = self.lock();
+        cache.insert_model_ids(metadatable_type, [current_id.to_string()]);
+        let known_ids = cache.known_ids(metadatable_type);
+        cache.missing_metadata_ids(metadatable_type, shape, known_ids)
+    }
+
+    pub(crate) fn missing_metadata_ids(
+        &self,
+        metadatable_type: &str,
+        shape: &MetadataCacheShape,
+        ids: &[String],
+    ) -> Vec<String> {
+        let mut cache = self.lock();
+        cache.insert_model_ids(metadatable_type, ids.iter().cloned());
+        cache.missing_metadata_ids(metadatable_type, shape, ids.to_vec())
+    }
+
+    pub(crate) fn store_metadata(
+        &self,
+        metadatable_type: &str,
+        shape: MetadataCacheShape,
+        ids: &[String],
+        rows: Vec<ModelMeta>,
+    ) {
+        let mut cache = self.lock();
+        let key = MetadataCacheKey {
+            metadatable_type: metadatable_type.to_string(),
+            shape,
+        };
+        let entry = cache.metadata.entry(key).or_default();
+        let mut grouped: HashMap<String, Vec<ModelMeta>> = HashMap::new();
+        for row in rows {
+            grouped
+                .entry(row.metadatable_id.clone())
+                .or_default()
+                .push(row);
+        }
+        for id in ids {
+            entry.loaded_ids.insert(id.clone());
+            entry
+                .rows_by_id
+                .insert(id.clone(), grouped.remove(id).unwrap_or_default());
+        }
+    }
+
+    pub(crate) fn invalidate_metadata(&self, metadatable_type: &str, metadatable_id: &str) {
+        let mut cache = self.lock();
+        for (key, entry) in &mut cache.metadata {
+            if key.metadatable_type == metadatable_type {
+                entry.loaded_ids.remove(metadatable_id);
+                entry.rows_by_id.remove(metadatable_id);
+            }
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ModelExtensionCache> {
         lock_unpoisoned(&self.inner, "model extension cache")
     }
@@ -356,6 +483,33 @@ impl ModelExtensionCache {
         let entry = self.translations.entry(key).or_default();
         ids.into_iter()
             .filter(|id| !entry.loaded_ids.contains(id))
+            .collect()
+    }
+
+    fn missing_metadata_ids(
+        &mut self,
+        metadatable_type: &str,
+        shape: &MetadataCacheShape,
+        ids: Vec<String>,
+    ) -> Vec<String> {
+        let key = MetadataCacheKey {
+            metadatable_type: metadatable_type.to_string(),
+            shape: shape.clone(),
+        };
+        let exact_loaded = self.metadata.entry(key).or_default().loaded_ids.clone();
+        let all_loaded = if matches!(shape, MetadataCacheShape::Key(_)) {
+            self.metadata
+                .get(&MetadataCacheKey {
+                    metadatable_type: metadatable_type.to_string(),
+                    shape: MetadataCacheShape::All,
+                })
+                .map(|entry| entry.loaded_ids.clone())
+                .unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
+        ids.into_iter()
+            .filter(|id| !exact_loaded.contains(id) && !all_loaded.contains(id))
             .collect()
     }
 }

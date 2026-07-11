@@ -56,6 +56,8 @@ impl Default for RuntimeDiagnosticsConfig {
 pub struct RuntimeSnapshot {
     pub backend: RuntimeBackendKind,
     pub bootstrap_complete: bool,
+    #[serde(default)]
+    pub logging: super::file_writer::LogWriterRuntimeSnapshot,
     pub http: HttpRuntimeSnapshot,
     pub auth: AuthRuntimeSnapshot,
     pub websocket: WebSocketRuntimeSnapshot,
@@ -886,10 +888,6 @@ impl RuntimeDiagnostics {
         self.backend
     }
 
-    pub(crate) fn capture_enabled(&self) -> bool {
-        self.capture_enabled
-    }
-
     pub fn mark_bootstrap_complete(&self) {
         self.bootstrap_complete.store(true, Ordering::Relaxed);
     }
@@ -908,6 +906,7 @@ impl RuntimeDiagnostics {
         RuntimeSnapshot {
             backend: self.backend,
             bootstrap_complete: self.bootstrap_complete(),
+            logging: super::file_writer::global_snapshot(),
             http: self.http.snapshot(),
             auth: self.auth.snapshot(),
             websocket: self.websocket.snapshot(),

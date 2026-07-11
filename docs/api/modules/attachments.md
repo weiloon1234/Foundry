@@ -67,6 +67,7 @@ trait HasAttachments
   fn current_localized_attachment<'life0, 'life1, 'life2, 'async_trait>(
   fn attachment<'life0, 'life1, 'life2, 'async_trait>(
   fn attachments<'life0, 'life1, 'life2, 'async_trait>(
+  fn reorder_attachments<'life0, 'life1, 'life2, 'life3, 'async_trait>(
   fn detach<'life0, 'life1, 'life2, 'async_trait>(
   fn detach_keep_file<'life0, 'life1, 'life2, 'async_trait>(
   fn detach_all<'life0, 'life1, 'life2, 'async_trait>(

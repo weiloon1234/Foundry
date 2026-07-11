@@ -13,7 +13,9 @@ use crate::auth::lockout::LoginThrottle;
 use crate::auth::token::{actor_has_mfa_pending, TokenResponse};
 use crate::auth::{Actor, CurrentActor};
 use crate::config::MfaConfig;
-use crate::database::{ComparisonOp, Condition, DbType, DbValue, Expr, FromDbValue, Query, Sql};
+use crate::database::{
+    ColumnRef, ComparisonOp, Condition, DbType, DbValue, Expr, FromDbValue, Query, Sql,
+};
 use crate::events::Event;
 use crate::foundation::{AppContext, Error, Result};
 use crate::support::{EventId, GuardId, HashManager, RoleId, Token};
@@ -26,9 +28,6 @@ type HmacSha1 = Hmac<Sha1>;
 const TOTP_PERIOD_SECONDS: i64 = 30;
 const TOTP_DIGITS: u32 = 6;
 const AUTH_MFA_TOTP_FACTORS_TABLE: &str = "auth_mfa_totp_factors";
-
-#[cfg(feature = "webauthn")]
-pub mod webauthn {}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnrollChallenge {
@@ -262,25 +261,7 @@ impl TotpFactor {
     async fn upsert_pending_secret(&self, actor: &Actor, secret: &str) -> Result<bool> {
         let encrypted = self.app.crypt()?.encrypt_string(secret)?;
         let database = self.app.database()?;
-        let empty_recovery_codes = serde_json::json!([]);
-        let affected = Query::insert_into(AUTH_MFA_TOTP_FACTORS_TABLE)
-            .values([
-                ("guard", DbValue::Text(actor.guard.to_string())),
-                ("actor_id", DbValue::Text(actor.id.clone())),
-                ("secret_ciphertext", DbValue::Text(encrypted)),
-                (
-                    "recovery_codes",
-                    DbValue::Json(empty_recovery_codes.clone()),
-                ),
-            ])
-            .on_conflict_columns(["guard", "actor_id"])
-            .do_update()
-            .set_excluded("secret_ciphertext")
-            .set("confirmed_at", DbValue::Null(DbType::TimestampTz))
-            .set("recovery_codes", DbValue::Json(empty_recovery_codes))
-            .set("last_used_step", DbValue::Null(DbType::Int64))
-            .set_expr("updated_at", Sql::now())
-            .where_(Expr::column("confirmed_at").is_null())
+        let affected = pending_secret_upsert_query(actor, encrypted)
             .execute(database.as_ref())
             .await?;
         Ok(affected > 0)
@@ -423,6 +404,28 @@ impl TotpFactor {
         self.dispatch_failed(actor, "invalid_code").await?;
         Err(invalid_mfa_code_error())
     }
+}
+
+fn pending_secret_upsert_query(actor: &Actor, encrypted: String) -> Query {
+    let empty_recovery_codes = serde_json::json!([]);
+    Query::insert_into(AUTH_MFA_TOTP_FACTORS_TABLE)
+        .values([
+            ("guard", DbValue::Text(actor.guard.to_string())),
+            ("actor_id", DbValue::Text(actor.id.clone())),
+            ("secret_ciphertext", DbValue::Text(encrypted)),
+            (
+                "recovery_codes",
+                DbValue::Json(empty_recovery_codes.clone()),
+            ),
+        ])
+        .on_conflict_columns(["guard", "actor_id"])
+        .do_update()
+        .set_excluded("secret_ciphertext")
+        .set("confirmed_at", DbValue::Null(DbType::TimestampTz))
+        .set("recovery_codes", DbValue::Json(empty_recovery_codes))
+        .set("last_used_step", DbValue::Null(DbType::Int64))
+        .set_expr("updated_at", Sql::now())
+        .where_(Expr::column(ColumnRef::new(AUTH_MFA_TOTP_FACTORS_TABLE, "confirmed_at")).is_null())
 }
 
 #[async_trait]
@@ -851,5 +854,17 @@ mod tests {
             crate::auth::token::MFA_PENDING_ABILITY,
         )]);
         ensure_mfa_pending_actor(&pending).unwrap();
+    }
+
+    #[test]
+    fn pending_factor_upsert_qualifies_the_conflict_update_predicate() {
+        let actor = Actor::new("actor-1", GuardId::new("api"));
+        let compiled = pending_secret_upsert_query(&actor, "encrypted-secret".to_string())
+            .compile()
+            .unwrap();
+
+        assert!(compiled
+            .sql
+            .contains("WHERE \"auth_mfa_totp_factors\".\"confirmed_at\" IS NULL"));
     }
 }

@@ -616,6 +616,18 @@ impl PluginRegistrar {
         self
     }
 
+    pub fn register_actor_hydrator<I, H>(&mut self, guard: I, hydrator: H) -> &mut Self
+    where
+        I: Into<crate::support::GuardId> + Send + 'static,
+        H: crate::auth::ActorHydrator,
+    {
+        let guard = guard.into();
+        self.registrar_actions.push(Box::new(move |registrar| {
+            registrar.register_actor_hydrator(guard, hydrator)
+        }));
+        self
+    }
+
     pub fn register_policy<I, P>(&mut self, id: I, policy: P) -> &mut Self
     where
         I: Into<crate::support::PolicyId> + Send + 'static,

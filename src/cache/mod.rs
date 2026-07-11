@@ -1,5 +1,6 @@
 mod memory;
 mod redis_store;
+mod tagged;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -13,10 +14,11 @@ use tokio::sync::Mutex;
 use crate::config::{CacheConfig, CacheErrorMode};
 use crate::foundation::{Error, Result};
 use crate::logging::{catch_async_panic, panic_payload_message};
-use crate::support::lock::DistributedLock;
+use crate::support::{lock::DistributedLock, sha256_hex_str};
 
 pub use memory::MemoryCacheStore;
 pub use redis_store::RedisCacheStore;
+pub use tagged::TaggedCache;
 
 /// Trait for cache store backends.
 #[async_trait]
@@ -25,6 +27,24 @@ pub trait CacheStore: Send + Sync + 'static {
     async fn put_raw(&self, key: &str, value: &str, ttl: Duration) -> Result<()>;
     async fn forget(&self, key: &str) -> Result<bool>;
     async fn flush(&self) -> Result<()>;
+
+    /// Read persistent invalidation metadata used by cache tags.
+    ///
+    /// Stores that support [`CacheManager::tags`] must override this together
+    /// with [`CacheStore::put_control_raw`]. Control values must be shared by
+    /// every manager using the same store namespace and must not be removed by
+    /// a logical namespace flush unless all corresponding cached data is also
+    /// physically removed.
+    async fn get_control_raw(&self, _key: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Persist invalidation metadata used by cache tags without expiration.
+    async fn put_control_raw(&self, _key: &str, _value: &str) -> Result<()> {
+        Err(Error::message(
+            "cache store does not support persistent control values required by cache tags",
+        ))
+    }
 }
 
 /// Framework cache manager, accessible via `app.cache()`.
@@ -57,6 +77,10 @@ impl CacheManager {
     /// Get a value from cache. Returns None if not found or expired.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         self.validate_key(key)?;
+        self.get_unchecked(key).await
+    }
+
+    async fn get_unchecked<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         let raw = match self.store.get_raw(key).await {
             Ok(raw) => raw,
             Err(error) => return self.handle_store_error("get", key, error, None),
@@ -70,6 +94,10 @@ impl CacheManager {
     /// Store a value in cache with a TTL.
     pub async fn put<T: Serialize>(&self, key: &str, value: &T, ttl: Duration) -> Result<()> {
         self.validate_key(key)?;
+        self.put_unchecked(key, value, ttl).await
+    }
+
+    async fn put_unchecked<T: Serialize>(&self, key: &str, value: &T, ttl: Duration) -> Result<()> {
         let raw = serde_json::to_string(value).map_err(Error::other)?;
         match self.store.put_raw(key, &raw, ttl).await {
             Ok(()) => Ok(()),
@@ -85,7 +113,16 @@ impl CacheManager {
         Fut: Future<Output = Result<T>>,
     {
         self.validate_key(key)?;
-        if let Some(cached) = self.get::<T>(key).await? {
+        self.remember_unchecked(key, ttl, f).await
+    }
+
+    async fn remember_unchecked<T, F, Fut>(&self, key: &str, ttl: Duration, f: F) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        if let Some(cached) = self.get_unchecked::<T>(key).await? {
             return Ok(cached);
         }
         if !self.config.remember_singleflight {
@@ -95,7 +132,7 @@ impl CacheManager {
         let singleflight = self.singleflight_lock(key).await;
         let guard = singleflight.lock().await;
         let result = async {
-            if let Some(cached) = self.get::<T>(key).await? {
+            if let Some(cached) = self.get_unchecked::<T>(key).await? {
                 return Ok(cached);
             }
             self.remember_after_miss(key, ttl, f).await
@@ -109,6 +146,10 @@ impl CacheManager {
     /// Remove a value from cache.
     pub async fn forget(&self, key: &str) -> Result<bool> {
         self.validate_key(key)?;
+        self.forget_unchecked(key).await
+    }
+
+    async fn forget_unchecked(&self, key: &str) -> Result<bool> {
         match self.store.forget(key).await {
             Ok(removed) => Ok(removed),
             Err(error) => self.handle_store_error("forget", key, error, false),
@@ -179,7 +220,7 @@ impl CacheManager {
         Fut: Future<Output = Result<T>>,
     {
         let value = run_cache_remember_callback(key, f).await?;
-        self.put(key, &value, ttl).await?;
+        self.put_unchecked(key, &value, ttl).await?;
         Ok(value)
     }
 
@@ -194,7 +235,7 @@ impl CacheManager {
     {
         let deadline = tokio::time::Instant::now() + wait_timeout;
         loop {
-            if let Some(cached) = self.get::<T>(key).await? {
+            if let Some(cached) = self.get_unchecked::<T>(key).await? {
                 return Ok(Some(cached));
             }
             if tokio::time::Instant::now() >= deadline {
@@ -224,6 +265,20 @@ impl CacheManager {
 
     fn validate_key(&self, key: &str) -> Result<()> {
         validate_cache_key(key, self.config.key_max_length)
+    }
+
+    async fn get_control_raw(&self, key: &str) -> Result<Option<String>> {
+        match self.store.get_control_raw(key).await {
+            Ok(value) => Ok(value),
+            Err(error) => self.handle_store_error("get_control", key, error, None),
+        }
+    }
+
+    async fn put_control_raw(&self, key: &str, value: &str) -> Result<()> {
+        match self.store.put_control_raw(key, value).await {
+            Ok(()) => Ok(()),
+            Err(error) => self.handle_store_error("put_control", key, error, ()),
+        }
     }
 
     fn handle_store_error<T>(
@@ -266,7 +321,11 @@ fn validate_cache_key(key: &str, max_length: usize) -> Result<()> {
 }
 
 fn remember_lock_key(key: &str) -> String {
-    format!("cache:remember:{key}")
+    if key.chars().any(char::is_control) {
+        format!("cache:remember:{}", sha256_hex_str(key))
+    } else {
+        format!("cache:remember:{key}")
+    }
 }
 
 async fn run_cache_remember_callback<T, F, Fut>(key: &str, callback: F) -> Result<T>
@@ -312,6 +371,18 @@ mod tests {
 
     fn manager_with_config(config: CacheConfig) -> CacheManager {
         CacheManager::with_config(Arc::new(MemoryCacheStore::new(100)), config, None)
+    }
+
+    #[test]
+    fn remember_lock_keys_preserve_public_keys_and_encode_internal_keys() {
+        assert_eq!(
+            super::remember_lock_key("users:1"),
+            "cache:remember:users:1"
+        );
+
+        let internal = super::remember_lock_key("\u{001f}tagged");
+        assert!(internal.starts_with("cache:remember:"));
+        assert!(!internal.chars().any(char::is_control));
     }
 
     struct FailingStore;

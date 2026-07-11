@@ -7,6 +7,22 @@ Built-in audit logging with automatic model mutation tracking and redaction
 ## foundry::audit
 
 ```rust
+struct AuditContext
+  fn new(area: impl Into<String>) -> Self
+  fn try_new(area: impl Into<String>) -> Result<Self>
+  fn with_actor(self, actor: Actor) -> Self
+  fn with_request_id(self, request_id: RequestId) -> Self
+  fn with_ip(self, ip: IpAddr) -> Self
+  fn with_user_agent(self, user_agent: impl Into<String>) -> Self
+  fn area(&self) -> &str
+  fn actor(&self) -> Option<&Actor>
+struct AuditEntry
+  fn new( event_type: impl Into<String>, subject_table: impl Into<String>, subject_id: impl Into<String>, ) -> Self
+  fn subject_model(self, subject_model: impl Into<String>) -> Self
+  fn area(self, area: impl Into<String>) -> Self
+  fn before(self, value: impl Serialize) -> Result<Self>
+  fn after(self, value: impl Serialize) -> Result<Self>
+  fn changes(self, value: impl Serialize) -> Result<Self>
 struct AuditLog
   const ID: Column<Self, ModelId<AuditLog>>
   const EVENT_TYPE: Column<Self, String>
@@ -30,6 +46,12 @@ struct AuditLog
   fn delete() -> DeleteModel<Self>
   fn force_delete() -> DeleteModel<Self>
   fn restore() -> RestoreModel<Self>
+struct AuditManager
+  async fn record<E>(&self, executor: &E, entry: AuditEntry) -> Result<()>
+  async fn prune_before<E>( &self, executor: &E, cutoff: DateTime, ) -> Result<u64>
+  async fn prune_retention<E>( &self, executor: &E, now: DateTime, ) -> Result<u64>
+  fn retention_days(&self) -> u32
+async fn scope_audit<F>(context: AuditContext, future: F) -> F::Output
 ```
 
 ## Notes

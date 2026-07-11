@@ -2,18 +2,33 @@ use std::ffi::OsString;
 
 use clap::{error::ErrorKind, Command};
 
-use crate::cli::{CommandInvocation, CommandRegistry};
+use std::sync::Arc;
+
+use crate::cli::{CommandExit, CommandInvocation, CommandIo, CommandRegistry, TerminalCommandIo};
 use crate::foundation::{AppContext, Error, Result};
 use crate::logging::{catch_future_panic, panic_payload_message};
 
 pub struct CliKernel {
     app: AppContext,
     registrars: Vec<crate::cli::CommandRegistrar>,
+    io: Arc<dyn CommandIo>,
 }
 
 impl CliKernel {
     pub fn new(app: AppContext, registrars: Vec<crate::cli::CommandRegistrar>) -> Self {
-        Self { app, registrars }
+        Self {
+            app,
+            registrars,
+            io: Arc::new(TerminalCommandIo),
+        }
+    }
+
+    pub fn with_io<I>(mut self, io: I) -> Self
+    where
+        I: CommandIo,
+    {
+        self.io = Arc::new(io);
+        self
     }
 
     pub fn build_registry(&self) -> Result<CommandRegistry> {
@@ -25,10 +40,22 @@ impl CliKernel {
     }
 
     pub async fn run(self) -> Result<()> {
-        self.run_with_args(std::env::args_os()).await
+        self.run_status().await?.into_result()
+    }
+
+    pub async fn run_status(self) -> Result<CommandExit> {
+        self.run_with_args_status(std::env::args_os()).await
     }
 
     pub async fn run_with_args<I, T>(self, args: I) -> Result<()>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        self.run_with_args_status(args).await?.into_result()
+    }
+
+    pub async fn run_with_args_status<I, T>(self, args: I) -> Result<CommandExit>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
@@ -51,8 +78,10 @@ impl CliKernel {
                     ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
                 ) =>
             {
-                error.print().map_err(Error::other)?;
-                return Ok(());
+                self.io
+                    .write_stdout(&error.to_string())
+                    .map_err(Error::other)?;
+                return Ok(CommandExit::SUCCESS);
             }
             Err(error) => return Err(Error::other(error)),
         };
@@ -63,9 +92,10 @@ impl CliKernel {
                 .find(|command| command.id.as_str() == name)
             {
                 let handler = registered.handler.clone();
-                let invocation = CommandInvocation::new(self.app.clone(), sub_matches.clone());
+                let invocation =
+                    CommandInvocation::new(self.app.clone(), sub_matches.clone(), self.io.clone());
                 match catch_future_panic(async move { handler(invocation).await }).await {
-                    Ok(result) => result?,
+                    Ok(result) => return result,
                     Err(panic) => {
                         let message = panic_payload_message(panic);
                         tracing::error!(
@@ -79,7 +109,7 @@ impl CliKernel {
             }
         }
 
-        Ok(())
+        Ok(CommandExit::SUCCESS)
     }
 }
 
@@ -90,10 +120,11 @@ mod tests {
     use clap::Command;
 
     use super::CliKernel;
-    use crate::cli::CommandRegistrar;
+    use crate::cli::{CommandExit, CommandRegistrar};
     use crate::config::ConfigRepository;
     use crate::foundation::{AppContext, Container, Error};
     use crate::support::CommandId;
+    use crate::testing::CommandIoFake;
     use crate::validation::RuleRegistry;
 
     fn test_app() -> AppContext {
@@ -167,14 +198,61 @@ mod tests {
             Ok(())
         });
 
+        let help = CommandIoFake::new();
         kernel_with_registrar(registrar.clone())
+            .with_io(help.clone())
             .run_with_args(["foundry", "--help"])
             .await
             .unwrap();
+        help.assert_stdout_contains("Usage:");
+
+        let version = CommandIoFake::new();
         kernel_with_registrar(registrar)
+            .with_io(version.clone())
             .run_with_args(["foundry", "--version"])
             .await
             .unwrap();
+        version.assert_stdout_contains(env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn injected_io_captures_prompts_progress_and_typed_exit_status() {
+        let registrar: CommandRegistrar = Arc::new(|registry| {
+            registry.command_with_exit(
+                CommandId::new("interactive"),
+                Command::new("interactive"),
+                |invocation| async move {
+                    invocation.line("starting")?;
+                    if !invocation.confirm("Continue", false)? {
+                        return Ok(CommandExit::new(4));
+                    }
+
+                    let mut progress = invocation.progress("Import", 2)?;
+                    progress.advance(1)?;
+                    progress.finish()?;
+                    invocation.error("diagnostic")?;
+                    Ok(CommandExit::new(7))
+                },
+            )?;
+            Ok(())
+        });
+        let io = CommandIoFake::new()
+            .with_input("not-an-answer")
+            .with_input("yes");
+
+        let status = kernel_with_registrar(registrar)
+            .with_io(io.clone())
+            .run_with_args_status(["foundry", "interactive"])
+            .await
+            .unwrap();
+
+        assert_eq!(status.code(), 7);
+        io.assert_stdout_contains("starting\n")
+            .assert_stdout_contains("Continue [y/N]: ")
+            .assert_stdout_contains("Import: 0/2\n")
+            .assert_stdout_contains("Import: 1/2\n")
+            .assert_stdout_contains("Import: 2/2\n")
+            .assert_stderr("Please answer yes or no.\ndiagnostic\n");
     }
 
     #[test]

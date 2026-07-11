@@ -27,6 +27,19 @@ pub struct EventOrigin {
     pub request_id: Option<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct RecordedEventDispatch {
+    pub(crate) event_id: EventId,
+    pub(crate) event_type: TypeId,
+    pub(crate) event_type_name: &'static str,
+    pub(crate) event: Arc<dyn Any + Send + Sync>,
+    pub(crate) origin: Option<EventOrigin>,
+}
+
+pub(crate) trait EventDispatchSink: Send + Sync {
+    fn record(&self, dispatch: RecordedEventDispatch) -> Result<()>;
+}
+
 impl EventOrigin {
     pub fn new(
         actor: Option<Actor>,
@@ -141,6 +154,12 @@ pub(crate) type EventRegistryHandle = Arc<Mutex<EventRegistryBuilder>>;
 #[derive(Default)]
 pub(crate) struct EventRegistryBuilder {
     listeners: HashMap<TypeId, Vec<Arc<dyn DynEventListener>>>,
+    event_types: HashMap<EventId, RegisteredEventType>,
+}
+
+struct RegisteredEventType {
+    type_id: TypeId,
+    type_name: &'static str,
 }
 
 impl EventRegistryBuilder {
@@ -148,22 +167,38 @@ impl EventRegistryBuilder {
         Arc::new(Mutex::new(Self::default()))
     }
 
-    pub(crate) fn listen<E, L>(&mut self, listener: L)
+    pub(crate) fn listen<E, L>(&mut self, listener: L) -> Result<()>
     where
         E: Event,
         L: EventListener<E>,
     {
+        let type_id = TypeId::of::<E>();
+        let type_name = std::any::type_name::<E>();
+        if let Some(existing) = self.event_types.get(&E::ID) {
+            if existing.type_id != type_id {
+                return Err(Error::message(format!(
+                    "event ID `{}` is already registered for `{}` and cannot also be used by `{type_name}`",
+                    E::ID, existing.type_name
+                )));
+            }
+        } else {
+            self.event_types
+                .insert(E::ID.clone(), RegisteredEventType { type_id, type_name });
+        }
+
         self.listeners
-            .entry(TypeId::of::<E>())
+            .entry(type_id)
             .or_default()
             .push(Arc::new(ListenerAdapter::<E, L> {
                 listener,
                 marker: PhantomData,
             }));
+        Ok(())
     }
 
     pub(crate) fn freeze_shared(handle: EventRegistryHandle) -> EventRegistrySnapshot {
         let mut builder = lock_unpoisoned(&handle, "event registry");
+        builder.event_types.clear();
         EventRegistrySnapshot {
             listeners: std::mem::take(&mut builder.listeners),
         }
@@ -178,6 +213,7 @@ pub(crate) struct EventRegistrySnapshot {
 pub struct EventBus {
     app: AppContext,
     registry: Arc<EventRegistrySnapshot>,
+    test_sink: Option<Arc<dyn EventDispatchSink>>,
 }
 
 impl EventBus {
@@ -185,6 +221,15 @@ impl EventBus {
         Self {
             app,
             registry: Arc::new(registry),
+            test_sink: None,
+        }
+    }
+
+    pub(crate) fn with_test_sink(&self, sink: Arc<dyn EventDispatchSink>) -> Self {
+        Self {
+            app: self.app.clone(),
+            registry: self.registry.clone(),
+            test_sink: Some(sink),
         }
     }
 
@@ -206,6 +251,17 @@ impl EventBus {
     where
         E: Event,
     {
+        if let Some(sink) = &self.test_sink {
+            sink.record(RecordedEventDispatch {
+                event_id: E::ID.clone(),
+                event_type: TypeId::of::<E>(),
+                event_type_name: std::any::type_name::<E>(),
+                event: Arc::new(event),
+                origin,
+            })?;
+            return Ok(());
+        }
+
         let context = EventContext::new(self.app.clone(), origin);
         if let Some(listeners) = self.registry.listeners.get(&TypeId::of::<E>()) {
             for listener in listeners {
@@ -319,6 +375,7 @@ fn event_listener_panic_error<E: Event>(panic: Box<dyn std::any::Any + Send>) ->
 
 #[cfg(test)]
 mod tests {
+    use std::any::TypeId;
     use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr};
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -343,6 +400,13 @@ mod tests {
     struct TestEvent;
 
     impl Event for TestEvent {
+        const ID: EventId = EventId::new("test.event");
+    }
+
+    #[derive(Clone, serde::Serialize)]
+    struct ConflictingTestEvent;
+
+    impl Event for ConflictingTestEvent {
         const ID: EventId = EventId::new("test.event");
     }
 
@@ -410,6 +474,19 @@ mod tests {
         }
     }
 
+    struct ConflictingListener;
+
+    #[async_trait]
+    impl EventListener<ConflictingTestEvent> for ConflictingListener {
+        async fn handle(
+            &self,
+            _context: &EventContext,
+            _event: &ConflictingTestEvent,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
     struct FactoryPanicListener;
 
     impl EventListener<TestEvent> for FactoryPanicListener {
@@ -433,7 +510,11 @@ mod tests {
         L: EventListener<TestEvent>,
     {
         let registry = EventRegistryBuilder::shared();
-        registry.lock().unwrap().listen::<TestEvent, _>(listener);
+        registry
+            .lock()
+            .unwrap()
+            .listen::<TestEvent, _>(listener)
+            .unwrap();
 
         let app = AppContext::new(
             Container::new(),
@@ -454,14 +535,16 @@ mod tests {
             .listen::<TestEvent, _>(PushListener {
                 target: target.clone(),
                 name: "first",
-            });
+            })
+            .unwrap();
         registry
             .lock()
             .unwrap()
             .listen::<TestEvent, _>(PushListener {
                 target: target.clone(),
                 name: "second",
-            });
+            })
+            .unwrap();
 
         let app = AppContext::new(
             Container::new(),
@@ -473,6 +556,26 @@ mod tests {
         bus.dispatch(TestEvent).await.unwrap();
 
         assert_eq!(target.lock().unwrap().as_slice(), ["first", "second"]);
+    }
+
+    #[test]
+    fn semantic_event_id_cannot_be_shared_by_different_event_types() {
+        let mut registry = EventRegistryBuilder::default();
+        registry.listen::<TestEvent, _>(ErrorListener).unwrap();
+
+        let error = registry
+            .listen::<ConflictingTestEvent, _>(ConflictingListener)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("event ID `test.event`"));
+        assert!(error
+            .to_string()
+            .contains(std::any::type_name::<TestEvent>()));
+        assert!(error
+            .to_string()
+            .contains(std::any::type_name::<ConflictingTestEvent>()));
+        assert_eq!(registry.listeners.len(), 1);
+        assert_eq!(registry.listeners[&TypeId::of::<TestEvent>()].len(), 1);
     }
 
     #[test]
@@ -500,21 +603,24 @@ mod tests {
             .listen::<TestEvent, _>(PushListener {
                 target: target.clone(),
                 name: "first",
-            });
+            })
+            .unwrap();
         registry
             .lock()
             .unwrap()
             .listen::<TestEvent, _>(PanicListener {
                 target: target.clone(),
                 name: "panic",
-            });
+            })
+            .unwrap();
         registry
             .lock()
             .unwrap()
             .listen::<TestEvent, _>(PushListener {
                 target: target.clone(),
                 name: "after",
-            });
+            })
+            .unwrap();
 
         let app = AppContext::new(
             Container::new(),
@@ -564,7 +670,8 @@ mod tests {
             .listen::<TestEvent, _>(PanicOnceListener {
                 panicked,
                 target: target.clone(),
-            });
+            })
+            .unwrap();
 
         let app = AppContext::new(
             Container::new(),
@@ -660,7 +767,8 @@ mod tests {
             .unwrap()
             .listen::<TestEvent, _>(OriginListener {
                 target: target.clone(),
-            });
+            })
+            .unwrap();
 
         let app = AppContext::new(
             Container::new(),

@@ -43,22 +43,28 @@ impl EmailMailer {
 
     /// Queue for async delivery via Foundry jobs.
     pub async fn queue(&self, message: EmailMessage) -> Result<()> {
+        let manager = self.app.resolve::<super::EmailManager>()?;
         let job = super::job::SendQueuedEmailJob {
             mailer_name: self.mailer_name.clone(),
             message,
         };
         let dispatcher = self.app.jobs()?;
-        dispatcher.dispatch(job).await
+        dispatcher
+            .dispatch_on(job, manager.queue_id().clone())
+            .await
     }
 
     /// Queue for delayed delivery.
     pub async fn queue_later(&self, message: EmailMessage, run_at_millis: i64) -> Result<()> {
+        let manager = self.app.resolve::<super::EmailManager>()?;
         let job = super::job::SendQueuedEmailJob {
             mailer_name: self.mailer_name.clone(),
             message,
         };
         let dispatcher = self.app.jobs()?;
-        dispatcher.dispatch_later(job, run_at_millis).await
+        dispatcher
+            .dispatch_later_on(job, run_at_millis, manager.queue_id().clone())
+            .await
     }
 
     /// Resolve sender fallback: message.from > config email.from > error.
