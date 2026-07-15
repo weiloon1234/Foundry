@@ -359,6 +359,13 @@ mod tests {
         value: Option<String>,
     }
 
+    #[derive(Debug, Deserialize)]
+    struct NestedPresenceAwareJson {
+        name: serde_json::Value,
+        #[serde(default)]
+        contact: serde_json::Value,
+    }
+
     #[async_trait]
     impl RequestValidator for RejectingMultipartUpload {
         async fn validate(&self, validator: &mut Validator) -> Result<()> {
@@ -374,6 +381,34 @@ mod tests {
             validator
                 .optional_field("value", self.value.clone())
                 .present()
+                .apply()
+                .await
+        }
+    }
+
+    #[async_trait]
+    impl RequestValidator for NestedPresenceAwareJson {
+        async fn validate(&self, validator: &mut Validator) -> Result<()> {
+            let default_name = self
+                .name
+                .get("en")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            validator
+                .field("name.en", default_name)
+                .required()
+                .apply()
+                .await?;
+
+            let email = self
+                .contact
+                .get("email")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            validator
+                .field("contact.email", email)
+                .sometimes()
+                .email()
                 .apply()
                 .await
         }
@@ -483,6 +518,43 @@ mod tests {
             Ok(_) => panic!("missing field should fail present validation"),
             Err(response) => response,
         };
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn json_validation_accepts_a_required_nested_field_when_its_root_is_present() {
+        let app = test_app();
+        let request = Request::builder()
+            .method(Method::POST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"name":{"en":"Chicken Satay"}}"#))
+            .unwrap();
+
+        let result = JsonValidated::<NestedPresenceAwareJson>::from_request(request, &app).await;
+
+        assert!(
+            result.is_ok(),
+            "a required nested field should pass when its root and value are present"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_validation_runs_sometimes_rules_for_nested_fields() {
+        let app = test_app();
+        let request = Request::builder()
+            .method(Method::POST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"name":{"en":"Chicken Satay"},"contact":{"email":"not-an-email"}}"#,
+            ))
+            .unwrap();
+
+        let result = JsonValidated::<NestedPresenceAwareJson>::from_request(request, &app).await;
+        let response = match result {
+            Ok(_) => panic!("an invalid nested email must fail validation"),
+            Err(response) => response,
+        };
+
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

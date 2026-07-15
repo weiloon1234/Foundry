@@ -46,10 +46,18 @@ impl Validator {
         present: bool,
     ) -> FieldValidator<'a> {
         let name = name.into();
-        let present = self
-            .present_fields
-            .as_ref()
-            .map_or(present, |fields| fields.contains(&name));
+        let present = self.present_fields.as_ref().map_or(present, |fields| {
+            if fields.contains(&name) {
+                return true;
+            }
+
+            let nested_root_is_present = name
+                .split(['.', '['])
+                .next()
+                .is_some_and(|root| root != name && fields.contains(root));
+
+            present && nested_root_is_present
+        });
         FieldValidator {
             validator: self,
             field: name,

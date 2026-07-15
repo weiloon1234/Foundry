@@ -18,6 +18,7 @@ pub use validator::Validator;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::future::Future;
     use std::pin::Pin;
@@ -1410,6 +1411,116 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["present", "email", "prohibited"]
         );
+    }
+
+    #[tokio::test]
+    async fn request_presence_resolves_dot_and_bracket_paths_from_their_root() {
+        let mut validator = Validator::new(test_app());
+        validator.set_present_fields(Some(HashSet::from([
+            "name".to_string(),
+            "rows".to_string(),
+        ])));
+
+        validator
+            .field("name.en", "Chicken Satay")
+            .required()
+            .apply()
+            .await
+            .unwrap();
+        validator
+            .field("rows[0].open_time", "09:00")
+            .required()
+            .apply()
+            .await
+            .unwrap();
+
+        assert!(
+            validator.finish().is_ok(),
+            "a non-empty nested value must satisfy required() when its root field was sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_presence_runs_sometimes_rules_for_nested_fields() {
+        let mut validator = Validator::new(test_app());
+        validator.set_present_fields(Some(HashSet::from(["contact".to_string()])));
+
+        validator
+            .field("contact.email", "not-an-email")
+            .sometimes()
+            .email()
+            .apply()
+            .await
+            .unwrap();
+        validator
+            .field_with_presence("contact.secondary_email", "not-an-email", false)
+            .sometimes()
+            .email()
+            .apply()
+            .await
+            .unwrap();
+
+        let errors = validator.finish().unwrap_err();
+        assert_eq!(errors.errors.len(), 1);
+        assert_eq!(errors.errors[0].field, "contact.email");
+        assert_eq!(errors.errors[0].code, "email");
+    }
+
+    #[tokio::test]
+    async fn request_presence_keeps_nested_absent_and_empty_values_required() {
+        let mut empty = Validator::new(test_app());
+        empty.set_present_fields(Some(HashSet::from(["name".to_string()])));
+        empty.field("name.en", "").required().apply().await.unwrap();
+        assert_eq!(empty.finish().unwrap_err().errors[0].code, "required");
+
+        let mut missing_root = Validator::new(test_app());
+        missing_root.set_present_fields(Some(HashSet::new()));
+        missing_root
+            .field("name.en", "Chicken Satay")
+            .required()
+            .apply()
+            .await
+            .unwrap();
+        assert_eq!(
+            missing_root.finish().unwrap_err().errors[0].code,
+            "required"
+        );
+
+        let mut explicitly_absent = Validator::new(test_app());
+        explicitly_absent.set_present_fields(Some(HashSet::from(["name".to_string()])));
+        explicitly_absent
+            .field_with_presence("name.en", "Chicken Satay", false)
+            .required()
+            .apply()
+            .await
+            .unwrap();
+        assert_eq!(
+            explicitly_absent.finish().unwrap_err().errors[0].code,
+            "required"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_presence_keeps_exact_raw_keys_authoritative() {
+        let mut exact_top_level = Validator::new(test_app());
+        exact_top_level.set_present_fields(Some(HashSet::from(["value".to_string()])));
+        exact_top_level
+            .field_with_presence("value", "", false)
+            .present()
+            .apply()
+            .await
+            .unwrap();
+        assert!(exact_top_level.finish().is_ok());
+
+        let mut exact_nested_name = Validator::new(test_app());
+        exact_nested_name.set_present_fields(Some(HashSet::from(["name.en".to_string()])));
+        exact_nested_name
+            .field_with_presence("name.en", "", false)
+            .present()
+            .apply()
+            .await
+            .unwrap();
+        assert!(exact_nested_name.finish().is_ok());
     }
 
     #[tokio::test]

@@ -32,6 +32,7 @@ The format is inspired by Keep a Changelog, adapted for Foundry's pre-`1.0` rele
 
 ### Fixed
 
+- Manual validation now resolves dot/bracket composite field names against their top-level request root without discarding explicit nested absence, so `required`, `sometimes`, and other presence-gated rules behave correctly for fields such as `name.en` and `rows[0].open_time`.
 - CI and release-readiness now export the `FOUNDRY_TEST_POSTGRES_URL` variable consumed by every PostgreSQL acceptance target; the stale `FORGE_TEST_POSTGRES_URL` name previously caused those test bodies to skip silently.
 - Redis command paths now use reconnect-invalidating shared connections with bounded connect/command/pub-sub timeouts. Failed operations are not replayed, while the next operation reconnects instead of cloning an unusable cached transport forever.
 - Attachment orphan maintenance now paginates every local/S3 prefix to exhaustion instead of repeatedly scanning only the first configured batch. `.single()`/replacement writes are serialized and atomic per owner collection, preventing concurrent uploads from leaving multiple live rows.
